@@ -21,6 +21,7 @@ dependencies = [
   "PyYAML>=6",
   "pywin32>=310",
   "rtgym>=0.16",
+  "tensorboard>=2.19",
   "vgamepad>=0.1.0",
 ]
 

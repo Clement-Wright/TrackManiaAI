@@ -24,6 +24,15 @@ class WindowGeometry:
         return (self.left, self.top, self.right, self.bottom)
 
 
+@dataclass(slots=True, frozen=True)
+class TrackmaniaWindowLocator:
+    title_substring: str = "Trackmania"
+
+    def locate_tm_window(self) -> tuple[int, WindowGeometry]:
+        hwnd = find_window(self.title_substring)
+        return hwnd, get_client_geometry(hwnd)
+
+
 def _load_win32_modules():
     try:
         import win32gui
