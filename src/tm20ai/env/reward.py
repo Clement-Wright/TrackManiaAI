@@ -90,9 +90,8 @@ class TrajectoryProgressReward:
             "reward_reason": done_reason,
             "stray_distance": stray_distance,
             "trajectory_arc_length_m": float(self.trajectory.arc_length[self._current_index]),
+            "tm20ai_done_type": done_type,
         }
-        if done_type is not None:
-            info["tm20ai_done_type"] = done_type
         return RewardStepResult(
             reward=reward,
             done_type=done_type,

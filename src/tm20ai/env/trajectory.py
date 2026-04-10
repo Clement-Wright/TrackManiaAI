@@ -45,6 +45,10 @@ class RuntimeTrajectory:
     arc_length: np.ndarray
     race_time_ms: np.ndarray
 
+    @property
+    def total_length(self) -> float:
+        return float(self.arc_length[-1]) if len(self.arc_length) else 0.0
+
     def nearest_index(
         self,
         position: Sequence[float],
@@ -68,6 +72,27 @@ class RuntimeTrajectory:
         distances = np.linalg.norm(window - pos, axis=1)
         local_index = int(np.argmin(distances))
         return start + local_index, float(distances[local_index])
+
+    def sector_edges(self, sector_count: int) -> np.ndarray:
+        if sector_count <= 0:
+            raise ValueError("sector_count must be positive.")
+        if self.total_length <= 0.0:
+            return np.zeros(sector_count + 1, dtype=np.float32)
+        return np.linspace(0.0, self.total_length, sector_count + 1, dtype=np.float32)
+
+    def sector_index_for_arc_length(self, arc_length_value: float, sector_count: int) -> int:
+        if sector_count <= 0:
+            raise ValueError("sector_count must be positive.")
+        edges = self.sector_edges(sector_count)
+        if arc_length_value <= 0.0:
+            return 0
+        if arc_length_value >= float(edges[-1]):
+            return sector_count - 1
+        return max(0, min(sector_count - 1, int(np.searchsorted(edges, arc_length_value, side="right") - 1)))
+
+    def sector_index_for_progress(self, progress_index: int, sector_count: int) -> int:
+        bounded_index = max(0, min(len(self.arc_length) - 1, int(progress_index)))
+        return self.sector_index_for_arc_length(float(self.arc_length[bounded_index]), sector_count)
 
 
 def save_raw_lap_records(records: list[dict[str, Any]], path: Path) -> None:

@@ -7,7 +7,7 @@ import gymnasium as gym
 from rtgym.envs.real_time_env import RealTimeEnv
 
 from ..config import load_tm20ai_config
-from .rt_interface import TM20AIRtInterface
+from .rt_interface import FROZEN_STEP_INFO_KEYS, TM20AIRtInterface
 
 
 def build_rtgym_config(config_path: str | Path, *, benchmark: bool = False) -> dict[str, Any]:
@@ -54,19 +54,31 @@ class TM20AIGymEnv(gym.Env):
 
     def step(self, action):
         observation, reward, terminated, truncated, info = self._rt_env.step(action)
+        info = dict(info)
         done_type = info.get("tm20ai_done_type")
         if done_type == "truncated":
             terminated = False
             truncated = True
         elif done_type == "terminated":
             terminated = True
+        elif truncated:
+            info["tm20ai_done_type"] = "truncated"
+            info["reward_reason"] = "ep_max_length"
+        elif terminated and info.get("reward_reason") is None:
+            info["reward_reason"] = info.get("terminal_reason")
+
+        for key in FROZEN_STEP_INFO_KEYS:
+            info.setdefault(key, None)
         return self._unwrap_observation(observation), float(reward), bool(terminated), bool(truncated), info
 
     def wait(self):
         self._rt_env.wait()
 
     def benchmarks(self) -> dict[str, Any]:
-        return self._rt_env.benchmarks()
+        return {
+            "tm20ai": self.interface.get_runtime_metrics(),
+            "rtgym": self._rt_env.benchmarks(),
+        }
 
     def close(self) -> None:
         try:

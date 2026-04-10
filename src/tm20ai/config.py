@@ -65,6 +65,9 @@ class CaptureConfig:
     max_buffer_len: int = 64
     latest_frame_only: bool = True
     frame_timeout: float = 1.0
+    post_reset_flush_seconds: float = 0.25
+    invalid_frame_limit: int = 3
+    region_change_tolerance_pixels: int = 4
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "CaptureConfig":
@@ -74,6 +77,9 @@ class CaptureConfig:
             max_buffer_len=int(payload.get("max_buffer_len", 64)),
             latest_frame_only=_bool(payload.get("latest_frame_only", True), context="capture.latest_frame_only"),
             frame_timeout=float(payload.get("frame_timeout", 1.0)),
+            post_reset_flush_seconds=float(payload.get("post_reset_flush_seconds", 0.25)),
+            invalid_frame_limit=int(payload.get("invalid_frame_limit", 3)),
+            region_change_tolerance_pixels=int(payload.get("region_change_tolerance_pixels", 4)),
         )
 
 
@@ -126,6 +132,34 @@ class RewardConfig:
 
 
 @dataclass(slots=True)
+class EvalConfig:
+    episodes: int = 20
+    seed_base: int = 12345
+    sector_count: int = 10
+    record_video: bool = False
+    video_fps: int = 20
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any]) -> "EvalConfig":
+        return cls(
+            episodes=int(payload.get("episodes", 20)),
+            seed_base=int(payload.get("seed_base", 12345)),
+            sector_count=int(payload.get("sector_count", 10)),
+            record_video=_bool(payload.get("record_video", False), context="eval.record_video"),
+            video_fps=int(payload.get("video_fps", 20)),
+        )
+
+
+@dataclass(slots=True)
+class ArtifactConfig:
+    root: str = "artifacts"
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any]) -> "ArtifactConfig":
+        return cls(root=str(payload.get("root", "artifacts")))
+
+
+@dataclass(slots=True)
 class TM20AIConfig:
     runtime: RuntimeLoopConfig
     bridge: BridgeConnectionConfig
@@ -133,6 +167,8 @@ class TM20AIConfig:
     capture: CaptureConfig
     full_observation: FullObservationConfig
     reward: RewardConfig
+    eval: EvalConfig
+    artifacts: ArtifactConfig
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "TM20AIConfig":
@@ -147,6 +183,8 @@ class TM20AIConfig:
                 _mapping(payload.get("full_observation", {}), context="full_observation")
             ),
             reward=RewardConfig.from_mapping(_mapping(payload.get("reward", {}), context="reward")),
+            eval=EvalConfig.from_mapping(_mapping(payload.get("eval", {}), context="eval")),
+            artifacts=ArtifactConfig.from_mapping(_mapping(payload.get("artifacts", {}), context="artifacts")),
         )
 
 

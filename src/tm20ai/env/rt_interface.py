@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from gymnasium import spaces
@@ -14,6 +16,41 @@ from ..control import GamepadController
 from .reset_manager import ResetManager
 from .reward import TrajectoryProgressReward
 from .trajectory import load_runtime_trajectory, runtime_trajectory_path_for_map
+
+
+@dataclass(slots=True)
+class InterfaceTimingMetrics:
+    observation_calls: int = 0
+    total_obs_retrieval_seconds: float = 0.0
+    total_preprocess_seconds: float = 0.0
+    total_reward_compute_seconds: float = 0.0
+
+    def snapshot(self) -> dict[str, Any]:
+        count = max(1, self.observation_calls)
+        return {
+            "avg_obs_retrieval_seconds": self.total_obs_retrieval_seconds / count,
+            "avg_preprocess_seconds": self.total_preprocess_seconds / count,
+            "avg_reward_compute_seconds": self.total_reward_compute_seconds / count,
+            "observation_calls": self.observation_calls,
+        }
+
+
+FROZEN_STEP_INFO_KEYS = (
+    "session_id",
+    "run_id",
+    "map_uid",
+    "frame_id",
+    "timestamp_ns",
+    "race_time_ms",
+    "terminal_reason",
+    "progress_index",
+    "progress_delta",
+    "no_progress_steps",
+    "stray_distance",
+    "trajectory_arc_length_m",
+    "reward_reason",
+    "tm20ai_done_type",
+)
 
 
 class TM20AIRtInterface(RealTimeGymInterface):
@@ -41,6 +78,7 @@ class TM20AIRtInterface(RealTimeGymInterface):
         )
         self._reward_model: TrajectoryProgressReward | None = None
         self._last_frame = None
+        self._timing_metrics = InterfaceTimingMetrics()
 
     def get_observation_space(self):
         obs_space = spaces.Box(
@@ -84,7 +122,7 @@ class TM20AIRtInterface(RealTimeGymInterface):
 
     def reset(self, seed=None, options=None):
         del seed, options
-        self._capture.open()
+        self._capture.ensure_started()
         reset_result = self._reset_manager.reset_to_start()
         self._last_frame = reset_result.frame
         reward_model = self._ensure_reward_model(reset_result.frame.map_uid)
@@ -99,10 +137,22 @@ class TM20AIRtInterface(RealTimeGymInterface):
             after_frame_id=self._last_frame.frame_id,
             timeout=self.config.bridge.initial_frame_timeout,
         )
+        retrieval_start = time.perf_counter()
         latest_frame = self._capture.get_latest_frame(timeout=self.config.capture.frame_timeout)
+        retrieval_duration = time.perf_counter() - retrieval_start
+
+        preprocess_start = time.perf_counter()
         observation = self._preprocessor.append_frame(latest_frame)
+        preprocess_duration = time.perf_counter() - preprocess_start
+
+        reward_start = time.perf_counter()
         reward_result = reward_model.evaluate(frame)
+        reward_duration = time.perf_counter() - reward_start
         self._last_frame = frame
+        self._timing_metrics.observation_calls += 1
+        self._timing_metrics.total_obs_retrieval_seconds += retrieval_duration
+        self._timing_metrics.total_preprocess_seconds += preprocess_duration
+        self._timing_metrics.total_reward_compute_seconds += reward_duration
         info = {
             "session_id": frame.session_id,
             "run_id": frame.run_id,
@@ -111,8 +161,16 @@ class TM20AIRtInterface(RealTimeGymInterface):
             "timestamp_ns": frame.timestamp_ns,
             "race_time_ms": frame.race_time_ms,
             "terminal_reason": frame.terminal_reason,
+            "speed_kmh": frame.speed_kmh,
+            "gear": frame.gear,
+            "rpm": frame.rpm,
+            "pos_xyz": frame.pos_xyz,
+            "vel_xyz": frame.vel_xyz,
+            "yaw_pitch_roll": frame.yaw_pitch_roll,
         }
         info.update(reward_result.info)
+        for key in FROZEN_STEP_INFO_KEYS:
+            info.setdefault(key, None)
         return [observation], float(reward_result.reward), bool(reward_result.done_type is not None), info
 
     def wait(self):
@@ -121,6 +179,9 @@ class TM20AIRtInterface(RealTimeGymInterface):
 
     def render(self):
         return None
+
+    def get_runtime_metrics(self) -> dict[str, Any]:
+        return self._timing_metrics.snapshot()
 
     def close(self) -> None:
         self._gamepad.close()

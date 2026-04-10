@@ -54,9 +54,10 @@ class ResetManager:
         expected_frame_id = int(response.payload["frame_id"])
         time.sleep(self._runtime.sleep_time_at_reset)
 
-        self._capture.restart()
+        self._capture.ensure_started()
         self._preprocessor.clear()
         self._client.pop_received_frames()
+        self._capture.flush_for_interval(self._capture.config.post_reset_flush_seconds)
 
         deadline = time.monotonic() + max(self._bridge_config.reset_timeout, self._bridge_config.initial_frame_timeout)
         frame: TelemetryFrame | None = None
@@ -90,10 +91,10 @@ class ResetManager:
             raise RuntimeError(f"Race timer did not return to a valid pre-run state: {frame.race_time_ms} ms")
 
         fresh_frames = self._capture.prime_frames(
-            count=self._preprocessor.frame_stack + 1,
+            count=self._preprocessor.frame_stack,
             timeout=max(self._bridge_config.initial_frame_timeout, self._capture.config.frame_timeout),
         )
-        observation = self._preprocessor.build_clean_stack(fresh_frames[-self._preprocessor.frame_stack :])
+        observation = self._preprocessor.build_clean_stack(fresh_frames)
         info = {
             "map_uid": frame.map_uid,
             "run_id": frame.run_id,
