@@ -1,9 +1,11 @@
 runtime:
   time_step_duration: 0.05
   start_obs_capture: 0.04
+  time_step_timeout_factor: 1.0
   act_buf_len: 2
+  wait_on_done: true
   ep_max_length: 1000
-  reset_sleep: 1.5
+  sleep_time_at_reset: 1.5
 
 bridge:
   host: "127.0.0.1"
@@ -16,6 +18,16 @@ bridge:
   stale_timeout: 0.25
   reset_timeout: 5.0
 
+observation:
+  mode: full
+
+capture:
+  window_title: "Trackmania"
+  target_fps: 60
+  max_buffer_len: 64
+  latest_frame_only: true
+  frame_timeout: 1.0
+
 full_observation:
   window_width: 256
   window_height: 128
@@ -27,5 +39,10 @@ full_observation:
 reward:
   mode: trajectory_progress
   spacing_meters: 0.5
-  no_progress_timeout_seconds: 5.0
-  finish_bonus: 100.0
+  end_of_track: 100.0
+  constant_penalty: 0.0
+  check_forward: 500
+  check_backward: 10
+  failure_countdown: 10
+  min_steps: 70
+  max_stray: 100.0
