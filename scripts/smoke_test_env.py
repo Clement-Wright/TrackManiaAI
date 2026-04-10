@@ -106,6 +106,8 @@ def focus_and_resize_window(hwnd: int, width: int, height: int, retries: int = 5
     user32 = ctypes.windll.user32
     user32.AllowSetForegroundWindow(-1)
 
+    last_rect: tuple[int, int, int, int] | None = None
+    foreground_matched = False
     for attempt in range(1, retries + 1):
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
         win32gui.MoveWindow(hwnd, 0, 0, width, height, True)
@@ -115,15 +117,31 @@ def focus_and_resize_window(hwnd: int, width: int, height: int, retries: int = 5
 
         foreground = win32gui.GetForegroundWindow()
         rect = win32gui.GetWindowRect(hwnd)
+        last_rect = rect
         current_width = rect[2] - rect[0]
         current_height = rect[3] - rect[1]
+        foreground_matched = foreground == hwnd
 
-        if foreground == hwnd and rect[0] == 0 and rect[1] == 0 and current_width == width and current_height == height:
-            log(f"Trackmania window focused and resized on attempt {attempt}.")
+        width_ok = abs(current_width - width) <= 1
+        height_ok = abs(current_height - height) <= 1
+        if rect[0] == 0 and rect[1] == 0 and width_ok and height_ok:
+            if foreground_matched:
+                log(f"Trackmania window focused and resized on attempt {attempt}.")
+            else:
+                log(
+                    "Trackmania window resized correctly, but Windows did not keep it in the foreground. "
+                    "Continuing with a warning."
+                )
             return
 
+    rect_text = str(last_rect) if last_rect is not None else "unknown"
+    if not foreground_matched:
+        raise RuntimeError(
+            f"Repeated resize failure for Trackmania window; latest rect was {rect_text}. "
+            f"Expected top-left {width}x{height}."
+        )
     raise RuntimeError(
-        f"Repeated focus or resize failure for Trackmania window. "
+        f"Repeated focus or resize failure for Trackmania window; latest rect was {rect_text}. "
         f"Expected top-left {width}x{height}."
     )
 
