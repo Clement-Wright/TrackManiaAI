@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
 import zipfile
 from pathlib import Path
@@ -16,6 +17,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from tm20ai.bridge import BridgeClient, BridgeConnectionConfig, assess_bridge_status
+from tm20ai.env.trajectory import runtime_trajectory_path_for_map
 
 
 VALID_GATE_RACE_STATES = frozenset({"outside_race", "start_line", "running", "finished"})
@@ -111,6 +113,16 @@ def main() -> int:
         default=str(ROOT / "configs" / "base.yaml"),
         help="Path to the Phase 2 base config.",
     )
+    parser.add_argument(
+        "--require-reward",
+        action="store_true",
+        help="Require a reward trajectory artifact for the currently loaded map.",
+    )
+    parser.add_argument(
+        "--check-ffmpeg",
+        action="store_true",
+        help="Require ffmpeg to be available on PATH.",
+    )
     args = parser.parse_args()
 
     config_path = Path(args.config).resolve()
@@ -171,6 +183,25 @@ def main() -> int:
     if race_state not in VALID_GATE_RACE_STATES:
         log(f"ERROR: bridge race_state {race_state!r} is not one of {sorted(VALID_GATE_RACE_STATES)}")
         return 1
+
+    if args.require_reward:
+        map_uid = report.latest_frame.map_uid if report.latest_frame is not None else None
+        if not map_uid:
+            log("ERROR: reward artifact check requires a live map_uid from telemetry.")
+            return 1
+        reward_config = config.get("reward", {}) if isinstance(config.get("reward", {}), dict) else {}
+        reward_path = runtime_trajectory_path_for_map(map_uid, float(reward_config.get("spacing_meters", 0.5)))
+        if not reward_path.exists():
+            log(f"ERROR: reward trajectory artifact is missing for map_uid {map_uid!r}: {reward_path}")
+            return 1
+        log(f"reward_trajectory={reward_path}")
+
+    if args.check_ffmpeg:
+        ffmpeg_path = shutil.which("ffmpeg")
+        if ffmpeg_path is None:
+            log("ERROR: ffmpeg is not available on PATH.")
+            return 1
+        log(f"ffmpeg={ffmpeg_path}")
 
     if not report.ok:
         log("ERROR: bridge did not pass the environment gate.")

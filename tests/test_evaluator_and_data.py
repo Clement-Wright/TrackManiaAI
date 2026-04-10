@@ -1,0 +1,193 @@
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+
+from tm20ai.train.evaluator import FixedActionPolicy, ScriptedPolicyAdapter, ZeroPolicy, run_policy_episodes
+
+
+class FakeEnv:
+    def __init__(self) -> None:
+        self.default_action = np.zeros(3, dtype=np.float32)
+        self._episode_index = -1
+        self._step_index = 0
+
+    def reset(self, *, seed=None, options=None):  # noqa: ANN001
+        del seed, options
+        self._episode_index += 1
+        self._step_index = 0
+        return np.zeros((4, 64, 64), dtype=np.uint8), {"map_uid": "test-map", "run_id": f"run-{self._episode_index}"}
+
+    def step(self, action):  # noqa: ANN001
+        self._step_index += 1
+        terminated = self._step_index >= 2
+        info = {
+            "session_id": "session",
+            "run_id": f"run-{self._episode_index}",
+            "map_uid": "test-map",
+            "frame_id": self._step_index,
+            "timestamp_ns": self._step_index * 1000,
+            "race_time_ms": self._step_index * 50,
+            "terminal_reason": "finished" if terminated else None,
+            "progress_index": self._step_index,
+            "progress_delta": 1,
+            "no_progress_steps": 0,
+            "stray_distance": 0.0,
+            "trajectory_arc_length_m": float(self._step_index),
+            "reward_reason": "finished" if terminated else None,
+            "tm20ai_done_type": "terminated" if terminated else None,
+            "speed_kmh": 100.0,
+            "gear": 3,
+            "rpm": 5000.0,
+            "pos_xyz": (1.0, 2.0, 3.0),
+            "vel_xyz": (0.0, 0.0, 0.0),
+            "yaw_pitch_roll": (0.0, 0.0, 0.0),
+        }
+        return np.zeros((4, 64, 64), dtype=np.uint8), 1.0, terminated, False, info
+
+    def close(self):
+        return None
+
+    def benchmarks(self):
+        return {
+            "tm20ai": {
+                "avg_obs_retrieval_seconds": 0.01,
+                "avg_preprocess_seconds": 0.002,
+                "avg_reward_compute_seconds": 0.003,
+            },
+            "rtgym": {"send_control_duration": (0.001, 0.0)},
+        }
+
+
+def write_test_trajectory(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        map_uid=np.asarray(["test-map"]),
+        points=np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=np.float32),
+        tangents=np.asarray([[1.0, 0.0, 0.0]] * 3, dtype=np.float32),
+        arc_length=np.asarray([0.0, 1.0, 2.0], dtype=np.float32),
+        race_time_ms=np.asarray([0.0, 100.0, 200.0], dtype=np.float32),
+    )
+
+
+def write_test_config(path: Path, artifacts_root: Path) -> None:
+    path.write_text(
+        f"""
+runtime:
+  time_step_duration: 0.05
+  start_obs_capture: 0.04
+  time_step_timeout_factor: 1.0
+  act_buf_len: 2
+  wait_on_done: true
+  ep_max_length: 1000
+  sleep_time_at_reset: 1.5
+bridge:
+  host: "127.0.0.1"
+  telemetry_port: 9100
+  command_port: 9101
+  connect_timeout: 5.0
+  command_timeout: 5.0
+  initial_frame_timeout: 10.0
+  reconnect_delay: 1.0
+  stale_timeout: 0.25
+  reset_timeout: 5.0
+observation:
+  mode: full
+capture:
+  window_title: "Trackmania"
+  target_fps: 60
+  max_buffer_len: 64
+  latest_frame_only: true
+  frame_timeout: 1.0
+  post_reset_flush_seconds: 0.25
+  invalid_frame_limit: 3
+  region_change_tolerance_pixels: 4
+full_observation:
+  window_width: 256
+  window_height: 128
+  output_width: 64
+  output_height: 64
+  grayscale: true
+  frame_stack: 4
+reward:
+  mode: trajectory_progress
+  spacing_meters: 0.5
+  end_of_track: 100.0
+  constant_penalty: 0.0
+  check_forward: 500
+  check_backward: 10
+  failure_countdown: 10
+  min_steps: 70
+  max_stray: 100.0
+eval:
+  episodes: 2
+  seed_base: 12345
+  sector_count: 4
+  record_video: false
+  video_fps: 20
+artifacts:
+  root: "{artifacts_root.as_posix()}"
+""".strip(),
+        encoding="utf-8",
+    )
+
+
+def test_run_policy_episodes_writes_scalar_artifacts(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "config.yaml"
+    artifacts_root = tmp_path / "artifacts"
+    trajectory_path = tmp_path / "trajectory_0p5m.npz"
+    write_test_config(config_path, artifacts_root)
+    write_test_trajectory(trajectory_path)
+
+    monkeypatch.setattr("tm20ai.train.evaluator.runtime_trajectory_path_for_map", lambda *args, **kwargs: trajectory_path)
+    env_factory = lambda _path, _benchmark=False: FakeEnv()
+
+    for policy in (
+        ZeroPolicy(),
+        FixedActionPolicy(action=np.asarray([1.0, 0.0, 0.0], dtype=np.float32)),
+        ScriptedPolicyAdapter(callback=lambda obs, info: np.asarray([0.5, 0.0, 0.0], dtype=np.float32)),
+    ):
+        result = run_policy_episodes(
+            config_path=config_path,
+            mode="eval",
+            policy=policy,
+            episodes=2,
+            seed_base=123,
+            record_video=False,
+            env_factory=env_factory,
+        )
+        assert Path(result["summary_path"]).exists()
+        assert Path(result["episode_index_path"]).exists()
+        assert result["summary"]["completion_rate"] == 1.0
+
+
+def test_export_video_fails_clearly_without_ffmpeg(tmp_path) -> None:
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    frame_path = frames_dir / "frame_000000.png"
+    frame_path.write_bytes(
+        bytes.fromhex(
+            "89504E470D0A1A0A0000000D49484452000000010000000108000000003A7E9B550000000A49444154789C6360000000020001E221BC330000000049454E44AE426082"
+        )
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path("scripts") / "export_video.py"),
+            "--frames-dir",
+            str(frames_dir),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env={**os.environ, "PATH": ""},
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "ffmpeg is not available on PATH" in (result.stderr + result.stdout)

@@ -27,6 +27,9 @@ capture:
   max_buffer_len: 64
   latest_frame_only: true
   frame_timeout: 1.0
+  post_reset_flush_seconds: 0.25
+  invalid_frame_limit: 3
+  region_change_tolerance_pixels: 4
 
 full_observation:
   window_width: 256
@@ -46,3 +49,13 @@ reward:
   failure_countdown: 10
   min_steps: 70
   max_stray: 100.0
+
+eval:
+  episodes: 20
+  seed_base: 12345
+  sector_count: 10
+  record_video: false
+  video_fps: 20
+
+artifacts:
+  root: "artifacts"
