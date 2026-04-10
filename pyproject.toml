@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tm20-phase1"
+version = "0.1.0"
+description = "Phase 1 Trackmania 2020 environment bootstrap and smoke loop."
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+license = { text = "MIT" }
+authors = [
+  { name = "Codex" },
+]
+
+[tool.setuptools]
+py-modules = []

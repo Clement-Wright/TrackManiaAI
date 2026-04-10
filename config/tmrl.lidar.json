@@ -1,0 +1,31 @@
+{
+  "RUN_NAME": "phase1_lidar_smoke",
+  "ENV": {
+    "RTGYM_INTERFACE": "TM20LIDAR",
+    "WINDOW_WIDTH": 958,
+    "WINDOW_HEIGHT": 488,
+    "SLEEP_TIME_AT_RESET": 1.5,
+    "IMG_HIST_LEN": 4,
+    "RTGYM_CONFIG": {
+      "time_step_duration": 0.05,
+      "start_obs_capture": 0.04,
+      "time_step_timeout_factor": 1.0,
+      "act_buf_len": 2,
+      "benchmark": false,
+      "wait_on_done": true,
+      "ep_max_length": 1000,
+      "interface_kwargs": {
+        "save_replays": false
+      }
+    },
+    "REWARD_CONFIG": {
+      "END_OF_TRACK": 100.0,
+      "CONSTANT_PENALTY": 0.0,
+      "CHECK_FORWARD": 500,
+      "CHECK_BACKWARD": 10,
+      "FAILURE_COUNTDOWN": 10,
+      "MIN_STEPS": 70,
+      "MAX_STRAY": 100.0
+    }
+  }
+}
