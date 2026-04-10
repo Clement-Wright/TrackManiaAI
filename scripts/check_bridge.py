@@ -49,6 +49,12 @@ def main() -> int:
         default=None,
         help="Per-reset timeout in seconds. Defaults to the bridge reset_timeout from the config.",
     )
+    parser.add_argument(
+        "--reset-sleep",
+        type=float,
+        default=None,
+        help="Sleep between reset attempts in seconds. Defaults to runtime.sleep_time_at_reset from the config.",
+    )
     args = parser.parse_args()
 
     config_path = Path(args.config).resolve()
@@ -59,6 +65,12 @@ def main() -> int:
     config = load_base_config(config_path)
     bridge_config = BridgeConnectionConfig.from_mapping(config.get("bridge", {}))
     per_reset_timeout = bridge_config.reset_timeout if args.reset_timeout is None else args.reset_timeout
+    runtime_config = config.get("runtime", {}) if isinstance(config.get("runtime", {}), dict) else {}
+    reset_sleep = (
+        float(runtime_config.get("sleep_time_at_reset", runtime_config.get("reset_sleep", 0.0)))
+        if args.reset_sleep is None
+        else args.reset_sleep
+    )
 
     try:
         with BridgeClient(bridge_config) as client:
@@ -98,6 +110,7 @@ def main() -> int:
                 client,
                 reset_count=args.reset_count,
                 per_reset_timeout_seconds=per_reset_timeout,
+                sleep_between_resets_seconds=reset_sleep,
             )
             log(
                 "reset_validation="

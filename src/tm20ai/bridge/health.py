@@ -99,15 +99,24 @@ def assess_bridge_status(
             issues.append(f"Bridge health run_id {health.run_id!r} does not match latest telemetry {latest_frame.run_id!r}.")
         if health.map_uid is not None and health.map_uid != latest_frame.map_uid:
             issues.append(f"Bridge health map_uid {health.map_uid!r} does not match latest telemetry {latest_frame.map_uid!r}.")
-        if health.last_frame_id is not None and health.last_frame_id != latest_frame.frame_id:
-            warnings.append(
-                f"Bridge health last_frame_id {health.last_frame_id} does not match latest telemetry frame_id {latest_frame.frame_id}."
-            )
-        if health.last_timestamp_ns is not None and health.last_timestamp_ns != latest_frame.timestamp_ns:
-            warnings.append(
-                "Bridge health last_timestamp_ns "
-                f"{health.last_timestamp_ns} does not match latest telemetry timestamp_ns {latest_frame.timestamp_ns}."
-            )
+        # Health is sampled over the command socket while telemetry can advance on the stream
+        # between reads, so allow a small bounded drift instead of exact equality.
+        if health.last_frame_id is not None:
+            frame_delta = abs(health.last_frame_id - latest_frame.frame_id)
+            if frame_delta > 5:
+                warnings.append(
+                    "Bridge health last_frame_id drifted too far from latest telemetry: "
+                    f"{health.last_frame_id} vs {latest_frame.frame_id} (delta={frame_delta})."
+                )
+        if health.last_timestamp_ns is not None:
+            timestamp_delta_ns = abs(health.last_timestamp_ns - latest_frame.timestamp_ns)
+            max_timestamp_delta_ns = int(max(stale_threshold, 1.0) * 1_000_000_000)
+            if timestamp_delta_ns > max_timestamp_delta_ns:
+                warnings.append(
+                    "Bridge health last_timestamp_ns drifted too far from latest telemetry: "
+                    f"{health.last_timestamp_ns} vs {latest_frame.timestamp_ns} "
+                    f"(delta_ns={timestamp_delta_ns})."
+                )
         if not latest_frame.map_uid and (health.race_state or "") != "outside_race":
             issues.append("Latest telemetry frame is missing map_uid while the bridge is not in outside_race.")
 
@@ -219,6 +228,7 @@ def run_reset_validation(
     *,
     reset_count: int,
     per_reset_timeout_seconds: float,
+    sleep_between_resets_seconds: float = 0.0,
 ) -> ResetValidationResult:
     latest = client.wait_for_frame(timeout=client.config.initial_frame_timeout)
     expected_session = latest.session_id
@@ -245,11 +255,15 @@ def run_reset_validation(
         target_race_state = response.payload.get("race_state")
         if target_race_state != "start_line":
             failures.append(f"Reset {index + 1}: reset response race_state was {target_race_state!r}, expected 'start_line'.")
+            if sleep_between_resets_seconds > 0.0:
+                time.sleep(sleep_between_resets_seconds)
             continue
         if target_map_uid != expected_map_uid:
             failures.append(
                 f"Reset {index + 1}: reset response map_uid was {target_map_uid!r}, expected {expected_map_uid!r}."
             )
+            if sleep_between_resets_seconds > 0.0:
+                time.sleep(sleep_between_resets_seconds)
             continue
         deadline = time.monotonic() + per_reset_timeout_seconds
         acknowledged_frame: TelemetryFrame | None = None
@@ -264,38 +278,54 @@ def run_reset_validation(
 
         if acknowledged_frame is None:
             failures.append(f"Reset {index + 1}: timed out waiting for a new run_id.")
+            if sleep_between_resets_seconds > 0.0:
+                time.sleep(sleep_between_resets_seconds)
             continue
 
         if acknowledged_frame.session_id != expected_session:
             failures.append(
                 f"Reset {index + 1}: session_id changed from {expected_session} to {acknowledged_frame.session_id}."
             )
+            if sleep_between_resets_seconds > 0.0:
+                time.sleep(sleep_between_resets_seconds)
             continue
         if expected_map_uid and acknowledged_frame.map_uid != expected_map_uid:
             failures.append(
                 f"Reset {index + 1}: map_uid changed from {expected_map_uid} to {acknowledged_frame.map_uid}."
             )
+            if sleep_between_resets_seconds > 0.0:
+                time.sleep(sleep_between_resets_seconds)
             continue
         if acknowledged_frame.run_id == previous_run_id:
             failures.append(f"Reset {index + 1}: run_id did not change after reset.")
+            if sleep_between_resets_seconds > 0.0:
+                time.sleep(sleep_between_resets_seconds)
             continue
         if target_run_id != acknowledged_frame.run_id:
             failures.append(
                 f"Reset {index + 1}: response run_id {target_run_id!r} did not match telemetry {acknowledged_frame.run_id!r}."
             )
+            if sleep_between_resets_seconds > 0.0:
+                time.sleep(sleep_between_resets_seconds)
             continue
         if target_frame_id != acknowledged_frame.frame_id:
             failures.append(
                 f"Reset {index + 1}: response frame_id {target_frame_id!r} did not match telemetry {acknowledged_frame.frame_id!r}."
             )
+            if sleep_between_resets_seconds > 0.0:
+                time.sleep(sleep_between_resets_seconds)
             continue
         if target_timestamp_ns != acknowledged_frame.timestamp_ns:
             failures.append(
                 "Reset "
                 f"{index + 1}: response timestamp_ns {target_timestamp_ns!r} did not match telemetry {acknowledged_frame.timestamp_ns!r}."
             )
+            if sleep_between_resets_seconds > 0.0:
+                time.sleep(sleep_between_resets_seconds)
             continue
 
         succeeded += 1
+        if sleep_between_resets_seconds > 0.0:
+            time.sleep(sleep_between_resets_seconds)
 
     return ResetValidationResult(requested=reset_count, succeeded=succeeded, failures=failures)
