@@ -1,0 +1,44 @@
+{
+  "config_path": "C:\\Users\\clewr\\TrackManiaAI\\configs\\base.yaml",
+  "duration_seconds": 60.0,
+  "episodes": 12,
+  "steps": 722,
+  "averages": {
+    "target_time_step_duration": 0.05,
+    "step_duration": 0.05101429681455148,
+    "inference_duration": 1.6463573334285204e-05,
+    "reset_duration": 1.9320721249999526,
+    "send_control_duration": 0.000124165150085477,
+    "retrieve_observation_duration": 0.015433434356146658,
+    "rtgym_time_step_duration": 0.08866921812939196
+  },
+  "timeout_overruns": 365,
+  "cumulative_drift_seconds": 1.3118109999922951,
+  "max_drift_seconds": 23.94149170000164,
+  "rtgym_benchmarks": {
+    "time_step_duration": {
+      "average": 0.08866921812939196,
+      "average_deviation": 0.10328526297625211
+    },
+    "step_duration": {
+      "average": 0.05110494608245341,
+      "average_deviation": 0.0035022377593882446
+    },
+    "join_duration": {
+      "average": 0.04936158116512205,
+      "average_deviation": 0.0018709316491956856
+    },
+    "inference_duration": {
+      "average": 0.04173542061354065,
+      "average_deviation": 0.10676454476807304
+    },
+    "send_control_duration": {
+      "average": 0.000124165150085477,
+      "average_deviation": 2.245333494787442e-05
+    },
+    "get_obs_duration": {
+      "average": 0.015433434356146658,
+      "average_deviation": 0.0009003435625487892
+    }
+  }
+}

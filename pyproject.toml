@@ -13,7 +13,15 @@ authors = [
   { name = "Codex" },
 ]
 dependencies = [
+  "dxcam>=0.0.5",
+  "gymnasium>=1.0",
+  "numpy>=2.0",
+  "opencv-python>=4.10",
+  "pyarrow>=19.0",
   "PyYAML>=6",
+  "pywin32>=310",
+  "rtgym>=0.16",
+  "vgamepad>=0.1.0",
 ]
 
 [project.optional-dependencies]
