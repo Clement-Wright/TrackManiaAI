@@ -1,0 +1,51 @@
+{
+  "mode": "eval",
+  "run_name": "eval_zero_20260410_225940",
+  "config_path": "C:\\Users\\clewr\\TrackManiaAI\\configs\\base.yaml",
+  "config_sha256": "ececccc6ef37d9c21038569d9506710a6d8e867c2c7843b54bcc6390b98fc192",
+  "reward_trajectory_path": "C:\\Users\\clewr\\TrackManiaAI\\data\\reward\\nHC4rwnDO4gGNsFdfzH_lqglXK9\\trajectory_0p5m.npz",
+  "policy_descriptor": {
+    "name": "zero",
+    "checkpoint_path": null
+  },
+  "seed_schedule": [
+    12345,
+    12346
+  ],
+  "episode_count": 2,
+  "completion_rate": 0.0,
+  "mean_final_progress_index": 0.0,
+  "median_final_progress_index": 0.0,
+  "timeout_rate": 1.0,
+  "stray_termination_rate": 0.0,
+  "mean_episode_reward": 0.0,
+  "best_reward": 0.0,
+  "best_completion_time_ms": null,
+  "median_completion_time_ms": null,
+  "sector_metrics": {
+    "best_sector_entry_speed": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "average_sector_reward_gain": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ]
+  }
+}

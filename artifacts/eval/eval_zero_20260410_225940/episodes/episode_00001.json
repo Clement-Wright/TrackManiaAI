@@ -1,0 +1,18 @@
+{
+  "episode_id": "episode_00001",
+  "map_uid": "nHC4rwnDO4gGNsFdfzH_lqglXK9",
+  "run_id": "session-102482-552497-run-000006",
+  "episode_seed": 12346,
+  "start_timestamp": "2026-04-10T22:59:48.827320+00:00",
+  "end_timestamp": "2026-04-10T22:59:52.384460+00:00",
+  "step_count": 70,
+  "completion_flag": false,
+  "done_type": "truncated",
+  "termination_reason": "no_progress",
+  "final_progress_index": 0,
+  "completion_time_ms": null,
+  "sampled_frames_dir": null,
+  "video_path": null,
+  "furthest_sector_reached": 0,
+  "best_progress_index": 0
+}
