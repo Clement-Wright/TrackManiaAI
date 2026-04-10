@@ -1,0 +1,31 @@
+runtime:
+  time_step_duration: 0.05
+  start_obs_capture: 0.04
+  act_buf_len: 2
+  ep_max_length: 1000
+  reset_sleep: 1.5
+
+bridge:
+  host: "127.0.0.1"
+  telemetry_port: 9100
+  command_port: 9101
+  connect_timeout: 5.0
+  command_timeout: 5.0
+  initial_frame_timeout: 10.0
+  reconnect_delay: 1.0
+  stale_timeout: 0.25
+  reset_timeout: 5.0
+
+full_observation:
+  window_width: 256
+  window_height: 128
+  output_width: 64
+  output_height: 64
+  grayscale: true
+  frame_stack: 4
+
+reward:
+  mode: trajectory_progress
+  spacing_meters: 0.5
+  no_progress_timeout_seconds: 5.0
+  finish_bonus: 100.0
