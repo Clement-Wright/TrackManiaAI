@@ -3,15 +3,28 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tm20-phase1"
-version = "0.1.0"
-description = "Phase 1 Trackmania 2020 environment bootstrap and smoke loop."
+name = "tm20-ai"
+version = "0.2.0"
+description = "Trackmania 2020 runtime scaffold with a custom Openplanet bridge."
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 license = { text = "MIT" }
 authors = [
   { name = "Codex" },
 ]
+dependencies = [
+  "PyYAML>=6",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "rich>=13",
+  "ruff>=0.11",
+]
 
 [tool.setuptools]
-py-modules = []
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
