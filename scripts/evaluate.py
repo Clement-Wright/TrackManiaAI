@@ -30,7 +30,7 @@ def parse_action(value: str) -> np.ndarray:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run deterministic evaluation episodes against the custom env.")
-    parser.add_argument("--config", default=str(ROOT / "configs" / "base.yaml"))
+    parser.add_argument("--config", default=str(ROOT / "configs" / "full_sac.yaml"))
     parser.add_argument("--episodes", type=int, default=None)
     parser.add_argument("--seed-base", type=int, default=None)
     parser.add_argument("--policy", choices=("zero", "fixed", "scripted", "checkpoint"), default="zero")

@@ -8,8 +8,6 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -17,6 +15,10 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from tm20ai.bridge import BridgeClient, BridgeConnectionConfig, assess_bridge_status
+from tm20ai.capture import DXCamCapture, LidarExtractor
+from tm20ai.capture.window import TrackmaniaWindowLocator
+from tm20ai.config import TM20AIConfig, load_tm20ai_config
+from tm20ai.data.parquet_writer import resolve_artifact_root
 from tm20ai.env.trajectory import runtime_trajectory_path_for_map
 
 
@@ -25,14 +27,6 @@ VALID_GATE_RACE_STATES = frozenset({"outside_race", "start_line", "running", "fi
 
 def log(message: str) -> None:
     print(f"[check-environment] {message}", flush=True)
-
-
-def load_base_config(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as handle:
-        payload = yaml.safe_load(handle) or {}
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"Expected a mapping in {path}.")
-    return payload
 
 
 def get_installed_plugin_dir() -> Path:
@@ -106,6 +100,29 @@ def require_plugin_layout(repo_plugin_path: Path, installed_plugin_dir: Path, in
     return failures
 
 
+def expected_window_shape(config: TM20AIConfig) -> tuple[int, int]:
+    if config.observation.mode == "lidar":
+        return config.lidar_observation.window_width, config.lidar_observation.window_height
+    return config.full_observation.window_width, config.full_observation.window_height
+
+
+def maybe_dump_lidar_debug(config: TM20AIConfig, *, map_uid: str | None) -> Path:
+    capture = DXCamCapture(config.capture)
+    try:
+        frame = capture.get_latest_frame(timeout=config.capture.frame_timeout)
+    finally:
+        capture.close()
+    debug = LidarExtractor(config.lidar_observation).build_debug_result(frame)
+    root = resolve_artifact_root(config) / "debug"
+    root.mkdir(parents=True, exist_ok=True)
+    suffix = "unknown_map" if not map_uid else map_uid
+    output_path = root / f"lidar_overlay_{suffix}.png"
+    import cv2
+
+    cv2.imwrite(str(output_path), debug.overlay)
+    return output_path
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Verify that the Phase 2 custom bridge is installed and healthy.")
     parser.add_argument(
@@ -123,6 +140,11 @@ def main() -> int:
         action="store_true",
         help="Require ffmpeg to be available on PATH.",
     )
+    parser.add_argument(
+        "--dump-lidar-debug",
+        action="store_true",
+        help="Capture one frame and write a LIDAR overlay image when observation.mode=lidar.",
+    )
     args = parser.parse_args()
 
     config_path = Path(args.config).resolve()
@@ -130,8 +152,8 @@ def main() -> int:
         log(f"ERROR: config path does not exist: {config_path}")
         return 1
 
-    config = load_base_config(config_path)
-    bridge_config = BridgeConnectionConfig.from_mapping(config.get("bridge", {}))
+    config = load_tm20ai_config(config_path)
+    bridge_config = config.bridge
     repo_plugin_path = ROOT / "openplanet" / "TM20AIBridge"
     installed_plugin_dir = get_installed_plugin_dir()
     installed_plugin_archive = get_installed_plugin_archive()
@@ -184,13 +206,27 @@ def main() -> int:
         log(f"ERROR: bridge race_state {race_state!r} is not one of {sorted(VALID_GATE_RACE_STATES)}")
         return 1
 
+    try:
+        _, geometry = TrackmaniaWindowLocator(config.capture.window_title).locate_tm_window()
+    except Exception as exc:  # noqa: BLE001
+        log(f"ERROR: failed to locate the Trackmania window: {exc}")
+        return 1
+
+    expected_width, expected_height = expected_window_shape(config)
+    log(f"window_client_rect={geometry.width}x{geometry.height}")
+    if geometry.width != expected_width or geometry.height != expected_height:
+        log(
+            "ERROR: client rect does not match the configured observation mode "
+            f"({config.observation.mode} expects {expected_width}x{expected_height})."
+        )
+        return 1
+
     if args.require_reward:
         map_uid = report.latest_frame.map_uid if report.latest_frame is not None else None
         if not map_uid:
             log("ERROR: reward artifact check requires a live map_uid from telemetry.")
             return 1
-        reward_config = config.get("reward", {}) if isinstance(config.get("reward", {}), dict) else {}
-        reward_path = runtime_trajectory_path_for_map(map_uid, float(reward_config.get("spacing_meters", 0.5)))
+        reward_path = runtime_trajectory_path_for_map(map_uid, config.reward.spacing_meters)
         if not reward_path.exists():
             log(f"ERROR: reward trajectory artifact is missing for map_uid {map_uid!r}: {reward_path}")
             return 1
@@ -202,6 +238,16 @@ def main() -> int:
             log("ERROR: ffmpeg is not available on PATH.")
             return 1
         log(f"ffmpeg={ffmpeg_path}")
+
+    if args.dump_lidar_debug:
+        if config.observation.mode != "lidar":
+            log("ERROR: --dump-lidar-debug requires observation.mode=lidar.")
+            return 1
+        debug_path = maybe_dump_lidar_debug(
+            config,
+            map_uid=report.latest_frame.map_uid if report.latest_frame is not None else None,
+        )
+        log(f"lidar_debug_overlay={debug_path}")
 
     if not report.ok:
         log("ERROR: bridge did not pass the environment gate.")

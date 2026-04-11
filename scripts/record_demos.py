@@ -30,7 +30,7 @@ def parse_action(value: str) -> np.ndarray:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Record scalar-first demo episodes from a deterministic policy adapter.")
-    parser.add_argument("--config", default=str(ROOT / "configs" / "base.yaml"))
+    parser.add_argument("--config", default=str(ROOT / "configs" / "full_sac.yaml"))
     parser.add_argument("--episodes", type=int, default=1)
     parser.add_argument("--seed-base", type=int, default=None)
     parser.add_argument("--policy", choices=("zero", "fixed", "scripted", "checkpoint"), default="fixed")
