@@ -19,7 +19,7 @@ bridge:
   reset_timeout: 5.0
 
 observation:
-  mode: full
+  mode: lidar
 
 capture:
   window_title: "Trackmania"

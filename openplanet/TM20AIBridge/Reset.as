@@ -1,11 +1,22 @@
-bool TryRequestRestartMap() {
-    auto clientApi = TryGetClientScriptApi();
-    if (clientApi is null) {
-        g_Bridge.lastMessage = "reset_to_start unavailable: client playground API is not ready";
+bool TryRespawnPlayerToStart() {
+    auto rulesMode = TryGetArenaRulesMode();
+    if (rulesMode is null) {
+        g_Bridge.lastMessage = "reset_to_start unavailable: arena rules mode is not ready";
         return false;
     }
 
-    clientApi.RequestRestartMap();
+    auto player = TryGetScriptPlayer();
+    if (player is null) {
+        g_Bridge.lastMessage = "reset_to_start unavailable: local player is not ready";
+        return false;
+    }
+
+    if (!rulesMode.CanRespawnPlayer(player)) {
+        g_Bridge.lastMessage = "reset_to_start unavailable: player cannot respawn from the current race state";
+        return false;
+    }
+
+    rulesMode.RespawnPlayer(player);
     return true;
 }
 
@@ -30,7 +41,7 @@ bool ExecuteResetToStart(int timeoutMs, Json::Value@ &out payload, string &out m
     g_Bridge.pendingResetExpectedMapUid = expectedMapUid;
     g_Bridge.pendingResetAfterFrameId = previousFrameId;
 
-    if (!TryRequestRestartMap()) {
+    if (!TryRespawnPlayerToStart()) {
         g_Bridge.pendingReset = false;
         message = g_Bridge.lastMessage;
         return false;

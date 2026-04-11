@@ -34,6 +34,14 @@ CSmArena@ TryGetArena() {
     return cast<CSmArena>(playground.Arena);
 }
 
+CSmArenaRulesMode@ TryGetArenaRulesMode() {
+    auto arena = TryGetArena();
+    if (arena is null || arena.Rules is null) {
+        return null;
+    }
+    return arena.Rules.RulesMode;
+}
+
 CSmScriptPlayer@ TryGetScriptPlayer() {
     auto arena = TryGetArena();
     if (arena is null || arena.Players.Length == 0 || arena.Players[0] is null) {

@@ -1,4 +1,4 @@
-const string PLUGIN_VERSION = "0.2.0";
+const string PLUGIN_VERSION = "0.2.2";
 const string BRIDGE_HOST = "127.0.0.1";
 const uint16 TELEMETRY_PORT = 9100;
 const uint16 COMMAND_PORT = 9101;
