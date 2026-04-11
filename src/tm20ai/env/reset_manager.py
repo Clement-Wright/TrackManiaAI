@@ -7,14 +7,16 @@ from typing import Any
 import numpy as np
 
 from ..bridge import BridgeClient, TelemetryFrame
-from ..capture import DXCamCapture, FrameStackPreprocessor
+from ..capture import DXCamCapture
 from ..config import BridgeConnectionConfig, RuntimeLoopConfig
 from ..control import GamepadController
+
+ACTIVE_RACE_STATES = frozenset({"start_line", "running", "finished"})
 
 
 @dataclass(slots=True)
 class ResetResult:
-    observation: np.ndarray
+    fresh_frames: list[np.ndarray]
     frame: TelemetryFrame
     info: dict[str, Any]
 
@@ -28,18 +30,19 @@ class ResetManager:
         client: BridgeClient,
         gamepad: GamepadController,
         capture: DXCamCapture,
-        preprocessor: FrameStackPreprocessor,
+        prime_frame_count: int,
         runtime: RuntimeLoopConfig,
         bridge_config: BridgeConnectionConfig,
     ) -> None:
         self._client = client
         self._gamepad = gamepad
         self._capture = capture
-        self._preprocessor = preprocessor
+        self._prime_frame_count = prime_frame_count
         self._runtime = runtime
         self._bridge_config = bridge_config
 
     def reset_to_start(self) -> ResetResult:
+        self._wait_for_active_race()
         before = self._client.wait_for_frame(timeout=self._bridge_config.initial_frame_timeout)
         previous_run_id = before.run_id
         neutral_action = self._gamepad.neutral_action()
@@ -55,7 +58,6 @@ class ResetManager:
         time.sleep(self._runtime.sleep_time_at_reset)
 
         self._capture.ensure_started()
-        self._preprocessor.clear()
         self._client.pop_received_frames()
         self._capture.flush_for_interval(self._capture.config.post_reset_flush_seconds)
 
@@ -91,10 +93,9 @@ class ResetManager:
             raise RuntimeError(f"Race timer did not return to a valid pre-run state: {frame.race_time_ms} ms")
 
         fresh_frames = self._capture.prime_frames(
-            count=self._preprocessor.frame_stack,
+            count=self._prime_frame_count,
             timeout=max(self._bridge_config.initial_frame_timeout, self._capture.config.frame_timeout),
         )
-        observation = self._preprocessor.build_clean_stack(fresh_frames)
         info = {
             "map_uid": frame.map_uid,
             "run_id": frame.run_id,
@@ -102,5 +103,26 @@ class ResetManager:
             "race_state": race_state_payload.get("race_state"),
             "frame_id": frame.frame_id,
             "timestamp_ns": frame.timestamp_ns,
+            "speed_kmh": frame.speed_kmh,
+            "gear": frame.gear,
+            "rpm": frame.rpm,
+            "pos_xyz": frame.pos_xyz,
+            "vel_xyz": frame.vel_xyz,
+            "yaw_pitch_roll": frame.yaw_pitch_roll,
         }
-        return ResetResult(observation=observation, frame=frame, info=info)
+        return ResetResult(fresh_frames=fresh_frames, frame=frame, info=info)
+
+    def _wait_for_active_race(self) -> None:
+        deadline = time.monotonic() + max(self._bridge_config.initial_frame_timeout, self._bridge_config.command_timeout)
+        latest_state: str | None = None
+        while time.monotonic() < deadline:
+            response = self._client.race_state(timeout=self._bridge_config.command_timeout)
+            latest_state = str(response.payload.get("race_state"))
+            if latest_state in ACTIVE_RACE_STATES:
+                return
+            time.sleep(0.25)
+        raise RuntimeError(
+            "Trackmania is not in an active Drive Alone race. "
+            "Press Drive Alone and wait at the start line before starting training or evaluation "
+            f"(last race_state={latest_state!r})."
+        )

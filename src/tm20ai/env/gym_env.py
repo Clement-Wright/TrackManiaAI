@@ -7,15 +7,12 @@ import gymnasium as gym
 from rtgym.envs.real_time_env import RealTimeEnv
 
 from ..config import load_tm20ai_config
+from .live_lock import LiveEnvLock, default_live_env_lock_path
 from .rt_interface import FROZEN_STEP_INFO_KEYS, TM20AIRtInterface
 
 
 def build_rtgym_config(config_path: str | Path, *, benchmark: bool = False) -> dict[str, Any]:
     config = load_tm20ai_config(config_path)
-    if config.observation.mode != "full":
-        raise NotImplementedError(
-            f"Observation mode {config.observation.mode!r} is planned but not implemented in Phase 3-4."
-        )
     return {
         "interface": TM20AIRtInterface,
         "interface_kwargs": {"config_path": str(Path(config_path).resolve())},
@@ -36,7 +33,18 @@ class TM20AIGymEnv(gym.Env):
 
     def __init__(self, config_path: str | Path, *, benchmark: bool = False):
         self.config_path = Path(config_path).resolve()
-        self._rt_env = RealTimeEnv(build_rtgym_config(self.config_path, benchmark=benchmark))
+        self.config = load_tm20ai_config(self.config_path)
+        self._live_env_lock: LiveEnvLock | None = None
+        if self.config.train.single_live_env:
+            self._live_env_lock = LiveEnvLock(default_live_env_lock_path(self.config))
+            self._live_env_lock.acquire()
+        try:
+            self._rt_env = RealTimeEnv(build_rtgym_config(self.config_path, benchmark=benchmark))
+        except Exception:
+            if self._live_env_lock is not None:
+                self._live_env_lock.release()
+                self._live_env_lock = None
+            raise
         self.action_space = self._rt_env.action_space
         self.observation_space = self._rt_env.interface.get_observation_space().spaces[0]
 
@@ -84,9 +92,14 @@ class TM20AIGymEnv(gym.Env):
         try:
             self._rt_env.stop()
         finally:
-            close = getattr(self.interface, "close", None)
-            if callable(close):
-                close()
+            try:
+                close = getattr(self.interface, "close", None)
+                if callable(close):
+                    close()
+            finally:
+                if self._live_env_lock is not None:
+                    self._live_env_lock.release()
+                    self._live_env_lock = None
 
     @staticmethod
     def _unwrap_observation(observation):

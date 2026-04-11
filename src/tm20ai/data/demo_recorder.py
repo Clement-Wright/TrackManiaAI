@@ -33,17 +33,24 @@ class DemoRecorder:
         trajectory: RuntimeTrajectory,
         sector_count: int,
         record_video: bool = False,
+        observation_mode: str = "full",
+        record_observation_sidecar: bool = False,
     ) -> None:
         self._run_paths = run_paths
         self._trajectory = trajectory
         self._sector_count = sector_count
         self._record_video = record_video
+        self._observation_mode = observation_mode
+        self._record_observation_sidecar = record_observation_sidecar
         self._episode_index_rows: list[dict[str, Any]] = []
         self._current_episode_id: str | None = None
         self._current_episode_paths: EpisodeArtifactPaths | None = None
         self._current_metadata: dict[str, Any] | None = None
         self._current_rows: list[dict[str, Any]] = []
         self._current_step_index = 0
+        self._current_observations: list[np.ndarray] = []
+        self._current_telemetry: list[np.ndarray] = []
+        self._current_actions: list[np.ndarray] = []
 
     @property
     def episode_index_rows(self) -> list[dict[str, Any]]:
@@ -62,6 +69,7 @@ class DemoRecorder:
             self._run_paths.episodes_dir,
             episode_id=episode_id,
             record_video=self._record_video,
+            record_observation_sidecar=self._record_observation_sidecar,
         )
         self._current_metadata = {
             "episode_id": episode_id,
@@ -72,6 +80,9 @@ class DemoRecorder:
         }
         self._current_rows = []
         self._current_step_index = 0
+        self._current_observations = []
+        self._current_telemetry = []
+        self._current_actions = []
         return self._current_episode_paths
 
     def record_step(
@@ -81,11 +92,17 @@ class DemoRecorder:
         action: Sequence[float],
         reward: float,
         info: Mapping[str, Any],
+        policy_observation: np.ndarray | None = None,
+        policy_telemetry: np.ndarray | None = None,
     ) -> None:
         if self._current_episode_id is None or self._current_episode_paths is None or self._current_metadata is None:
             raise RuntimeError("start_episode() must be called before record_step().")
 
-        latest_frame = np.asarray(observation[-1], dtype=np.uint8)
+        latest_frame = (
+            np.asarray(observation[-1], dtype=np.uint8)
+            if isinstance(observation, np.ndarray) and observation.ndim >= 3
+            else None
+        )
         progress_index = int(info["progress_index"])
         sector_index = self._trajectory.sector_index_for_progress(progress_index, self._sector_count)
         row = {
@@ -119,9 +136,18 @@ class DemoRecorder:
         }
         self._current_rows.append(row)
 
-        if self._current_episode_paths.frames_dir is not None:
+        if self._current_episode_paths.frames_dir is not None and latest_frame is not None:
             frame_path = self._current_episode_paths.frames_dir / f"frame_{self._current_step_index:06d}.png"
             cv2.imwrite(str(frame_path), latest_frame)
+
+        if self._current_episode_paths.observation_npz is not None:
+            if policy_observation is None:
+                raise RuntimeError("policy_observation is required when observation sidecars are enabled.")
+            self._current_observations.append(np.asarray(policy_observation))
+            if policy_telemetry is None:
+                raise RuntimeError("policy_telemetry is required when observation sidecars are enabled.")
+            self._current_telemetry.append(np.asarray(policy_telemetry, dtype=np.float32))
+            self._current_actions.append(np.asarray(action, dtype=np.float32))
 
         self._current_step_index += 1
 
@@ -150,6 +176,10 @@ class DemoRecorder:
             "completion_time_ms": int(final_info["race_time_ms"]) if completion_flag else None,
             "sampled_frames_dir": str(self._current_episode_paths.frames_dir) if self._current_episode_paths.frames_dir else None,
             "video_path": None,
+            "observation_mode": self._observation_mode,
+            "observation_sidecar_path": (
+                str(self._current_episode_paths.observation_npz) if self._current_episode_paths.observation_npz else None
+            ),
         }
         summary = summarize_episode_trace(
             episode_id=self._current_episode_id,
@@ -162,6 +192,13 @@ class DemoRecorder:
         metadata["best_progress_index"] = summary["best_progress_index"]
 
         write_parquet_rows(self._current_episode_paths.steps_parquet, self._current_rows)
+        if self._current_episode_paths.observation_npz is not None:
+            np.savez_compressed(
+                self._current_episode_paths.observation_npz,
+                obs_uint8=np.stack(self._current_observations).astype(np.uint8, copy=False),
+                telemetry_float=np.stack(self._current_telemetry).astype(np.float32, copy=False),
+                action=np.stack(self._current_actions).astype(np.float32, copy=False),
+            )
         write_json(self._current_episode_paths.metadata_json, metadata)
         self._episode_index_rows.append(summary)
 
@@ -171,6 +208,9 @@ class DemoRecorder:
         self._current_metadata = None
         self._current_rows = []
         self._current_step_index = 0
+        self._current_observations = []
+        self._current_telemetry = []
+        self._current_actions = []
         return result
 
     def write_episode_index(self) -> Path:

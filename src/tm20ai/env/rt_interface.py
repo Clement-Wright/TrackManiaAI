@@ -10,7 +10,7 @@ from gymnasium import spaces
 from rtgym.envs.real_time_env import RealTimeGymInterface
 
 from ..bridge import BridgeClient
-from ..capture import DXCamCapture, FrameStackPreprocessor
+from ..capture import DXCamCapture, FrameStackPreprocessor, LidarObservationBuilder, lidar_feature_dim
 from ..config import TM20AIConfig, load_tm20ai_config
 from ..control import GamepadController
 from .reset_manager import ResetManager
@@ -58,21 +58,27 @@ class TM20AIRtInterface(RealTimeGymInterface):
 
     def __init__(self, *, config_path: str | Path):
         self.config: TM20AIConfig = load_tm20ai_config(config_path)
-        if self.config.observation.mode != "full":
-            raise NotImplementedError(
-                f"Observation mode {self.config.observation.mode!r} is planned but not implemented in Phase 3-4."
-            )
+        self.observation_mode = self.config.observation.mode
 
         self._bridge = BridgeClient(self.config.bridge)
         self._bridge.start()
         self._gamepad = GamepadController()
         self._capture = DXCamCapture(self.config.capture)
-        self._preprocessor = FrameStackPreprocessor(self.config.full_observation)
+        self._preprocessor: FrameStackPreprocessor | None = None
+        self._lidar_builder: LidarObservationBuilder | None = None
+        if self.observation_mode == "full":
+            self._preprocessor = FrameStackPreprocessor(self.config.full_observation)
+            prime_frame_count = self.config.full_observation.frame_stack
+        elif self.observation_mode == "lidar":
+            self._lidar_builder = LidarObservationBuilder(self.config.lidar_observation)
+            prime_frame_count = self.config.lidar_observation.lidar_hist_len
+        else:
+            raise NotImplementedError(f"Unsupported observation mode: {self.observation_mode!r}")
         self._reset_manager = ResetManager(
             client=self._bridge,
             gamepad=self._gamepad,
             capture=self._capture,
-            preprocessor=self._preprocessor,
+            prime_frame_count=prime_frame_count,
             runtime=self.config.runtime,
             bridge_config=self.config.bridge,
         )
@@ -81,16 +87,24 @@ class TM20AIRtInterface(RealTimeGymInterface):
         self._timing_metrics = InterfaceTimingMetrics()
 
     def get_observation_space(self):
-        obs_space = spaces.Box(
-            low=0,
-            high=255,
-            shape=(
-                self.config.full_observation.frame_stack,
-                self.config.full_observation.output_height,
-                self.config.full_observation.output_width,
-            ),
-            dtype=np.uint8,
-        )
+        if self.observation_mode == "full":
+            obs_space = spaces.Box(
+                low=0,
+                high=255,
+                shape=(
+                    self.config.full_observation.frame_stack,
+                    self.config.full_observation.output_height,
+                    self.config.full_observation.output_width,
+                ),
+                dtype=np.uint8,
+            )
+        else:
+            obs_space = spaces.Box(
+                low=0.0,
+                high=1.0,
+                shape=(lidar_feature_dim(self.config.lidar_observation),),
+                dtype=np.float32,
+            )
         return spaces.Tuple((obs_space,))
 
     def get_action_space(self):
@@ -106,7 +120,9 @@ class TM20AIRtInterface(RealTimeGymInterface):
     def send_control(self, control):
         if control is None:
             return
-        self._gamepad.apply(control)
+        applied = self._gamepad.apply(control)
+        if self._lidar_builder is not None:
+            self._lidar_builder.observe_action(applied)
 
     def _ensure_reward_model(self, map_uid: str) -> TrajectoryProgressReward:
         path = runtime_trajectory_path_for_map(map_uid, self.config.reward.spacing_meters)
@@ -127,7 +143,8 @@ class TM20AIRtInterface(RealTimeGymInterface):
         self._last_frame = reset_result.frame
         reward_model = self._ensure_reward_model(reset_result.frame.map_uid)
         reward_model.reset(run_id=reset_result.frame.run_id, initial_position=reset_result.frame.pos_xyz)
-        return [reset_result.observation], dict(reset_result.info)
+        observation = self._build_reset_observation(reset_result.fresh_frames, reset_result.frame)
+        return [observation], dict(reset_result.info)
 
     def get_obs_rew_terminated_info(self):
         if self._last_frame is None:
@@ -142,7 +159,7 @@ class TM20AIRtInterface(RealTimeGymInterface):
         retrieval_duration = time.perf_counter() - retrieval_start
 
         preprocess_start = time.perf_counter()
-        observation = self._preprocessor.append_frame(latest_frame)
+        observation = self._build_step_observation(latest_frame, frame)
         preprocess_duration = time.perf_counter() - preprocess_start
 
         reward_start = time.perf_counter()
@@ -172,6 +189,23 @@ class TM20AIRtInterface(RealTimeGymInterface):
         for key in FROZEN_STEP_INFO_KEYS:
             info.setdefault(key, None)
         return [observation], float(reward_result.reward), bool(reward_result.done_type is not None), info
+
+    def _build_reset_observation(self, fresh_frames: list[np.ndarray], frame) -> np.ndarray:  # noqa: ANN001
+        if self.observation_mode == "full":
+            assert self._preprocessor is not None
+            self._preprocessor.clear()
+            return self._preprocessor.build_clean_stack(fresh_frames)
+        assert self._lidar_builder is not None
+        speed_norm = float(np.clip(frame.speed_kmh / 1_000.0, 0.0, 1.0))
+        return self._lidar_builder.reset(fresh_frames, speed_norm=speed_norm)
+
+    def _build_step_observation(self, latest_frame: np.ndarray, frame) -> np.ndarray:  # noqa: ANN001
+        if self.observation_mode == "full":
+            assert self._preprocessor is not None
+            return self._preprocessor.append_frame(latest_frame)
+        assert self._lidar_builder is not None
+        speed_norm = float(np.clip(frame.speed_kmh / 1_000.0, 0.0, 1.0))
+        return self._lidar_builder.append_frame(latest_frame, speed_norm=speed_norm)
 
     def wait(self):
         self._gamepad.apply(self._gamepad.neutral_action())

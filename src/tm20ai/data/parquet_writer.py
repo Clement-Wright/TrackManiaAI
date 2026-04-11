@@ -75,6 +75,7 @@ class EpisodeArtifactPaths:
     metadata_json: Path
     frames_dir: Path | None
     video_path: Path | None
+    observation_npz: Path | None
 
 
 def build_run_artifact_paths(config: TM20AIConfig, *, mode: str, run_name: str) -> RunArtifactPaths:
@@ -95,6 +96,7 @@ def build_episode_artifact_paths(
     *,
     episode_id: str,
     record_video: bool,
+    record_observation_sidecar: bool = False,
 ) -> EpisodeArtifactPaths:
     frames_dir = episodes_dir / f"{episode_id}_frames" if record_video else None
     if frames_dir is not None:
@@ -104,4 +106,5 @@ def build_episode_artifact_paths(
         metadata_json=episodes_dir / f"{episode_id}.json",
         frames_dir=frames_dir,
         video_path=None,
+        observation_npz=episodes_dir / f"{episode_id}_observations.npz" if record_observation_sidecar else None,
     )
