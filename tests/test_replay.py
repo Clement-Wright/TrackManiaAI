@@ -1,0 +1,83 @@
+from __future__ import annotations
+
+import numpy as np
+import torch
+
+from tm20ai.train.replay import ReplayBuffer
+
+
+def make_full_transition(step: int) -> dict[str, object]:
+    obs = np.full((4, 64, 64), step, dtype=np.uint8)
+    next_obs = np.full((4, 64, 64), step + 1, dtype=np.uint8)
+    telemetry = np.full((14,), float(step), dtype=np.float32)
+    next_telemetry = np.full((14,), float(step + 1), dtype=np.float32)
+    return {
+        "obs_uint8": obs,
+        "telemetry_float": telemetry,
+        "action": np.asarray([0.1, 0.2, -0.3], dtype=np.float32),
+        "reward": float(step),
+        "next_obs_uint8": next_obs,
+        "next_telemetry_float": next_telemetry,
+        "terminated": False,
+        "truncated": step % 2 == 0,
+        "episode_id": f"episode-{step}",
+        "map_uid": "map",
+        "step_idx": step,
+    }
+
+
+def make_lidar_transition(step: int) -> dict[str, object]:
+    obs = np.full((83,), 0.1 * step, dtype=np.float32)
+    next_obs = np.full((83,), 0.1 * (step + 1), dtype=np.float32)
+    return {
+        "obs_float": obs,
+        "action": np.asarray([0.4, 0.1, -0.2], dtype=np.float32),
+        "reward": float(step),
+        "next_obs_float": next_obs,
+        "terminated": step % 2 == 0,
+        "truncated": False,
+        "episode_id": f"episode-{step}",
+        "map_uid": "map",
+        "step_idx": step,
+    }
+
+
+def test_full_replay_buffer_wraparound_and_sample_conversion() -> None:
+    replay = ReplayBuffer(mode="full", capacity=2, observation_shape=(4, 64, 64), telemetry_dim=14, rng_seed=7)
+    replay.add(make_full_transition(1))
+    replay.add(make_full_transition(2))
+    replay.add(make_full_transition(3))
+
+    assert replay.size == 2
+
+    sample = replay.sample(2, device=torch.device("cpu"))
+    assert sample.obs.shape == (2, 4, 64, 64)
+    assert sample.next_obs.shape == (2, 4, 64, 64)
+    assert sample.telemetry is not None
+    assert sample.next_telemetry is not None
+    assert sample.telemetry.shape == (2, 14)
+    assert sample.action.shape == (2, 3)
+    assert sample.reward.shape == (2, 1)
+    assert sample.done.shape == (2, 1)
+    assert sample.obs.dtype == torch.float32
+    assert sample.next_obs.dtype == torch.float32
+    assert float(sample.obs.max().item()) <= 1.0
+    assert float(sample.obs.min().item()) >= 0.0
+
+
+def test_lidar_replay_buffer_preserves_vector_observations() -> None:
+    replay = ReplayBuffer(mode="lidar", capacity=3, observation_shape=(83,), telemetry_dim=0, rng_seed=11)
+    replay.add(make_lidar_transition(1))
+    replay.add(make_lidar_transition(2))
+    replay.add(make_lidar_transition(3))
+
+    sample = replay.sample(2, device=torch.device("cpu"))
+    assert sample.obs.shape == (2, 83)
+    assert sample.next_obs.shape == (2, 83)
+    assert sample.telemetry is None
+    assert sample.next_telemetry is None
+    assert sample.action.shape == (2, 3)
+    assert sample.reward.shape == (2, 1)
+    assert sample.done.shape == (2, 1)
+    assert sample.obs.dtype == torch.float32
+    assert float(sample.obs.max().item()) <= 0.3

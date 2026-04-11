@@ -3,10 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+import pytest
 
 from tm20ai.bridge import TelemetryFrame
-from tm20ai.capture.preprocess import FrameStackPreprocessor
-from tm20ai.config import BridgeConnectionConfig, CaptureConfig, FullObservationConfig, RuntimeLoopConfig
+from tm20ai.config import BridgeConnectionConfig, RuntimeLoopConfig
 from tm20ai.env.reset_manager import ResetManager
 
 
@@ -81,9 +81,14 @@ class FakeGamepad:
         return array
 
 
+class FakeCaptureConfig:
+    frame_timeout = 0.1
+    post_reset_flush_seconds = 0.25
+
+
 class FakeCapture:
     def __init__(self) -> None:
-        self.config = CaptureConfig(frame_timeout=0.1, post_reset_flush_seconds=0.25)
+        self.config = FakeCaptureConfig()
         self.ensure_started_calls = 0
         self.flushed_for: list[float] = []
         self.prime_calls = 0
@@ -107,15 +112,44 @@ def test_reset_manager_reuses_capture_and_flushes_frames(monkeypatch) -> None:
         client=FakeClient(),
         gamepad=FakeGamepad(),
         capture=FakeCapture(),
-        preprocessor=FrameStackPreprocessor(FullObservationConfig()),
+        prime_frame_count=4,
         runtime=RuntimeLoopConfig(sleep_time_at_reset=0.0),
         bridge_config=BridgeConnectionConfig(),
     )
 
     result = manager.reset_to_start()
 
-    assert result.observation.shape == (4, 64, 64)
+    assert len(result.fresh_frames) == 4
     assert result.info["run_id"] == "run-new"
     assert manager._capture.ensure_started_calls == 1
     assert manager._capture.flushed_for == [0.25]
     assert manager._capture.prime_calls == 1
+
+
+class FakeMenuClient(FakeClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.race_state_calls = 0
+
+    def race_state(self, *, timeout=None):  # noqa: ANN001
+        del timeout
+        self.race_state_calls += 1
+        return FakeResponse(success=True, payload={"race_state": "outside_race", "run_id": "run-old"})
+
+
+def test_reset_manager_refuses_to_reset_while_outside_race(monkeypatch) -> None:
+    monotonic_values = iter([0.0, 0.0, 0.4, 0.8, 1.2])
+    monkeypatch.setattr("tm20ai.env.reset_manager.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("tm20ai.env.reset_manager.time.monotonic", lambda: next(monotonic_values))
+
+    manager = ResetManager(
+        client=FakeMenuClient(),
+        gamepad=FakeGamepad(),
+        capture=FakeCapture(),
+        prime_frame_count=4,
+        runtime=RuntimeLoopConfig(sleep_time_at_reset=0.0),
+        bridge_config=BridgeConnectionConfig(initial_frame_timeout=1.0, command_timeout=0.1),
+    )
+
+    with pytest.raises(RuntimeError, match="Drive Alone"):
+        manager.reset_to_start()

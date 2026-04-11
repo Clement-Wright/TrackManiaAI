@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
+from tm20ai.data.dataset import FullBehaviorCloningDataset, split_demo_dataset
 from tm20ai.train.evaluator import FixedActionPolicy, ScriptedPolicyAdapter, ZeroPolicy, run_policy_episodes
 
 
@@ -114,6 +115,17 @@ full_observation:
   output_height: 64
   grayscale: true
   frame_stack: 4
+lidar_observation:
+  window_width: 958
+  window_height: 488
+  ray_count: 19
+  lidar_hist_len: 4
+  prev_action_hist_len: 2
+  fixed_crop: [0.18, 0.34, 0.82, 0.96]
+  border_threshold: 48
+  ray_min_angle_degrees: -80.0
+  ray_max_angle_degrees: 80.0
+  max_ray_length_fraction: 1.0
 reward:
   mode: trajectory_progress
   spacing_meters: 0.5
@@ -130,6 +142,36 @@ eval:
   sector_count: 4
   record_video: false
   video_fps: 20
+train:
+  algorithm: sac
+  seed: 12345
+  memory_size: 64
+  batch_size: 2
+  environment_steps_before_training: 2
+  max_training_steps_per_environment_step: 1.0
+  update_model_interval: 1
+  update_buffer_interval: 1
+  eval_interval_steps: 2
+  checkpoint_interval_steps: 2
+  queue_capacity: 64
+  max_env_steps: 4
+  cuda_training: false
+  cuda_inference: false
+  single_live_env: false
+sac:
+  gamma: 0.995
+  polyak: 0.995
+  actor_lr: 3.0e-4
+  critic_lr: 3.0e-4
+  alpha_lr: 3.0e-4
+  learn_entropy_coef: false
+  alpha: 0.01
+  target_entropy: -3.0
+bc:
+  epochs: 2
+  learning_rate: 3.0e-4
+  weight_decay: 0.0
+  validation_fraction: 0.5
 artifacts:
   root: "{artifacts_root.as_posix()}"
 """.strip(),
@@ -164,6 +206,39 @@ def test_run_policy_episodes_writes_scalar_artifacts(tmp_path, monkeypatch) -> N
         assert Path(result["summary_path"]).exists()
         assert Path(result["episode_index_path"]).exists()
         assert result["summary"]["completion_rate"] == 1.0
+
+
+def test_demo_runs_write_sidecars_and_dataset_split(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "config.yaml"
+    artifacts_root = tmp_path / "artifacts"
+    trajectory_path = tmp_path / "trajectory_0p5m.npz"
+    write_test_config(config_path, artifacts_root)
+    write_test_trajectory(trajectory_path)
+
+    monkeypatch.setattr("tm20ai.train.evaluator.runtime_trajectory_path_for_map", lambda *args, **kwargs: trajectory_path)
+    env_factory = lambda _path, _benchmark=False: FakeEnv()
+
+    result = run_policy_episodes(
+        config_path=config_path,
+        mode="demos",
+        policy=FixedActionPolicy(action=np.asarray([1.0, 0.0, 0.0], dtype=np.float32)),
+        episodes=2,
+        seed_base=123,
+        record_video=False,
+        env_factory=env_factory,
+    )
+    episodes_dir = Path(result["run_dir"]) / "episodes"
+    sidecars = sorted(episodes_dir.glob("*_observations.npz"))
+    assert sidecars
+
+    split = split_demo_dataset(Path(result["run_dir"]), validation_fraction=0.5, seed=7)
+    assert split.train_episodes
+    dataset = FullBehaviorCloningDataset(split.train_episodes)
+    assert len(dataset) > 0
+    observation, telemetry, action = dataset[0]
+    assert observation.shape == (4, 64, 64)
+    assert telemetry.shape == (14,)
+    assert action.shape == (3,)
 
 
 def test_export_video_fails_clearly_without_ffmpeg(tmp_path) -> None:
