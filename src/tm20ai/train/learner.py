@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import time
 import subprocess
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -17,6 +18,7 @@ from ..data.dataset import seed_replay_from_demo_sidecars
 from ..data.parquet_writer import build_run_artifact_paths, ensure_directory, timestamp_tag, write_json
 from ..train.features import TELEMETRY_DIM
 from .metrics import TensorBoardScalarLogger
+from .protocol import EvalResult
 from .replay import ReplayBuffer
 
 
@@ -106,27 +108,53 @@ class SACLearner:
 
         self.command_queue = None
         self.output_queue = None
+        self.eval_result_queue = None
         self.shutdown_event = None
+        self.worker_done_event = None
         self.worker_process = None
 
         self.env_step = 0
         self.learner_step = 0
         self.episode_count = 0
         self.latest_eval_summary: dict[str, Any] | None = None
+        self.latest_eval_summary_path: str | None = None
         self.latest_checkpoint_path: Path | None = None
         self.last_worker_heartbeat: dict[str, Any] | None = None
         self.eval_in_flight = False
         self.pending_checkpoint_step: int | None = None
+        self.latest_eval_step: int = -1
+        self.checkpoint_history: list[dict[str, Any]] = []
+        self.eval_history: list[dict[str, Any]] = []
+        self.termination_reason: str | None = None
+        self.clean_shutdown: bool | None = None
+        self.worker_exit: dict[str, Any] = {
+            "done_event_set": False,
+            "exitcode": None,
+            "terminated": False,
+            "timeout": False,
+        }
 
         self.next_update_step = max(1, self.config.train.update_model_interval)
         self.next_eval_step = max(1, self.config.train.eval_interval_steps)
         self.next_checkpoint_step = max(1, self.config.train.checkpoint_interval_steps)
         self._reschedule_from_counters()
+        self._write_run_summary()
 
-    def attach_worker(self, *, command_queue, output_queue, shutdown_event, worker_process=None) -> None:  # noqa: ANN001
+    def attach_worker(
+        self,
+        *,
+        command_queue,
+        output_queue,
+        eval_result_queue,
+        shutdown_event,
+        worker_done_event,
+        worker_process=None,
+    ) -> None:  # noqa: ANN001
         self.command_queue = command_queue
         self.output_queue = output_queue
+        self.eval_result_queue = eval_result_queue
         self.shutdown_event = shutdown_event
+        self.worker_done_event = worker_done_event
         self.worker_process = worker_process
 
     def load_checkpoint(self, checkpoint_path: str | Path) -> None:
@@ -159,17 +187,30 @@ class SACLearner:
                 "env_step": self.env_step,
                 "checkpoint_path": str(checkpoint_path),
                 "observation_mode": self.config.observation.mode,
+                "latest_eval_summary_path": self.latest_eval_summary_path,
+                "latest_eval_env_step": None if self.latest_eval_summary is None else self.latest_eval_summary.get("env_step"),
             },
         )
         self.latest_checkpoint_path = checkpoint_path
+        checkpoint_entry = {
+            "path": str(checkpoint_path),
+            "env_step": self.env_step,
+            "learner_step": self.learner_step,
+            "timestamp": _utc_now(),
+            "final": final,
+            "latest_eval_summary_path": self.latest_eval_summary_path,
+            "latest_eval_env_step": None if self.latest_eval_summary is None else self.latest_eval_summary.get("env_step"),
+        }
+        if not self.checkpoint_history or self.checkpoint_history[-1] != checkpoint_entry:
+            self.checkpoint_history.append(checkpoint_entry)
         self._write_run_summary()
         return checkpoint_path
 
-    def request_shutdown(self) -> None:
-        if self.shutdown_event is not None:
-            self.shutdown_event.set()
+    def request_shutdown(self, *, force_event: bool = False) -> None:
         if self.command_queue is not None:
             self._put_command({"type": "shutdown"})
+        if force_event and self.shutdown_event is not None:
+            self.shutdown_event.set()
 
     def broadcast_actor(self, *, force: bool = False) -> None:
         if self.command_queue is None:
@@ -202,6 +243,25 @@ class SACLearner:
                 break
             transition_count += self._handle_message(message)
         return transition_count
+
+    def drain_eval_results(self, *, timeout: float = 0.0) -> int:
+        if self.eval_result_queue is None:
+            return 0
+        handled = 0
+        try:
+            result = self.eval_result_queue.get(timeout=timeout)
+        except queue.Empty:
+            return 0
+        self._handle_eval_result(result)
+        handled += 1
+        while True:
+            try:
+                result = self.eval_result_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._handle_eval_result(result)
+            handled += 1
+        return handled
 
     def maybe_train(self) -> int:
         if self.replay.size < self.config.train.environment_steps_before_training:
@@ -262,21 +322,43 @@ class SACLearner:
         return self.max_env_steps is not None and self.env_step >= self.max_env_steps
 
     def run(self) -> None:
-        if self.command_queue is None or self.output_queue is None or self.shutdown_event is None:
+        if (
+            self.command_queue is None
+            or self.output_queue is None
+            or self.eval_result_queue is None
+            or self.shutdown_event is None
+            or self.worker_done_event is None
+        ):
             raise RuntimeError("attach_worker() must be called before run().")
         self.broadcast_actor(force=True)
         try:
             while not self.should_stop():
                 self.drain_messages(timeout=0.25)
+                self.drain_eval_results(timeout=0.0)
                 updates = self.maybe_train()
                 if updates > 0:
                     self.broadcast_actor(force=True)
                 self.maybe_schedule_eval()
                 self.maybe_checkpoint()
                 if self.worker_process is not None and not self.worker_process.is_alive() and not self.shutdown_event.is_set():
+                    self.drain_messages(timeout=0.0)
+                    self.drain_eval_results(timeout=0.0)
+                    worker_done = self.worker_done_event.is_set() if self.worker_done_event is not None else False
+                    if self.worker_process.exitcode == 0 and worker_done and self.should_stop():
+                        break
                     raise RuntimeError(f"Worker process exited unexpectedly with code {self.worker_process.exitcode}.")
-        finally:
-            self.request_shutdown()
+        except KeyboardInterrupt:
+            self.termination_reason = "keyboard_interrupt"
+            raise
+        except Exception:
+            self.termination_reason = self.termination_reason or "fatal_error"
+            raise
+        else:
+            if self.termination_reason is None:
+                if self.max_env_steps is not None and self.env_step >= self.max_env_steps:
+                    self.termination_reason = "max_env_steps"
+                else:
+                    self.termination_reason = "completed"
 
     def close(self) -> None:
         self.writer.close()
@@ -299,20 +381,12 @@ class SACLearner:
             self._write_run_summary()
             return 0
         if message_type == "eval_result":
-            result = dict(message.get("result", {}))
-            self.latest_eval_summary = dict(result.get("summary", {}))
-            self.eval_in_flight = False
-            if self.latest_eval_summary:
-                self.writer.add_scalars_from_mapping("eval", self.latest_eval_summary, step=self.env_step)
-            if self.pending_checkpoint_step is not None:
-                self.save_checkpoint()
-                self.pending_checkpoint_step = None
-            self._write_run_summary()
             return 0
         if message_type == "heartbeat":
             self.last_worker_heartbeat = dict(message)
             return 0
         if message_type == "fatal_error":
+            self.termination_reason = self.termination_reason or "fatal_error"
             raise RuntimeError(str(message.get("error", "Worker reported an unspecified fatal error.")))
         return 0
 
@@ -330,6 +404,30 @@ class SACLearner:
         self.writer.add_scalars_from_mapping("train/update", asdict(update), step=self.learner_step)
         self.writer.add_scalar("train/replay_size", float(self.replay.size), step=self.learner_step)
         self.writer.add_scalar("train/env_step", float(self.env_step), step=self.learner_step)
+
+    def _handle_eval_result(self, result: EvalResult | Mapping[str, Any]) -> None:
+        payload = result if isinstance(result, EvalResult) else EvalResult(**dict(result))
+        if payload.env_step < self.latest_eval_step:
+            return
+        self.latest_eval_step = payload.env_step
+        self.latest_eval_summary = dict(payload.summary)
+        self.latest_eval_summary_path = payload.summary_path
+        self.eval_in_flight = False
+        eval_entry = {
+            "checkpoint_step": payload.checkpoint_step,
+            "env_step": payload.env_step,
+            "learner_step": payload.learner_step,
+            "summary_path": payload.summary_path,
+            "summary": dict(payload.summary),
+            "timestamp": payload.timestamp,
+        }
+        self.eval_history.append(eval_entry)
+        if self.latest_eval_summary:
+            self.writer.add_scalars_from_mapping("eval", self.latest_eval_summary, step=payload.env_step)
+        self._write_run_summary()
+        if self.pending_checkpoint_step is not None and payload.checkpoint_step >= self.pending_checkpoint_step:
+            self.save_checkpoint()
+            self.pending_checkpoint_step = None
 
     def _reschedule_from_counters(self) -> None:
         self.next_update_step = self._next_multiple(self.env_step, self.config.train.update_model_interval)
@@ -355,7 +453,13 @@ class SACLearner:
                 "replay_size": self.replay.size,
                 "latest_checkpoint_path": None if self.latest_checkpoint_path is None else str(self.latest_checkpoint_path),
                 "latest_eval_summary": self.latest_eval_summary,
+                "latest_eval_summary_path": self.latest_eval_summary_path,
+                "checkpoint_history": self.checkpoint_history,
+                "eval_history": self.eval_history,
                 "last_worker_heartbeat": self.last_worker_heartbeat,
+                "termination_reason": self.termination_reason,
+                "clean_shutdown": self.clean_shutdown,
+                "worker_exit": self.worker_exit,
                 "timestamp": _utc_now(),
                 "observation_mode": self.config.observation.mode,
             },
@@ -367,3 +471,48 @@ class SACLearner:
         if actor_state is None:
             raise RuntimeError(f"Checkpoint {checkpoint_path} does not contain actor_state_dict.")
         self.agent.actor.load_state_dict(actor_state)
+
+    def finalize_run(self, *, timeout_seconds: float = 30.0) -> Path:
+        if self.termination_reason is None:
+            self.termination_reason = "shutdown_requested"
+        self.request_shutdown()
+        deadline = time.monotonic() + timeout_seconds
+        done_event_set = False
+        while time.monotonic() < deadline:
+            self.drain_messages(timeout=0.25)
+            self.drain_eval_results(timeout=0.0)
+            done_event_set = self.worker_done_event.is_set() if self.worker_done_event is not None else False
+            if done_event_set:
+                break
+            if self.worker_process is not None and not self.worker_process.is_alive():
+                break
+
+        if self.worker_process is not None:
+            remaining = max(0.0, deadline - time.monotonic())
+            self.worker_process.join(timeout=remaining)
+        self.drain_messages(timeout=0.0)
+        self.drain_eval_results(timeout=0.0)
+
+        done_event_set = self.worker_done_event.is_set() if self.worker_done_event is not None else False
+        worker_alive = self.worker_process.is_alive() if self.worker_process is not None else False
+        terminated = False
+        timeout_hit = False
+        if worker_alive and self.worker_process is not None:
+            timeout_hit = True
+            if self.shutdown_event is not None:
+                self.shutdown_event.set()
+            self.worker_process.terminate()
+            self.worker_process.join(timeout=5.0)
+            terminated = True
+        exitcode = None if self.worker_process is None else self.worker_process.exitcode
+
+        self.worker_exit = {
+            "done_event_set": done_event_set,
+            "exitcode": exitcode,
+            "terminated": terminated,
+            "timeout": timeout_hit,
+        }
+        self.clean_shutdown = bool(done_event_set and not terminated)
+        final_checkpoint = self.save_checkpoint(final=True)
+        self._write_run_summary()
+        return final_checkpoint

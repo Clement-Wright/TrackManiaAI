@@ -12,6 +12,7 @@ import numpy as np
 import win32con
 import win32gui
 from tmrl import get_environment
+from tm20ai.capture.window import find_window
 
 
 APP_ID = "2225070"
@@ -62,18 +63,10 @@ def describe_observation(value: Any) -> Any:
 
 
 def enumerate_trackmania_windows() -> list[int]:
-    hwnds: list[int] = []
-
-    def callback(hwnd: int, _lparam: int) -> bool:
-        if not win32gui.IsWindowVisible(hwnd):
-            return True
-        title = win32gui.GetWindowText(hwnd)
-        if "Trackmania" in title:
-            hwnds.append(hwnd)
-        return True
-
-    win32gui.EnumWindows(callback, 0)
-    return hwnds
+    try:
+        return [find_window("Trackmania")]
+    except RuntimeError:
+        return []
 
 
 def get_trackmania_window() -> int | None:

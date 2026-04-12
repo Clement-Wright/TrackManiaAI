@@ -11,15 +11,15 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from tm20ai.train.learner import SACLearner
-from tm20ai.train.worker import worker_entry
-
 
 def log(message: str) -> None:
     print(f"[train-lidar-sac] {message}", flush=True)
 
 
 def main() -> int:
+    from tm20ai.train.learner import SACLearner
+    from tm20ai.train.worker import worker_entry
+
     parser = argparse.ArgumentParser(description="Train the first single-machine LIDAR SAC baseline.")
     parser.add_argument("--config", default=str(ROOT / "configs" / "lidar_sac.yaml"))
     parser.add_argument("--run-name", default=None)
@@ -43,14 +43,19 @@ def main() -> int:
     ctx = multiprocessing.get_context("spawn")
     command_queue = ctx.Queue(maxsize=learner.config.train.queue_capacity)
     output_queue = ctx.Queue(maxsize=learner.config.train.queue_capacity)
+    eval_result_queue = ctx.Queue(maxsize=learner.config.train.queue_capacity)
     shutdown_event = ctx.Event()
+    worker_done_event = ctx.Event()
     worker = ctx.Process(
         target=worker_entry,
         args=(
             str(Path(args.config).resolve()),
             command_queue,
             output_queue,
+            eval_result_queue,
             shutdown_event,
+            worker_done_event,
+            str(learner.paths.run_dir / "worker_bootstrap.log"),
             learner.max_env_steps,
         ),
         name="tm20ai-sac-worker",
@@ -58,7 +63,9 @@ def main() -> int:
     learner.attach_worker(
         command_queue=command_queue,
         output_queue=output_queue,
+        eval_result_queue=eval_result_queue,
         shutdown_event=shutdown_event,
+        worker_done_event=worker_done_event,
         worker_process=worker,
     )
 
@@ -73,13 +80,11 @@ def main() -> int:
         exit_code = 1
         log(f"ERROR: {exc}")
     finally:
-        learner.request_shutdown()
-        worker.join(timeout=30.0)
-        if worker.is_alive():
-            log("Worker did not exit cleanly; terminating.")
-            worker.terminate()
-            worker.join(timeout=5.0)
-        final_checkpoint = learner.save_checkpoint(final=True)
+        final_checkpoint = learner.finalize_run(timeout_seconds=30.0)
+        if not learner.clean_shutdown:
+            log("Worker did not exit cleanly; final summary recorded an unclean shutdown.")
+        if learner.latest_eval_summary is not None:
+            log(f"latest_eval_env_step={learner.latest_eval_summary.get('env_step')}")
         log(f"final_checkpoint={final_checkpoint}")
         learner.close()
 

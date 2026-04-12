@@ -217,6 +217,23 @@ class TM20AIRtInterface(RealTimeGymInterface):
     def get_runtime_metrics(self) -> dict[str, Any]:
         return self._timing_metrics.snapshot()
 
+    def describe_capture_bootstrap(self) -> dict[str, Any]:
+        return self._capture.describe_bootstrap_context()
+
+    def bootstrap_capture(self) -> dict[str, Any]:
+        context = self.describe_capture_bootstrap()
+        self._capture.ensure_started()
+        binding = self._capture.binding
+        context["capture_state"] = self._capture.state.value
+        context["active_binding"] = None if binding is None else {
+            "device_idx": binding.device_idx,
+            "output_idx": binding.output_idx,
+            "backend": binding.backend,
+            "monitor_device_name": binding.monitor_device_name,
+            "output_device_name": binding.output_device_name,
+        }
+        return context
+
     def close(self) -> None:
         self._gamepad.close()
         self._capture.close()

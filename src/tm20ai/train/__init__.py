@@ -14,6 +14,7 @@ __all__ = [
     "ScriptedPolicyAdapter",
     "TelemetryFeatureBuilder",
     "TorchCheckpointPolicyAdapter",
+    "EvalResult",
     "run_policy_episodes_on_env",
     "seed_replay_from_demo_sidecars",
     "split_demo_dataset",
@@ -38,6 +39,7 @@ if TYPE_CHECKING:
     from ..data.dataset import FullBehaviorCloningDataset, seed_replay_from_demo_sidecars, split_demo_dataset
     from .features import TelemetryFeatureBuilder
     from .learner import SACLearner
+    from .protocol import EvalResult
     from .replay import ReplayBuffer
     from .worker import worker_entry
 
@@ -58,11 +60,13 @@ def __getattr__(name: str) -> Any:
         from ..data.dataset import FullBehaviorCloningDataset, seed_replay_from_demo_sidecars, split_demo_dataset
         from .features import TelemetryFeatureBuilder
         from .learner import SACLearner
+        from .protocol import EvalResult
         from .replay import ReplayBuffer
         from .worker import worker_entry
 
         return {
             "ActorPolicyAdapter": ActorPolicyAdapter,
+            "EvalResult": EvalResult,
             "FullBehaviorCloningDataset": FullBehaviorCloningDataset,
             "FixedActionPolicy": FixedActionPolicy,
             "PolicyAdapter": PolicyAdapter,
