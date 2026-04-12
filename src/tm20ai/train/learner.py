@@ -46,6 +46,7 @@ class TrainRunPaths:
     checkpoints_dir: Path
     summary_json: Path
     tensorboard_dir: Path
+    actor_sync_path: Path
 
 
 class SACLearner:
@@ -56,17 +57,35 @@ class SACLearner:
         run_name: str | None = None,
         max_env_steps: int | None = None,
         init_actor: str | Path | None = None,
+        init_mode: str = "scratch",
+        demo_root: str | Path | None = None,
         seed_demos: str | Path | None = None,
+        eval_episodes_override: int | None = None,
     ) -> None:
         self.config_path = Path(config_path).resolve()
         self.config: TM20AIConfig = load_tm20ai_config(self.config_path)
         if self.config.train.algorithm != "sac":
             raise ValueError(f"Unsupported training algorithm: {self.config.train.algorithm!r}")
+        if init_mode not in {"scratch", "actor_only", "actor_plus_critic_encoders"}:
+            raise ValueError(f"Unsupported FULL SAC init_mode: {init_mode!r}")
+        if init_mode == "scratch" and init_actor is not None:
+            raise ValueError("init_actor requires init_mode to be actor_only or actor_plus_critic_encoders.")
+        if init_mode != "scratch" and init_actor is None:
+            raise ValueError("BC warm start requires --init-actor with init_mode actor_only or actor_plus_critic_encoders.")
         self.repo_root = self.config_path.parents[1]
         self.config_snapshot = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
         run_prefix = f"{self.config.observation.mode}_sac"
         self.run_name = run_name or f"{run_prefix}_{timestamp_tag()}"
         self.max_env_steps = self.config.train.max_env_steps if max_env_steps is None else int(max_env_steps)
+        self.eval_episodes = self.config.eval.episodes if eval_episodes_override is None else int(eval_episodes_override)
+        self.init_mode = init_mode
+        self.bc_checkpoint_path = None if init_actor is None else str(Path(init_actor).resolve())
+        self.bc_checkpoint_metadata: dict[str, Any] | None = None
+        self.demo_root = None if demo_root is None else str(Path(demo_root).resolve())
+        self.replay_seeded = False
+        self.run_start_timestamp = _utc_now()
+        self.run_end_timestamp: str | None = None
+        self._run_start_monotonic = time.monotonic()
 
         run_paths = build_run_artifact_paths(self.config, mode="train", run_name=self.run_name)
         self.paths = TrainRunPaths(
@@ -74,6 +93,7 @@ class SACLearner:
             checkpoints_dir=ensure_directory(run_paths.run_dir / "checkpoints"),
             summary_json=run_paths.summary_json,
             tensorboard_dir=run_paths.tensorboard_dir,
+            actor_sync_path=ensure_directory(run_paths.run_dir / "worker_sync") / "latest_actor.pt",
         )
         self.writer = TensorBoardScalarLogger(self.paths.tensorboard_dir)
 
@@ -100,10 +120,16 @@ class SACLearner:
             telemetry_dim=telemetry_dim,
         )
         if init_actor is not None:
-            self._load_actor_only(init_actor)
+            self.bc_checkpoint_metadata = self.agent.load_bc_warm_start(init_actor, init_mode=init_mode)
+            if self.demo_root is None and self.bc_checkpoint_metadata.get("demo_root") is not None:
+                self.demo_root = str(self.bc_checkpoint_metadata["demo_root"])
         self.replay = ReplayBuffer.from_config(self.config)
         if seed_demos is not None:
-            seeded = seed_replay_from_demo_sidecars(self.replay, Path(seed_demos).resolve())
+            seeded_root = Path(seed_demos).resolve()
+            seeded = seed_replay_from_demo_sidecars(self.replay, seeded_root)
+            self.replay_seeded = seeded > 0
+            if self.demo_root is None:
+                self.demo_root = str(seeded_root)
             self.writer.add_scalar("train/demo_seeded_transitions", float(seeded), step=0)
 
         self.command_queue = None
@@ -121,6 +147,8 @@ class SACLearner:
         self.latest_checkpoint_path: Path | None = None
         self.last_worker_heartbeat: dict[str, Any] | None = None
         self.eval_in_flight = False
+        self.pending_eval: dict[str, Any] | None = None
+        self.started_eval: dict[str, Any] | None = None
         self.pending_checkpoint_step: int | None = None
         self.latest_eval_step: int = -1
         self.checkpoint_history: list[dict[str, Any]] = []
@@ -189,6 +217,10 @@ class SACLearner:
                 "observation_mode": self.config.observation.mode,
                 "latest_eval_summary_path": self.latest_eval_summary_path,
                 "latest_eval_env_step": None if self.latest_eval_summary is None else self.latest_eval_summary.get("env_step"),
+                "init_mode": self.init_mode,
+                "bc_checkpoint_path": self.bc_checkpoint_path,
+                "demo_root": self.demo_root,
+                "replay_seeded": self.replay_seeded,
             },
         )
         self.latest_checkpoint_path = checkpoint_path
@@ -196,6 +228,7 @@ class SACLearner:
             "path": str(checkpoint_path),
             "env_step": self.env_step,
             "learner_step": self.learner_step,
+            "replay_size": self.replay.size,
             "timestamp": _utc_now(),
             "final": final,
             "latest_eval_summary_path": self.latest_eval_summary_path,
@@ -217,10 +250,11 @@ class SACLearner:
             return
         if not force and self.learner_step <= 0:
             return
+        actor_state_path = self._write_actor_sync_state()
         self._put_command(
             {
                 "type": "set_actor",
-                "actor_state_dict": self.agent.actor_state_dict_cpu(),
+                "actor_state_path": str(actor_state_path),
                 "env_step": self.env_step,
                 "learner_step": self.learner_step,
                 "observation_mode": self.config.observation.mode,
@@ -290,7 +324,7 @@ class SACLearner:
         self._put_command(
             {
                 "type": "run_eval",
-                "episodes": self.config.eval.episodes,
+                "episodes": self.eval_episodes,
                 "seed_base": self.config.eval.seed_base,
                 "record_video": self.config.eval.record_video,
                 "run_name": f"{self.run_name}_step_{scheduled_step:08d}",
@@ -300,12 +334,20 @@ class SACLearner:
             }
         )
         self.eval_in_flight = True
+        self.pending_eval = {
+            "run_name": f"{self.run_name}_step_{scheduled_step:08d}",
+            "env_step": scheduled_step,
+            "learner_step": self.learner_step,
+            "episodes": self.eval_episodes,
+            "scheduled_at": _utc_now(),
+        }
         if self.env_step >= self.next_checkpoint_step:
             self.pending_checkpoint_step = scheduled_step
             while self.next_checkpoint_step <= scheduled_step:
                 self.next_checkpoint_step += self.config.train.checkpoint_interval_steps
         while self.next_eval_step <= scheduled_step:
             self.next_eval_step += self.config.train.eval_interval_steps
+        self._write_run_summary()
 
     def maybe_checkpoint(self) -> None:
         if self.eval_in_flight:
@@ -382,6 +424,16 @@ class SACLearner:
             return 0
         if message_type == "eval_result":
             return 0
+        if message_type == "eval_started":
+            self.started_eval = {
+                "run_name": message.get("run_name"),
+                "env_step": int(message.get("env_step", self.env_step)),
+                "learner_step": int(message.get("learner_step", self.learner_step)),
+                "episodes": int(message.get("episodes", self.eval_episodes)),
+                "timestamp": message.get("timestamp"),
+            }
+            self._write_run_summary()
+            return 0
         if message_type == "heartbeat":
             self.last_worker_heartbeat = dict(message)
             return 0
@@ -400,6 +452,14 @@ class SACLearner:
                 if self.shutdown_event is not None and self.shutdown_event.is_set():
                     return
 
+    def _write_actor_sync_state(self) -> Path:
+        actor_state_path = self.paths.actor_sync_path
+        actor_state_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = actor_state_path.with_suffix(".tmp")
+        torch.save(self.agent.actor_state_dict_cpu(), temp_path)
+        temp_path.replace(actor_state_path)
+        return actor_state_path
+
     def _log_update(self, update: SACUpdateResult) -> None:
         self.writer.add_scalars_from_mapping("train/update", asdict(update), step=self.learner_step)
         self.writer.add_scalar("train/replay_size", float(self.replay.size), step=self.learner_step)
@@ -413,6 +473,8 @@ class SACLearner:
         self.latest_eval_summary = dict(payload.summary)
         self.latest_eval_summary_path = payload.summary_path
         self.eval_in_flight = False
+        self.pending_eval = None
+        self.started_eval = None
         eval_entry = {
             "checkpoint_step": payload.checkpoint_step,
             "env_step": payload.env_step,
@@ -441,36 +503,42 @@ class SACLearner:
         return ((current // interval) + 1) * interval
 
     def _write_run_summary(self) -> None:
+        now_timestamp = self.run_end_timestamp or _utc_now()
         write_json(
             self.paths.summary_json,
             {
                 "run_name": self.run_name,
                 "config_path": str(self.config_path),
                 "device": str(self.device),
+                "run_start_timestamp": self.run_start_timestamp,
+                "run_end_timestamp": self.run_end_timestamp,
+                "wall_clock_elapsed_seconds": time.monotonic() - self._run_start_monotonic,
                 "env_step": self.env_step,
                 "learner_step": self.learner_step,
                 "episode_count": self.episode_count,
                 "replay_size": self.replay.size,
+                "init_mode": self.init_mode,
+                "bc_checkpoint_path": self.bc_checkpoint_path,
+                "bc_checkpoint_metadata": self.bc_checkpoint_metadata,
+                "demo_root": self.demo_root,
+                "replay_seeded": self.replay_seeded,
+                "eval_episodes": self.eval_episodes,
                 "latest_checkpoint_path": None if self.latest_checkpoint_path is None else str(self.latest_checkpoint_path),
                 "latest_eval_summary": self.latest_eval_summary,
                 "latest_eval_summary_path": self.latest_eval_summary_path,
+                "eval_in_flight": self.eval_in_flight,
+                "pending_eval": self.pending_eval,
+                "started_eval": self.started_eval,
                 "checkpoint_history": self.checkpoint_history,
                 "eval_history": self.eval_history,
                 "last_worker_heartbeat": self.last_worker_heartbeat,
                 "termination_reason": self.termination_reason,
                 "clean_shutdown": self.clean_shutdown,
                 "worker_exit": self.worker_exit,
-                "timestamp": _utc_now(),
+                "timestamp": now_timestamp,
                 "observation_mode": self.config.observation.mode,
             },
         )
-
-    def _load_actor_only(self, checkpoint_path: str | Path) -> None:
-        payload = torch.load(Path(checkpoint_path).resolve(), map_location="cpu")
-        actor_state = payload.get("actor_state_dict")
-        if actor_state is None:
-            raise RuntimeError(f"Checkpoint {checkpoint_path} does not contain actor_state_dict.")
-        self.agent.actor.load_state_dict(actor_state)
 
     def finalize_run(self, *, timeout_seconds: float = 30.0) -> Path:
         if self.termination_reason is None:
@@ -513,6 +581,7 @@ class SACLearner:
             "timeout": timeout_hit,
         }
         self.clean_shutdown = bool(done_event_set and not terminated)
+        self.run_end_timestamp = _utc_now()
         final_checkpoint = self.save_checkpoint(final=True)
         self._write_run_summary()
         return final_checkpoint

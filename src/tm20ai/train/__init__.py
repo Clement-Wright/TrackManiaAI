@@ -6,8 +6,11 @@ from typing import TYPE_CHECKING, Any
 
 __all__ = [
     "ActorPolicyAdapter",
+    "build_comparison_report",
+    "build_training_report",
     "FullBehaviorCloningDataset",
     "FixedActionPolicy",
+    "KeyboardTeleopPolicy",
     "PolicyAdapter",
     "ReplayBuffer",
     "SACLearner",
@@ -19,6 +22,8 @@ __all__ = [
     "seed_replay_from_demo_sidecars",
     "split_demo_dataset",
     "worker_entry",
+    "write_comparison_report",
+    "write_training_report",
     "ZeroPolicy",
     "resolve_policy_adapter",
     "run_policy_episodes",
@@ -28,6 +33,7 @@ if TYPE_CHECKING:
     from .evaluator import (
         ActorPolicyAdapter,
         FixedActionPolicy,
+        KeyboardTeleopPolicy,
         PolicyAdapter,
         ScriptedPolicyAdapter,
         TorchCheckpointPolicyAdapter,
@@ -41,6 +47,12 @@ if TYPE_CHECKING:
     from .learner import SACLearner
     from .protocol import EvalResult
     from .replay import ReplayBuffer
+    from .reporting import (
+        build_comparison_report,
+        build_training_report,
+        write_comparison_report,
+        write_training_report,
+    )
     from .worker import worker_entry
 
 
@@ -49,6 +61,7 @@ def __getattr__(name: str) -> Any:
         from .evaluator import (
             ActorPolicyAdapter,
             FixedActionPolicy,
+            KeyboardTeleopPolicy,
             PolicyAdapter,
             ScriptedPolicyAdapter,
             TorchCheckpointPolicyAdapter,
@@ -62,13 +75,22 @@ def __getattr__(name: str) -> Any:
         from .learner import SACLearner
         from .protocol import EvalResult
         from .replay import ReplayBuffer
+        from .reporting import (
+            build_comparison_report,
+            build_training_report,
+            write_comparison_report,
+            write_training_report,
+        )
         from .worker import worker_entry
 
         return {
             "ActorPolicyAdapter": ActorPolicyAdapter,
+            "build_comparison_report": build_comparison_report,
+            "build_training_report": build_training_report,
             "EvalResult": EvalResult,
             "FullBehaviorCloningDataset": FullBehaviorCloningDataset,
             "FixedActionPolicy": FixedActionPolicy,
+            "KeyboardTeleopPolicy": KeyboardTeleopPolicy,
             "PolicyAdapter": PolicyAdapter,
             "ReplayBuffer": ReplayBuffer,
             "SACLearner": SACLearner,
@@ -77,6 +99,8 @@ def __getattr__(name: str) -> Any:
             "split_demo_dataset": split_demo_dataset,
             "TelemetryFeatureBuilder": TelemetryFeatureBuilder,
             "TorchCheckpointPolicyAdapter": TorchCheckpointPolicyAdapter,
+            "write_comparison_report": write_comparison_report,
+            "write_training_report": write_training_report,
             "run_policy_episodes_on_env": run_policy_episodes_on_env,
             "worker_entry": worker_entry,
             "ZeroPolicy": ZeroPolicy,

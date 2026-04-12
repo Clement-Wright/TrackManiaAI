@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+import pytest
 
 from tm20ai.algos.sac import SACAgent
 from tm20ai.config import SACConfig
@@ -120,3 +121,100 @@ def test_sac_agent_update_smoke_for_lidar() -> None:
     assert np.isfinite(update.actor_loss)
     assert np.isfinite(update.critic_loss)
     assert np.isfinite(update.alpha)
+
+
+def _write_bc_actor_checkpoint(path, *, observation_shape=(4, 64, 64), telemetry_dim=14, action_dim=3) -> dict:
+    actor = FullObservationActor(
+        observation_shape=observation_shape,
+        telemetry_dim=telemetry_dim,
+        action_dim=action_dim,
+    )
+    with torch.no_grad():
+        for parameter in actor.parameters():
+            parameter.fill_(0.125)
+    payload = {
+        "checkpoint_kind": "bc_actor",
+        "observation_mode": "full",
+        "actor_state_dict": actor.state_dict(),
+        "observation_shape": observation_shape,
+        "telemetry_dim": telemetry_dim,
+        "action_dim": action_dim,
+        "map_uid": "test-map",
+        "demo_root": "C:/demo-root",
+        "epoch": 3,
+        "train_loss": 0.1,
+        "validation_loss": 0.2,
+    }
+    torch.save(payload, path)
+    return payload
+
+
+def test_sac_agent_load_bc_warm_start_actor_only(tmp_path) -> None:
+    checkpoint_path = tmp_path / "bc_actor.pt"
+    payload = _write_bc_actor_checkpoint(checkpoint_path)
+    agent = SACAgent(
+        config=SACConfig(),
+        observation_mode="full",
+        device=torch.device("cpu"),
+        observation_shape=(4, 64, 64),
+        telemetry_dim=14,
+    )
+    original_critic_state = {
+        key: value.clone()
+        for key, value in agent.critic1.vision_encoder.state_dict().items()
+    }
+
+    metadata = agent.load_bc_warm_start(checkpoint_path, init_mode="actor_only")
+
+    for key, value in payload["actor_state_dict"].items():
+        assert torch.equal(agent.actor.state_dict()[key], value)
+    for key, value in original_critic_state.items():
+        assert torch.equal(agent.critic1.vision_encoder.state_dict()[key], value)
+    assert metadata["checkpoint_kind"] == "bc_actor"
+    assert metadata["map_uid"] == "test-map"
+
+
+def test_sac_agent_load_bc_warm_start_actor_plus_critic_encoders(tmp_path) -> None:
+    checkpoint_path = tmp_path / "bc_actor.pt"
+    payload = _write_bc_actor_checkpoint(checkpoint_path)
+    agent = SACAgent(
+        config=SACConfig(),
+        observation_mode="full",
+        device=torch.device("cpu"),
+        observation_shape=(4, 64, 64),
+        telemetry_dim=14,
+    )
+
+    agent.load_bc_warm_start(checkpoint_path, init_mode="actor_plus_critic_encoders")
+
+    actor_state = payload["actor_state_dict"]
+    expected_vision = {
+        key.removeprefix("vision_encoder."): value
+        for key, value in actor_state.items()
+        if key.startswith("vision_encoder.")
+    }
+    expected_telemetry = {
+        key.removeprefix("telemetry_encoder."): value
+        for key, value in actor_state.items()
+        if key.startswith("telemetry_encoder.")
+    }
+    for critic in (agent.critic1, agent.critic2, agent.target_critic1, agent.target_critic2):
+        for key, value in expected_vision.items():
+            assert torch.equal(critic.vision_encoder.state_dict()[key], value)
+        for key, value in expected_telemetry.items():
+            assert torch.equal(critic.telemetry_encoder.state_dict()[key], value)
+
+
+def test_sac_agent_rejects_incompatible_bc_checkpoint(tmp_path) -> None:
+    checkpoint_path = tmp_path / "bc_actor_bad.pt"
+    _write_bc_actor_checkpoint(checkpoint_path, observation_shape=(3, 64, 64))
+    agent = SACAgent(
+        config=SACConfig(),
+        observation_mode="full",
+        device=torch.device("cpu"),
+        observation_shape=(4, 64, 64),
+        telemetry_dim=14,
+    )
+
+    with pytest.raises(RuntimeError, match="observation_shape"):
+        agent.load_bc_warm_start(checkpoint_path, init_mode="actor_only")

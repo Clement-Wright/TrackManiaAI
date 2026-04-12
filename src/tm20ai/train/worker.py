@@ -52,6 +52,9 @@ class SACWorker:
         self.shutdown_event = shutdown_event
         self.worker_done_event = worker_done_event
         self.bootstrap_log_path = None if bootstrap_log_path is None else Path(bootstrap_log_path)
+        self.worker_events_log_path = None if self.bootstrap_log_path is None else self.bootstrap_log_path.with_name(
+            "worker_events.log"
+        )
         self.env_factory = env_factory or (lambda path, benchmark=False: make_env(path, benchmark=benchmark))
         self._rng = np.random.default_rng(self.config.train.seed)
 
@@ -71,6 +74,23 @@ class SACWorker:
         self._last_heartbeat = monotonic()
         self._pending_transitions: list[dict[str, Any]] = []
         self._shutdown_requested = False
+
+    def _write_worker_event(self, event: str, payload: Mapping[str, Any] | None = None) -> None:
+        if self.worker_events_log_path is None:
+            return
+        self.worker_events_log_path.parent.mkdir(parents=True, exist_ok=True)
+        body = {
+            "timestamp": time.time(),
+            "pid": os.getpid(),
+            "event": event,
+            "env_step": self._env_step,
+            "observation_mode": self.observation_mode,
+        }
+        if payload is not None:
+            body["payload"] = dict(payload)
+        with self.worker_events_log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(body, sort_keys=True))
+            handle.write("\n")
 
     def _write_bootstrap_log(self, phase: str, payload: Mapping[str, Any]) -> None:
         if not self.config.capture.bootstrap_log or self.bootstrap_log_path is None:
@@ -129,14 +149,51 @@ class SACWorker:
                     break
                 if pending_eval is not None:
                     self._flush_pending_transitions(force=True)
-                    result = self._run_eval(env, pending_eval)
-                    self._put_eval_result(
-                        EvalResult.from_run_result(
-                            checkpoint_step=int(pending_eval.get("checkpoint_step", pending_eval.get("env_step", self._env_step))),
-                            env_step=int(pending_eval.get("env_step", self._env_step)),
-                            learner_step=int(pending_eval.get("learner_step", 0)),
-                            result=result,
+                    eval_metadata = {
+                        "run_name": pending_eval.get("run_name"),
+                        "env_step": int(pending_eval.get("env_step", self._env_step)),
+                        "learner_step": int(pending_eval.get("learner_step", 0)),
+                        "episodes": int(pending_eval.get("episodes", self.config.eval.episodes)),
+                    }
+                    self._put_message(
+                        {
+                            "type": "eval_started",
+                            **eval_metadata,
+                            "timestamp": time.time(),
+                        }
+                    )
+                    self._write_worker_event("eval_begin", eval_metadata)
+                    try:
+                        result = self._run_eval(env, pending_eval)
+                    except Exception:
+                        self._write_worker_event(
+                            "eval_exception",
+                            {
+                                **eval_metadata,
+                                "error": traceback.format_exc(),
+                            },
                         )
+                        raise
+                    self._write_worker_event(
+                        "eval_end",
+                        {
+                            **eval_metadata,
+                            "summary_path": str(result.get("summary_path")),
+                        },
+                    )
+                    eval_result = EvalResult.from_run_result(
+                        checkpoint_step=int(pending_eval.get("checkpoint_step", pending_eval.get("env_step", self._env_step))),
+                        env_step=int(pending_eval.get("env_step", self._env_step)),
+                        learner_step=int(pending_eval.get("learner_step", 0)),
+                        result=result,
+                    )
+                    self._put_eval_result(eval_result)
+                    self._write_worker_event(
+                        "eval_result_published",
+                        {
+                            **eval_metadata,
+                            "summary_path": eval_result.summary_path,
+                        },
                     )
                     if self._should_shutdown():
                         break
@@ -329,12 +386,46 @@ class SACWorker:
                 break
             command_type = str(command.get("type", ""))
             if command_type == "set_actor":
-                self.actor.load_state_dict(command["actor_state_dict"])
+                self._write_worker_event(
+                    "command_received",
+                    {
+                        "command_type": "set_actor",
+                        "learner_step": int(command.get("learner_step", 0)),
+                        "requested_env_step": int(command.get("env_step", self._env_step)),
+                        "actor_state_path": command.get("actor_state_path"),
+                    },
+                )
+                if "actor_state_dict" in command:
+                    actor_state_dict = command["actor_state_dict"]
+                else:
+                    actor_state_path = command.get("actor_state_path")
+                    if actor_state_path is None:
+                        raise RuntimeError("set_actor command is missing actor_state_dict and actor_state_path.")
+                    assert self._torch is not None
+                    actor_state_dict = self._torch.load(actor_state_path, map_location="cpu")
+                self.actor.load_state_dict(actor_state_dict)
                 self.actor.eval()
                 self._has_policy_weights = True
             elif command_type == "run_eval":
+                self._write_worker_event(
+                    "command_received",
+                    {
+                        "command_type": "run_eval",
+                        "run_name": command.get("run_name"),
+                        "learner_step": int(command.get("learner_step", 0)),
+                        "requested_env_step": int(command.get("env_step", self._env_step)),
+                        "episodes": int(command.get("episodes", self.config.eval.episodes)),
+                    },
+                )
                 pending_eval = dict(command)
             elif command_type == "shutdown":
+                self._write_worker_event(
+                    "command_received",
+                    {
+                        "command_type": "shutdown",
+                        "requested_env_step": self._env_step,
+                    },
+                )
                 self._shutdown_requested = True
         if self._shutdown_requested:
             return None

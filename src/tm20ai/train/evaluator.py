@@ -4,10 +4,9 @@ import importlib
 import importlib.util
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Protocol
 
 import numpy as np
-import torch
 
 from ..capture import lidar_feature_dim
 from ..config import TM20AIConfig, load_tm20ai_config
@@ -15,10 +14,11 @@ from ..data.demo_recorder import DemoRecorder
 from ..data.parquet_writer import build_run_artifact_paths, sha256_file, timestamp_tag, write_json
 from ..env import TM20AIGymEnv, make_env
 from ..env.trajectory import load_runtime_trajectory, runtime_trajectory_path_for_map
-from ..models.full_actor_critic import FullObservationActor
-from ..models.lidar_actor_critic import LidarActor
 from .features import TELEMETRY_DIM, TelemetryFeatureBuilder
 from .metrics import TensorBoardScalarLogger, aggregate_episode_summaries
+
+if TYPE_CHECKING:
+    import torch
 
 
 class PolicyAdapter(Protocol):
@@ -46,6 +46,55 @@ class FixedActionPolicy:
         return np.asarray(self.action, dtype=np.float32)
 
 
+VK_UP = 0x26
+VK_DOWN = 0x28
+VK_LEFT = 0x25
+VK_RIGHT = 0x27
+VK_W = 0x57
+VK_A = 0x41
+VK_S = 0x53
+VK_D = 0x44
+
+
+def _load_win32api():
+    try:
+        import win32api
+    except ImportError as exc:  # pragma: no cover - Windows dependency guard
+        raise RuntimeError("pywin32 is required for the human teleop policy.") from exc
+    return win32api
+
+
+@dataclass(slots=True)
+class KeyboardTeleopPolicy:
+    name: str = "human"
+    key_state_reader: Callable[[int], int] | None = None
+
+    def __post_init__(self) -> None:
+        if self.key_state_reader is None:
+            win32api = _load_win32api()
+            self.key_state_reader = win32api.GetAsyncKeyState
+
+    def _pressed(self, virtual_key: int) -> bool:
+        assert self.key_state_reader is not None
+        return bool(self.key_state_reader(virtual_key) & 0x8000)
+
+    def act(self, observation: np.ndarray, info: Mapping[str, Any]) -> np.ndarray:
+        del observation, info
+        gas = 1.0 if (self._pressed(VK_UP) or self._pressed(VK_W)) else 0.0
+        brake = 1.0 if (self._pressed(VK_DOWN) or self._pressed(VK_S)) else 0.0
+        steer_left = self._pressed(VK_LEFT) or self._pressed(VK_A)
+        steer_right = self._pressed(VK_RIGHT) or self._pressed(VK_D)
+        if steer_left and steer_right:
+            steer = 0.0
+        elif steer_left:
+            steer = -1.0
+        elif steer_right:
+            steer = 1.0
+        else:
+            steer = 0.0
+        return np.asarray([gas, brake, steer], dtype=np.float32)
+
+
 @dataclass(slots=True)
 class ScriptedPolicyAdapter:
     callback: Callable[[np.ndarray, Mapping[str, Any]], np.ndarray]
@@ -57,13 +106,15 @@ class ScriptedPolicyAdapter:
 
 
 class ActorPolicyAdapter:
-    def __init__(self, actor: torch.nn.Module, *, observation_mode: str, name: str = "checkpoint") -> None:
+    def __init__(self, actor: "torch.nn.Module", *, observation_mode: str, name: str = "checkpoint") -> None:
         self.name = name
         self._actor = actor.eval()
         self._observation_mode = observation_mode
         self._features = TelemetryFeatureBuilder() if self._observation_mode == "full" else None
 
     def act(self, observation: np.ndarray, info: Mapping[str, Any]) -> np.ndarray:
+        import torch
+
         if self._observation_mode == "full":
             assert self._features is not None
             telemetry = self._features.encode(info)
@@ -82,6 +133,8 @@ class ActorPolicyAdapter:
 
 class TorchCheckpointPolicyAdapter:
     def __init__(self, checkpoint_path: str | Path):
+        import torch
+
         self.name = "checkpoint"
         self.checkpoint_path = Path(checkpoint_path).resolve()
         payload = torch.load(self.checkpoint_path, map_location="cpu")
@@ -94,6 +147,8 @@ class TorchCheckpointPolicyAdapter:
         observation_mode = str(payload.get("observation_mode", "full"))
         action_dim = int(payload.get("action_dim", 3))
         if observation_mode == "full":
+            from ..models.full_actor_critic import FullObservationActor
+
             telemetry_dim = int(payload.get("telemetry_dim", TELEMETRY_DIM))
             observation_shape = tuple(payload.get("observation_shape", (4, 64, 64)))
             actor = FullObservationActor(
@@ -102,6 +157,8 @@ class TorchCheckpointPolicyAdapter:
                 action_dim=action_dim,
             )
         else:
+            from ..models.lidar_actor_critic import LidarActor
+
             observation_shape = tuple(payload.get("observation_shape", (83,)))
             actor = LidarActor(observation_dim=int(observation_shape[0]), action_dim=action_dim)
         actor.load_state_dict(actor_state)
@@ -168,6 +225,8 @@ def resolve_policy_adapter(
     script: str | None = None,
     checkpoint: str | Path | None = None,
 ) -> PolicyAdapter:
+    if policy == "human":
+        return KeyboardTeleopPolicy()
     if policy == "zero":
         return ZeroPolicy()
     if policy == "fixed":
@@ -257,6 +316,7 @@ def run_policy_episodes_on_env(
 
         recorder.write_episode_index()
         aggregate = aggregate_episode_summaries(recorder.episode_index_rows, sector_count=config.eval.sector_count)
+        action_metrics = recorder.run_action_metrics()
         summary = {
             "mode": mode,
             "run_name": effective_run_name,
@@ -271,11 +331,23 @@ def run_policy_episodes_on_env(
             "map_uid": str(info["map_uid"]),
             "observation_mode": config.observation.mode,
             **aggregate,
+            **action_metrics,
         }
+        invalid_reason = None
+        valid_for_bc = True
+        if mode == "demos" and policy.name == "human" and int(action_metrics["total_nonzero_action_steps"]) == 0:
+            valid_for_bc = False
+            invalid_reason = "all_zero_actions"
+        summary["valid_for_bc"] = valid_for_bc
+        summary["invalid_reason"] = invalid_reason
         if summary_extra is not None:
             summary.update(dict(summary_extra))
         write_json(run_paths.summary_json, summary)
         writer.add_scalars_from_mapping(mode, aggregate, step=episodes)
+        if mode == "demos" and policy.name == "human" and not valid_for_bc:
+            raise RuntimeError(
+                "Human demo run did not record any non-zero actions. Focus Trackmania and retry with --episodes 1 first."
+            )
         return {
             "summary": summary,
             "summary_path": run_paths.summary_json,
