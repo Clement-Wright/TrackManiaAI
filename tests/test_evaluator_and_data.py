@@ -1,14 +1,29 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
-from tm20ai.data.dataset import FullBehaviorCloningDataset, split_demo_dataset
-from tm20ai.train.evaluator import FixedActionPolicy, ScriptedPolicyAdapter, ZeroPolicy, run_policy_episodes
+from tm20ai.data.dataset import (
+    FullBehaviorCloningDataset,
+    split_demo_dataset,
+    validate_full_demo_dataset,
+)
+from tm20ai.train.evaluator import (
+    FixedActionPolicy,
+    KeyboardTeleopPolicy,
+    ScriptedPolicyAdapter,
+    VK_A,
+    VK_D,
+    VK_W,
+    ZeroPolicy,
+    run_policy_episodes,
+)
 
 
 class FakeEnv:
@@ -233,12 +248,185 @@ def test_demo_runs_write_sidecars_and_dataset_split(tmp_path, monkeypatch) -> No
 
     split = split_demo_dataset(Path(result["run_dir"]), validation_fraction=0.5, seed=7)
     assert split.train_episodes
+    validation = validate_full_demo_dataset(Path(result["run_dir"]))
+    assert validation.total_nonzero_action_steps > 0
     dataset = FullBehaviorCloningDataset(split.train_episodes)
     assert len(dataset) > 0
     observation, telemetry, action = dataset[0]
     assert observation.shape == (4, 64, 64)
     assert telemetry.shape == (14,)
     assert action.shape == (3,)
+
+
+def test_keyboard_teleop_policy_maps_keys() -> None:
+    pressed = {VK_W, VK_D}
+    policy = KeyboardTeleopPolicy(key_state_reader=lambda key: 0x8000 if key in pressed else 0)
+    action = policy.act(np.zeros((4, 64, 64), dtype=np.uint8), {})
+    assert np.allclose(action, np.asarray([1.0, 0.0, 1.0], dtype=np.float32))
+
+    conflicting = KeyboardTeleopPolicy(key_state_reader=lambda key: 0x8000 if key in {VK_A, VK_D} else 0)
+    conflicting_action = conflicting.act(np.zeros((4, 64, 64), dtype=np.uint8), {})
+    assert np.allclose(conflicting_action, np.asarray([0.0, 0.0, 0.0], dtype=np.float32))
+
+
+def test_validate_full_demo_dataset_rejects_missing_sidecar(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "config.yaml"
+    artifacts_root = tmp_path / "artifacts"
+    trajectory_path = tmp_path / "trajectory_0p5m.npz"
+    write_test_config(config_path, artifacts_root)
+    write_test_trajectory(trajectory_path)
+
+    monkeypatch.setattr("tm20ai.train.evaluator.runtime_trajectory_path_for_map", lambda *args, **kwargs: trajectory_path)
+    env_factory = lambda _path, _benchmark=False: FakeEnv()
+    result = run_policy_episodes(
+        config_path=config_path,
+        mode="demos",
+        policy=FixedActionPolicy(action=np.asarray([1.0, 0.0, 0.0], dtype=np.float32)),
+        episodes=2,
+        seed_base=123,
+        record_video=False,
+        env_factory=env_factory,
+    )
+    sidecar = next((Path(result["run_dir"]) / "episodes").glob("*_observations.npz"))
+    sidecar.unlink()
+
+    with pytest.raises(RuntimeError, match="missing the observation sidecar"):
+        validate_full_demo_dataset(Path(result["run_dir"]))
+
+
+def test_validate_full_demo_dataset_rejects_mixed_map_uids_without_override(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "config.yaml"
+    artifacts_root = tmp_path / "artifacts"
+    trajectory_path = tmp_path / "trajectory_0p5m.npz"
+    write_test_config(config_path, artifacts_root)
+    write_test_trajectory(trajectory_path)
+
+    monkeypatch.setattr("tm20ai.train.evaluator.runtime_trajectory_path_for_map", lambda *args, **kwargs: trajectory_path)
+    env_factory = lambda _path, _benchmark=False: FakeEnv()
+    result = run_policy_episodes(
+        config_path=config_path,
+        mode="demos",
+        policy=FixedActionPolicy(action=np.asarray([1.0, 0.0, 0.0], dtype=np.float32)),
+        episodes=2,
+        seed_base=123,
+        record_video=False,
+        env_factory=env_factory,
+    )
+    metadata_paths = sorted((Path(result["run_dir"]) / "episodes").glob("*.json"))
+    metadata = json.loads(metadata_paths[-1].read_text(encoding="utf-8"))
+    metadata["map_uid"] = "other-map"
+    metadata_paths[-1].write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="multiple map_uids"):
+        validate_full_demo_dataset(Path(result["run_dir"]))
+
+    validation = validate_full_demo_dataset(Path(result["run_dir"]), allow_mixed_map_uids=True)
+    assert validation.valid_episode_count == 2
+    assert validation.sample_count > 0
+
+
+def test_human_demo_run_rejects_all_zero_actions(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "config.yaml"
+    artifacts_root = tmp_path / "artifacts"
+    trajectory_path = tmp_path / "trajectory_0p5m.npz"
+    write_test_config(config_path, artifacts_root)
+    write_test_trajectory(trajectory_path)
+
+    monkeypatch.setattr("tm20ai.train.evaluator.runtime_trajectory_path_for_map", lambda *args, **kwargs: trajectory_path)
+    env_factory = lambda _path, _benchmark=False: FakeEnv()
+    policy = KeyboardTeleopPolicy(key_state_reader=lambda _key: 0)
+
+    with pytest.raises(RuntimeError, match="did not record any non-zero actions"):
+        run_policy_episodes(
+            config_path=config_path,
+            mode="demos",
+            policy=policy,
+            episodes=1,
+            seed_base=123,
+            record_video=False,
+            env_factory=env_factory,
+        )
+
+    run_dir = artifacts_root / "demos"
+    summaries = sorted(run_dir.glob("*/summary.json"))
+    assert summaries
+    summary = json.loads(summaries[-1].read_text(encoding="utf-8"))
+    assert summary["valid_for_bc"] is False
+    assert summary["invalid_reason"] == "all_zero_actions"
+
+
+def test_validate_full_demo_dataset_rejects_zero_action_demos(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "config.yaml"
+    artifacts_root = tmp_path / "artifacts"
+    trajectory_path = tmp_path / "trajectory_0p5m.npz"
+    write_test_config(config_path, artifacts_root)
+    write_test_trajectory(trajectory_path)
+
+    monkeypatch.setattr("tm20ai.train.evaluator.runtime_trajectory_path_for_map", lambda *args, **kwargs: trajectory_path)
+    env_factory = lambda _path, _benchmark=False: FakeEnv()
+    result = run_policy_episodes(
+        config_path=config_path,
+        mode="demos",
+        policy=FixedActionPolicy(action=np.asarray([1.0, 0.0, 0.0], dtype=np.float32)),
+        episodes=1,
+        seed_base=123,
+        record_video=False,
+        env_factory=env_factory,
+    )
+    sidecar = next((Path(result["run_dir"]) / "episodes").glob("*_observations.npz"))
+    payload = dict(np.load(sidecar))
+    payload["action"] = np.zeros_like(payload["action"])
+    np.savez_compressed(sidecar, **payload)
+
+    with pytest.raises(RuntimeError, match="contain no non-zero recorded actions"):
+        validate_full_demo_dataset(Path(result["run_dir"]))
+
+
+def test_pretrain_bc_writes_best_and_final_checkpoints(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "config.yaml"
+    artifacts_root = tmp_path / "artifacts"
+    trajectory_path = tmp_path / "trajectory_0p5m.npz"
+    write_test_config(config_path, artifacts_root)
+    write_test_trajectory(trajectory_path)
+
+    monkeypatch.setattr("tm20ai.train.evaluator.runtime_trajectory_path_for_map", lambda *args, **kwargs: trajectory_path)
+    env_factory = lambda _path, _benchmark=False: FakeEnv()
+    demo_result = run_policy_episodes(
+        config_path=config_path,
+        mode="demos",
+        policy=FixedActionPolicy(action=np.asarray([1.0, 0.0, 0.0], dtype=np.float32)),
+        episodes=2,
+        seed_base=123,
+        record_video=False,
+        env_factory=env_factory,
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path("scripts") / "pretrain_bc.py"),
+            "--config",
+            str(config_path),
+            "--demos-root",
+            str(demo_result["run_dir"]),
+            "--run-name",
+            "unit_bc",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+
+    summary_path = artifacts_root / "bc" / "unit_bc" / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["observation_mode"] == "full"
+    assert summary["map_uid"] == "test-map"
+    assert summary["best_checkpoint_path"].endswith("actor_checkpoint_best.pt")
+    assert summary["final_checkpoint_path"].endswith("actor_checkpoint_final.pt")
+    assert Path(summary["best_checkpoint_path"]).exists()
+    assert Path(summary["final_checkpoint_path"]).exists()
 
 
 def test_export_video_fails_clearly_without_ffmpeg(tmp_path) -> None:

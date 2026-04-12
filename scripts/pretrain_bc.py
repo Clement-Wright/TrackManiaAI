@@ -16,7 +16,11 @@ if str(SRC) not in sys.path:
 
 from tm20ai.algos.bc import BehaviorCloningTrainer
 from tm20ai.config import load_tm20ai_config
-from tm20ai.data.dataset import FullBehaviorCloningDataset, split_demo_dataset
+from tm20ai.data.dataset import (
+    FullBehaviorCloningDataset,
+    split_episode_records,
+    validate_full_demo_dataset,
+)
 from tm20ai.data.parquet_writer import build_run_artifact_paths, sha256_file, timestamp_tag, write_json
 from tm20ai.models.full_actor_critic import FullObservationActor
 from tm20ai.train.metrics import TensorBoardScalarLogger
@@ -38,17 +42,58 @@ def _mean(values: list[float]) -> float:
     return sum(values) / max(1, len(values))
 
 
+def _save_actor_checkpoint(
+    checkpoint_path: Path,
+    *,
+    actor: FullObservationActor,
+    config_path: Path,
+    demos_root: Path,
+    map_uid: str | None,
+    epoch: int,
+    train_loss: float,
+    validation_loss: float | None,
+) -> None:
+    actor_state_dict = {key: value.detach().cpu() for key, value in actor.state_dict().items()}
+    torch.save(
+        {
+            "checkpoint_kind": "bc_actor",
+            "observation_mode": "full",
+            "actor_state_dict": actor_state_dict,
+            "observation_shape": (4, 64, 64),
+            "telemetry_dim": 14,
+            "action_dim": 3,
+            "map_uid": map_uid,
+            "demo_root": str(demos_root),
+            "config_snapshot": {
+                "config_path": str(config_path),
+                "config_sha256": sha256_file(config_path),
+            },
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "validation_loss": validation_loss,
+        },
+        checkpoint_path,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Pretrain a FULL-observation actor with behavior cloning demos.")
     parser.add_argument("--config", default=str(ROOT / "configs" / "full_bc.yaml"))
     parser.add_argument("--demos-root", required=True)
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--allow-mixed-map-uids", action="store_true")
     args = parser.parse_args()
 
-    config = load_tm20ai_config(args.config)
-    split = split_demo_dataset(
-        Path(args.demos_root).resolve(),
+    config_path = Path(args.config).resolve()
+    demos_root = Path(args.demos_root).resolve()
+    config = load_tm20ai_config(config_path)
+    validation = validate_full_demo_dataset(
+        demos_root,
+        allow_mixed_map_uids=args.allow_mixed_map_uids,
+    )
+    split = split_episode_records(
+        validation.episodes,
         validation_fraction=config.bc.validation_fraction,
         seed=config.train.seed,
     )
@@ -79,10 +124,13 @@ def main() -> int:
     run_name = args.run_name or f"full_bc_{timestamp_tag()}"
     run_paths = build_run_artifact_paths(config, mode="bc", run_name=run_name)
     writer = TensorBoardScalarLogger(run_paths.tensorboard_dir)
-    checkpoint_path = run_paths.run_dir / "actor_checkpoint.pt"
+    final_checkpoint_path = run_paths.run_dir / "actor_checkpoint_final.pt"
+    best_checkpoint_path = run_paths.run_dir / "actor_checkpoint_best.pt"
     summary_path = run_paths.summary_json
 
     best_validation = None
+    best_selection_metric = None
+    best_epoch = None
     epoch_rows: list[dict[str, float | int | None]] = []
     try:
         for epoch in range(config.bc.epochs):
@@ -107,49 +155,67 @@ def main() -> int:
                         )
                     )
                 validation_loss = _mean(validation_losses)
-                if best_validation is None or validation_loss < best_validation:
-                    best_validation = validation_loss
             epoch_summary = {
                 "epoch": epoch + 1,
                 "train_loss": _mean(train_losses),
                 "validation_loss": validation_loss,
             }
+            selection_metric = epoch_summary["train_loss"] if validation_loss is None else validation_loss
+            if best_selection_metric is None or selection_metric < best_selection_metric:
+                best_selection_metric = selection_metric
+                best_validation = validation_loss
+                best_epoch = epoch + 1
+                _save_actor_checkpoint(
+                    best_checkpoint_path,
+                    actor=actor,
+                    config_path=config_path,
+                    demos_root=demos_root,
+                    map_uid=validation.map_uid,
+                    epoch=epoch + 1,
+                    train_loss=epoch_summary["train_loss"],
+                    validation_loss=validation_loss,
+                )
             epoch_rows.append(epoch_summary)
             writer.add_scalar("bc/train_loss", epoch_summary["train_loss"], step=epoch + 1)
             if validation_loss is not None:
                 writer.add_scalar("bc/validation_loss", validation_loss, step=epoch + 1)
 
-        torch.save(
-            {
-                "observation_mode": "full",
-                "actor_state_dict": actor.cpu().state_dict(),
-                "observation_shape": (4, 64, 64),
-                "telemetry_dim": 14,
-                "action_dim": 3,
-                "config_snapshot": {
-                    "config_path": str(Path(args.config).resolve()),
-                    "config_sha256": sha256_file(Path(args.config).resolve()),
-                },
-                "epochs": config.bc.epochs,
-            },
-            checkpoint_path,
+        _save_actor_checkpoint(
+            final_checkpoint_path,
+            actor=actor,
+            config_path=config_path,
+            demos_root=demos_root,
+            map_uid=validation.map_uid,
+            epoch=config.bc.epochs,
+            train_loss=float(epoch_rows[-1]["train_loss"]),
+            validation_loss=None if epoch_rows[-1]["validation_loss"] is None else float(epoch_rows[-1]["validation_loss"]),
         )
         summary = {
             "run_name": run_name,
-            "config_path": str(Path(args.config).resolve()),
-            "config_sha256": sha256_file(Path(args.config).resolve()),
-            "demos_root": str(Path(args.demos_root).resolve()),
+            "config_path": str(config_path),
+            "config_sha256": sha256_file(config_path),
+            "demos_root": str(demos_root),
             "device": str(device),
+            "observation_mode": "full",
+            "map_uid": validation.map_uid,
             "epochs": config.bc.epochs,
+            "total_episode_count": validation.total_episode_count,
+            "valid_episode_count": validation.valid_episode_count,
             "train_episode_count": len(split.train_episodes),
             "validation_episode_count": len(split.validation_episodes),
             "train_sample_count": len(train_dataset),
             "validation_sample_count": len(validation_dataset),
+            "dataset_sample_count": validation.sample_count,
             "best_validation_loss": best_validation,
-            "checkpoint_path": str(checkpoint_path),
+            "best_epoch": best_epoch,
+            "best_checkpoint_path": str(best_checkpoint_path),
+            "final_checkpoint_path": str(final_checkpoint_path),
+            "allow_mixed_map_uids": args.allow_mixed_map_uids,
             "history": epoch_rows,
         }
         write_json(summary_path, summary)
+        log(f"best_checkpoint={best_checkpoint_path}")
+        log(f"final_checkpoint={final_checkpoint_path}")
         log(f"summary={summary_path}")
         log(json.dumps(summary, indent=2))
         return 0

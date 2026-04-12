@@ -51,6 +51,11 @@ class DemoRecorder:
         self._current_observations: list[np.ndarray] = []
         self._current_telemetry: list[np.ndarray] = []
         self._current_actions: list[np.ndarray] = []
+        self._current_action_abs_sum = np.zeros(3, dtype=np.float64)
+        self._current_nonzero_action_steps = 0
+        self._run_action_abs_sum = np.zeros(3, dtype=np.float64)
+        self._run_action_step_count = 0
+        self._run_nonzero_action_steps = 0
 
     @property
     def episode_index_rows(self) -> list[dict[str, Any]]:
@@ -83,6 +88,8 @@ class DemoRecorder:
         self._current_observations = []
         self._current_telemetry = []
         self._current_actions = []
+        self._current_action_abs_sum = np.zeros(3, dtype=np.float64)
+        self._current_nonzero_action_steps = 0
         return self._current_episode_paths
 
     def record_step(
@@ -135,6 +142,14 @@ class DemoRecorder:
             "stray_distance": info.get("stray_distance"),
         }
         self._current_rows.append(row)
+        action_array = np.asarray(action, dtype=np.float32)
+        abs_action = np.abs(action_array)
+        self._current_action_abs_sum += abs_action
+        self._run_action_abs_sum += abs_action
+        self._run_action_step_count += 1
+        if bool(np.any(abs_action > 1.0e-6)):
+            self._current_nonzero_action_steps += 1
+            self._run_nonzero_action_steps += 1
 
         if self._current_episode_paths.frames_dir is not None and latest_frame is not None:
             frame_path = self._current_episode_paths.frames_dir / f"frame_{self._current_step_index:06d}.png"
@@ -180,6 +195,12 @@ class DemoRecorder:
             "observation_sidecar_path": (
                 str(self._current_episode_paths.observation_npz) if self._current_episode_paths.observation_npz else None
             ),
+            "mean_abs_action": (
+                self._current_action_abs_sum / max(1, len(self._current_rows))
+            ).astype(float).tolist(),
+            "nonzero_action_steps": int(self._current_nonzero_action_steps),
+            "nonzero_action_fraction": float(self._current_nonzero_action_steps / max(1, len(self._current_rows))),
+            "has_nonzero_actions": bool(self._current_nonzero_action_steps > 0),
         }
         summary = summarize_episode_trace(
             episode_id=self._current_episode_id,
@@ -187,6 +208,14 @@ class DemoRecorder:
             step_rows=self._current_rows,
             trajectory=self._trajectory,
             sector_count=self._sector_count,
+        )
+        summary.update(
+            {
+                "mean_abs_action": list(metadata["mean_abs_action"]),
+                "nonzero_action_steps": metadata["nonzero_action_steps"],
+                "nonzero_action_fraction": metadata["nonzero_action_fraction"],
+                "has_nonzero_actions": metadata["has_nonzero_actions"],
+            }
         )
         metadata["furthest_sector_reached"] = summary["furthest_sector_reached"]
         metadata["best_progress_index"] = summary["best_progress_index"]
@@ -211,8 +240,21 @@ class DemoRecorder:
         self._current_observations = []
         self._current_telemetry = []
         self._current_actions = []
+        self._current_action_abs_sum = np.zeros(3, dtype=np.float64)
+        self._current_nonzero_action_steps = 0
         return result
 
     def write_episode_index(self) -> Path:
         write_parquet_rows(self._run_paths.episode_index_parquet, self._episode_index_rows)
         return self._run_paths.episode_index_parquet
+
+    def run_action_metrics(self) -> dict[str, Any]:
+        mean_abs_action = (
+            self._run_action_abs_sum / max(1, self._run_action_step_count)
+        ).astype(float).tolist()
+        return {
+            "total_action_steps": int(self._run_action_step_count),
+            "total_nonzero_action_steps": int(self._run_nonzero_action_steps),
+            "mean_abs_action": mean_abs_action,
+            "nonzero_action_fraction": float(self._run_nonzero_action_steps / max(1, self._run_action_step_count)),
+        }

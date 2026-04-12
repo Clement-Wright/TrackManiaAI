@@ -64,6 +64,39 @@ class DemoDatasetSplit:
     validation_episodes: list[EpisodeRecord]
 
 
+@dataclass(slots=True, frozen=True)
+class FullDemoDatasetValidation:
+    root: Path
+    episodes: list[EpisodeRecord]
+    map_uid: str | None
+    total_episode_count: int
+    valid_episode_count: int
+    sample_count: int
+    total_nonzero_action_steps: int
+    mean_abs_action: tuple[float, float, float]
+
+
+def split_episode_records(
+    episodes: list[EpisodeRecord],
+    *,
+    validation_fraction: float,
+    seed: int,
+) -> DemoDatasetSplit:
+    if not episodes:
+        return DemoDatasetSplit(train_episodes=[], validation_episodes=[])
+    rng = np.random.default_rng(seed)
+    order = np.arange(len(episodes))
+    rng.shuffle(order)
+    shuffled = [episodes[index] for index in order.tolist()]
+    validation_count = max(1, int(round(len(shuffled) * validation_fraction))) if len(shuffled) > 1 else 0
+    validation = shuffled[:validation_count]
+    train = shuffled[validation_count:] or shuffled
+    if not train and validation:
+        train = validation
+        validation = []
+    return DemoDatasetSplit(train_episodes=train, validation_episodes=validation)
+
+
 def split_demo_dataset(
     root: Path,
     *,
@@ -72,19 +105,76 @@ def split_demo_dataset(
 ) -> DemoDatasetSplit:
     dataset = EpisodeDataset(root)
     candidates = [episode for episode in dataset.episodes if episode.observation_npz_path is not None]
-    if not candidates:
-        return DemoDatasetSplit(train_episodes=[], validation_episodes=[])
-    rng = np.random.default_rng(seed)
-    order = np.arange(len(candidates))
-    rng.shuffle(order)
-    shuffled = [candidates[index] for index in order.tolist()]
-    validation_count = max(1, int(round(len(shuffled) * validation_fraction))) if len(shuffled) > 1 else 0
-    validation = shuffled[:validation_count]
-    train = shuffled[validation_count:] or shuffled
-    if not train and validation:
-        train = validation
-        validation = []
-    return DemoDatasetSplit(train_episodes=train, validation_episodes=validation)
+    return split_episode_records(candidates, validation_fraction=validation_fraction, seed=seed)
+
+
+def validate_full_demo_dataset(
+    root: Path,
+    *,
+    allow_mixed_map_uids: bool = False,
+) -> FullDemoDatasetValidation:
+    dataset = EpisodeDataset(root)
+    if not dataset.episodes:
+        raise RuntimeError(f"No demo episodes were found under {root}.")
+
+    valid_episodes: list[EpisodeRecord] = []
+    invalid_messages: list[str] = []
+    map_uids: set[str] = set()
+    sample_count = 0
+    total_nonzero_action_steps = 0
+    total_abs_action = np.zeros(3, dtype=np.float64)
+    for episode in dataset.episodes:
+        observation_mode = str(episode.metadata.get("observation_mode", "")).strip().lower()
+        if observation_mode != "full":
+            invalid_messages.append(
+                f"{episode.metadata_path}: observation_mode must be 'full', got {observation_mode!r}."
+            )
+            continue
+        if episode.observation_npz_path is None:
+            invalid_messages.append(
+                f"{episode.metadata_path}: FULL demo is missing the observation sidecar NPZ."
+            )
+            continue
+        map_uid = episode.metadata.get("map_uid")
+        if map_uid in (None, ""):
+            invalid_messages.append(f"{episode.metadata_path}: map_uid is missing from episode metadata.")
+            continue
+        map_uids.add(str(map_uid))
+        payload = np.load(episode.observation_npz_path)
+        actions = np.asarray(payload["action"], dtype=np.float32)
+        if actions.ndim != 2 or actions.shape[1] != 3:
+            invalid_messages.append(
+                f"{episode.observation_npz_path}: expected action sidecar shape (N, 3), got {actions.shape}."
+            )
+            continue
+        valid_episodes.append(episode)
+        sample_count += int(actions.shape[0])
+        total_nonzero_action_steps += int(np.count_nonzero(np.any(np.abs(actions) > 1.0e-6, axis=1)))
+        total_abs_action += np.abs(actions).sum(axis=0, dtype=np.float64)
+
+    if invalid_messages:
+        raise RuntimeError("FULL demo dataset validation failed:\n- " + "\n- ".join(invalid_messages))
+    if not valid_episodes:
+        raise RuntimeError(f"No valid FULL demo episodes were found under {root}.")
+    if not allow_mixed_map_uids and len(map_uids) > 1:
+        raise RuntimeError(
+            "FULL demo dataset validation failed: demos span multiple map_uids: "
+            + ", ".join(sorted(map_uids))
+        )
+    if total_nonzero_action_steps <= 0:
+        raise RuntimeError("FULL demo dataset validation failed: demos contain no non-zero recorded actions.")
+
+    map_uid = next(iter(sorted(map_uids)), None)
+    return FullDemoDatasetValidation(
+        root=root,
+        episodes=valid_episodes,
+        map_uid=map_uid,
+        total_episode_count=len(dataset.episodes),
+        valid_episode_count=len(valid_episodes),
+        sample_count=sample_count,
+        total_nonzero_action_steps=total_nonzero_action_steps,
+        mean_abs_action=tuple((total_abs_action / max(1, sample_count)).astype(float).tolist()),
+    )
 
 
 class FullBehaviorCloningDataset(Dataset):
@@ -114,13 +204,11 @@ class FullBehaviorCloningDataset(Dataset):
 
 
 def seed_replay_from_demo_sidecars(replay, root: Path) -> int:  # noqa: ANN001
-    dataset = EpisodeDataset(root)
+    validation = validate_full_demo_dataset(root)
     if getattr(replay, "mode", None) != "full":
         return 0
     seeded = 0
-    for episode in dataset.episodes:
-        if episode.observation_npz_path is None:
-            continue
+    for episode in validation.episodes:
         payload = np.load(episode.observation_npz_path)
         observations = payload["obs_uint8"]
         telemetry = payload["telemetry_float"]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -230,6 +231,74 @@ class SACAgent:
 
     def actor_state_dict_cpu(self) -> dict[str, Tensor]:
         return {key: value.detach().cpu() for key, value in self.actor.state_dict().items()}
+
+    def load_bc_warm_start(self, checkpoint_path: str | Path, *, init_mode: str) -> dict[str, Any]:
+        if self.observation_mode != "full":
+            raise RuntimeError("BC warm start is only supported for FULL SAC runs.")
+        if init_mode not in {"actor_only", "actor_plus_critic_encoders"}:
+            raise ValueError(f"Unsupported BC init_mode: {init_mode!r}")
+
+        payload = torch.load(Path(checkpoint_path).resolve(), map_location="cpu")
+        observation_mode = str(payload.get("observation_mode", ""))
+        if observation_mode != "full":
+            raise RuntimeError(
+                f"BC checkpoint {checkpoint_path} is not compatible with FULL SAC warm start "
+                f"(observation_mode={observation_mode!r})."
+            )
+        observation_shape = tuple(int(value) for value in payload.get("observation_shape", ()))
+        telemetry_dim = int(payload.get("telemetry_dim", -1))
+        action_dim = int(payload.get("action_dim", -1))
+        if observation_shape and observation_shape != tuple(int(value) for value in self.observation_shape):
+            raise RuntimeError(
+                f"BC checkpoint {checkpoint_path} observation_shape {observation_shape!r} does not match "
+                f"FULL SAC observation_shape {self.observation_shape!r}."
+            )
+        if telemetry_dim not in {-1, self.telemetry_dim}:
+            raise RuntimeError(
+                f"BC checkpoint {checkpoint_path} telemetry_dim {telemetry_dim} does not match FULL SAC "
+                f"telemetry_dim {self.telemetry_dim}."
+            )
+        if action_dim not in {-1, self.action_dim}:
+            raise RuntimeError(
+                f"BC checkpoint {checkpoint_path} action_dim {action_dim} does not match FULL SAC "
+                f"action_dim {self.action_dim}."
+            )
+
+        actor_state_dict = payload.get("actor_state_dict")
+        if actor_state_dict is None:
+            raise RuntimeError(f"BC checkpoint {checkpoint_path} does not contain actor_state_dict.")
+        self.actor.load_state_dict(actor_state_dict)
+
+        if init_mode == "actor_plus_critic_encoders":
+            vision_encoder_state = {
+                key.removeprefix("vision_encoder."): value
+                for key, value in actor_state_dict.items()
+                if key.startswith("vision_encoder.")
+            }
+            telemetry_encoder_state = {
+                key.removeprefix("telemetry_encoder."): value
+                for key, value in actor_state_dict.items()
+                if key.startswith("telemetry_encoder.")
+            }
+            for critic in (self.critic1, self.critic2, self.target_critic1, self.target_critic2):
+                assert isinstance(critic, FullObservationCritic)
+                critic.vision_encoder.load_state_dict(vision_encoder_state)
+                critic.telemetry_encoder.load_state_dict(telemetry_encoder_state)
+
+        return {
+            "checkpoint_path": str(Path(checkpoint_path).resolve()),
+            "checkpoint_kind": payload.get("checkpoint_kind"),
+            "map_uid": payload.get("map_uid"),
+            "demo_root": payload.get("demo_root"),
+            "observation_mode": observation_mode,
+            "observation_shape": observation_shape or tuple(int(value) for value in self.observation_shape),
+            "telemetry_dim": self.telemetry_dim if telemetry_dim == -1 else telemetry_dim,
+            "action_dim": self.action_dim if action_dim == -1 else action_dim,
+            "epoch": payload.get("epoch"),
+            "train_loss": payload.get("train_loss"),
+            "validation_loss": payload.get("validation_loss"),
+            "config_snapshot": payload.get("config_snapshot"),
+        }
 
     def _prepare_observation(self, observation: Tensor) -> Tensor:
         if self.observation_mode == "full":

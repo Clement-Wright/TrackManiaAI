@@ -29,11 +29,11 @@ def parse_action(value: str) -> np.ndarray:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Record scalar-first demo episodes from a deterministic policy adapter.")
+    parser = argparse.ArgumentParser(description="Record scalar-first FULL demo episodes from a human or policy adapter.")
     parser.add_argument("--config", default=str(ROOT / "configs" / "full_sac.yaml"))
-    parser.add_argument("--episodes", type=int, default=1)
+    parser.add_argument("--episodes", type=int, default=20)
     parser.add_argument("--seed-base", type=int, default=None)
-    parser.add_argument("--policy", choices=("zero", "fixed", "scripted", "checkpoint"), default="fixed")
+    parser.add_argument("--policy", choices=("human", "zero", "fixed", "scripted", "checkpoint"), default="human")
     parser.add_argument("--fixed-action", default="1.0,0.0,0.0")
     parser.add_argument("--script", default=None, help="Scripted policy in 'module:attr' or 'path.py:attr' form.")
     parser.add_argument("--checkpoint", default=None)
@@ -49,6 +49,8 @@ def main() -> int:
         script=args.script,
         checkpoint=args.checkpoint,
     )
+    if args.policy == "human":
+        log("Human demo mode active. Focus Trackmania and drive with WASD or Arrow keys.")
     result = run_policy_episodes(
         config_path=args.config,
         mode="demos",

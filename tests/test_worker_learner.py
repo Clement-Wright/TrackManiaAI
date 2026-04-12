@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import queue
 import threading
 import time
@@ -220,6 +221,7 @@ def test_worker_emits_transition_batches_and_eval_results(tmp_path, monkeypatch)
     eval_result_queue: queue.Queue = queue.Queue()
     shutdown_event = threading.Event()
     worker_done_event = threading.Event()
+    bootstrap_log_path = tmp_path / "artifacts" / "train" / "worker_bootstrap.log"
     worker = SACWorker(
         config_path=str(config_path),
         command_queue=command_queue,
@@ -227,6 +229,7 @@ def test_worker_emits_transition_batches_and_eval_results(tmp_path, monkeypatch)
         eval_result_queue=eval_result_queue,
         shutdown_event=shutdown_event,
         worker_done_event=worker_done_event,
+        bootstrap_log_path=str(bootstrap_log_path),
         env_factory=lambda _path, _benchmark=False: FakeTrainingEnv(),
     )
     command_queue.put({"type": "run_eval", "episodes": 1, "seed_base": 7, "run_name": "worker_eval"})
@@ -244,8 +247,15 @@ def test_worker_emits_transition_batches_and_eval_results(tmp_path, monkeypatch)
         eval_results.append(eval_result_queue.get())
     assert "transition_batch" in message_types
     assert "episode_summary" in message_types
+    assert "eval_started" in message_types
     assert eval_results
     assert worker_done_event.is_set()
+    worker_events = [json.loads(line) for line in bootstrap_log_path.with_name("worker_events.log").read_text(encoding="utf-8").splitlines()]
+    events = [entry["event"] for entry in worker_events]
+    assert events.count("command_received") >= 1
+    assert "eval_begin" in events
+    assert "eval_end" in events
+    assert "eval_result_published" in events
 
 
 def test_learner_checkpoint_roundtrip_and_command_scheduling(tmp_path) -> None:
@@ -254,7 +264,13 @@ def test_learner_checkpoint_roundtrip_and_command_scheduling(tmp_path) -> None:
     trajectory_path = tmp_path / "reward" / "trajectory_0p5m.npz"
     write_train_config(config_path, artifacts_root, trajectory_path)
 
-    learner = SACLearner(config_path=config_path, run_name="unit_train")
+    demo_root = tmp_path / "demo_root"
+    learner = SACLearner(
+        config_path=config_path,
+        run_name="unit_train",
+        demo_root=demo_root,
+        eval_episodes_override=3,
+    )
     command_queue: queue.Queue = queue.Queue()
     output_queue: queue.Queue = queue.Queue()
     eval_result_queue: queue.Queue = queue.Queue()
@@ -306,6 +322,20 @@ def test_learner_checkpoint_roundtrip_and_command_scheduling(tmp_path) -> None:
     assert "set_actor" in commands
     assert "run_eval" in commands
 
+    output_queue.put(
+        {
+            "type": "eval_started",
+            "run_name": "unit_train_step_00000002",
+            "env_step": 2,
+            "learner_step": learner.learner_step,
+            "episodes": 3,
+            "timestamp": time.time(),
+        }
+    )
+    assert learner.drain_messages(timeout=0.01) == 0
+    assert learner.started_eval is not None
+    assert learner.started_eval["run_name"] == "unit_train_step_00000002"
+
     eval_result_queue.put(
         EvalResult(
             checkpoint_step=2,
@@ -320,6 +350,7 @@ def test_learner_checkpoint_roundtrip_and_command_scheduling(tmp_path) -> None:
     assert learner.latest_eval_summary is not None
     assert learner.latest_eval_summary["mean_final_progress_index"] == 12.0
     assert learner.eval_history
+    assert learner.started_eval is None
     assert learner.latest_checkpoint_path is not None
 
     checkpoint_path = learner.save_checkpoint()
@@ -346,10 +377,19 @@ def test_learner_checkpoint_roundtrip_and_command_scheduling(tmp_path) -> None:
     assert final_checkpoint.exists()
     assert learner.clean_shutdown is True
     assert learner.latest_eval_summary is not None
-    summary_payload = learner.paths.summary_json.read_text(encoding="utf-8")
-    assert "latest_eval_summary" in summary_payload
-    assert "eval_history" in summary_payload
-    assert "checkpoint_history" in summary_payload
+    summary_payload = json.loads(learner.paths.summary_json.read_text(encoding="utf-8"))
+    assert summary_payload["latest_eval_summary"] is not None
+    assert summary_payload["started_eval"] is None
+    assert summary_payload["eval_history"]
+    assert summary_payload["checkpoint_history"]
+    assert summary_payload["init_mode"] == "scratch"
+    assert summary_payload["demo_root"] == str(demo_root.resolve())
+    assert summary_payload["eval_episodes"] == 3
+
+    checkpoint_sidecar = json.loads(checkpoint_path.with_suffix(".json").read_text(encoding="utf-8"))
+    assert checkpoint_sidecar["init_mode"] == "scratch"
+    assert checkpoint_sidecar["demo_root"] == str(demo_root.resolve())
+    assert checkpoint_sidecar["replay_seeded"] is False
     learner.close()
     restored.close()
 
