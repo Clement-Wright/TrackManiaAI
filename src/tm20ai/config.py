@@ -82,6 +82,12 @@ class CaptureConfig:
     window_title: str = "Trackmania"
     target_fps: int = 60
     max_buffer_len: int = 64
+    backend: str = "dxgi"
+    device_idx: int | None = None
+    output_idx: int | None = None
+    bootstrap_log: bool = True
+    require_stable_window_polls: int = 5
+    stable_window_poll_interval_seconds: float = 0.1
     latest_frame_only: bool = True
     frame_timeout: float = 1.0
     post_reset_flush_seconds: float = 0.25
@@ -90,10 +96,21 @@ class CaptureConfig:
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "CaptureConfig":
+        backend = str(payload.get("backend", "dxgi")).strip().lower()
+        if backend not in {"dxgi", "winrt", "auto"}:
+            raise ConfigError(f"capture.backend must be one of ['dxgi', 'winrt', 'auto'], got {backend!r}.")
+        device_idx = payload.get("device_idx")
+        output_idx = payload.get("output_idx")
         return cls(
             window_title=str(payload.get("window_title", "Trackmania")),
             target_fps=int(payload.get("target_fps", 60)),
             max_buffer_len=int(payload.get("max_buffer_len", 64)),
+            backend=backend,
+            device_idx=None if device_idx in (None, "null") else int(device_idx),
+            output_idx=None if output_idx in (None, "null") else int(output_idx),
+            bootstrap_log=_bool(payload.get("bootstrap_log", True), context="capture.bootstrap_log"),
+            require_stable_window_polls=int(payload.get("require_stable_window_polls", 5)),
+            stable_window_poll_interval_seconds=float(payload.get("stable_window_poll_interval_seconds", 0.1)),
             latest_frame_only=_bool(payload.get("latest_frame_only", True), context="capture.latest_frame_only"),
             frame_timeout=float(payload.get("frame_timeout", 1.0)),
             post_reset_flush_seconds=float(payload.get("post_reset_flush_seconds", 0.25)),

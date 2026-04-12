@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
 
 from tm20ai.train.evaluator import resolve_policy_adapter
 from tm20ai.train.learner import SACLearner
+from tm20ai.train.protocol import EvalResult
 from tm20ai.train.worker import SACWorker
 
 
@@ -75,6 +77,22 @@ class FakeTrainingEnv:
 
     def close(self):
         return None
+
+
+class FakeWorkerProcess:
+    def __init__(self, *, alive: bool, exitcode: int) -> None:
+        self._alive = alive
+        self.exitcode = exitcode
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def join(self, timeout=None) -> None:  # noqa: ANN001
+        del timeout
+        return None
+
+    def terminate(self) -> None:
+        self._alive = False
 
 
 def write_train_config(path: Path, artifacts_root: Path, trajectory_path: Path) -> None:
@@ -199,12 +217,16 @@ def test_worker_emits_transition_batches_and_eval_results(tmp_path, monkeypatch)
 
     command_queue: queue.Queue = queue.Queue()
     output_queue: queue.Queue = queue.Queue()
+    eval_result_queue: queue.Queue = queue.Queue()
     shutdown_event = threading.Event()
+    worker_done_event = threading.Event()
     worker = SACWorker(
         config_path=str(config_path),
         command_queue=command_queue,
         output_queue=output_queue,
+        eval_result_queue=eval_result_queue,
         shutdown_event=shutdown_event,
+        worker_done_event=worker_done_event,
         env_factory=lambda _path, _benchmark=False: FakeTrainingEnv(),
     )
     command_queue.put({"type": "run_eval", "episodes": 1, "seed_base": 7, "run_name": "worker_eval"})
@@ -217,9 +239,13 @@ def test_worker_emits_transition_batches_and_eval_results(tmp_path, monkeypatch)
     message_types: list[str] = []
     while not output_queue.empty():
         message_types.append(output_queue.get()["type"])
+    eval_results: list[EvalResult] = []
+    while not eval_result_queue.empty():
+        eval_results.append(eval_result_queue.get())
     assert "transition_batch" in message_types
     assert "episode_summary" in message_types
-    assert "eval_result" in message_types
+    assert eval_results
+    assert worker_done_event.is_set()
 
 
 def test_learner_checkpoint_roundtrip_and_command_scheduling(tmp_path) -> None:
@@ -231,8 +257,16 @@ def test_learner_checkpoint_roundtrip_and_command_scheduling(tmp_path) -> None:
     learner = SACLearner(config_path=config_path, run_name="unit_train")
     command_queue: queue.Queue = queue.Queue()
     output_queue: queue.Queue = queue.Queue()
+    eval_result_queue: queue.Queue = queue.Queue()
     shutdown_event = threading.Event()
-    learner.attach_worker(command_queue=command_queue, output_queue=output_queue, shutdown_event=shutdown_event)
+    worker_done_event = threading.Event()
+    learner.attach_worker(
+        command_queue=command_queue,
+        output_queue=output_queue,
+        eval_result_queue=eval_result_queue,
+        shutdown_event=shutdown_event,
+        worker_done_event=worker_done_event,
+    )
 
     for step in range(3):
         output_queue.put(
@@ -272,6 +306,22 @@ def test_learner_checkpoint_roundtrip_and_command_scheduling(tmp_path) -> None:
     assert "set_actor" in commands
     assert "run_eval" in commands
 
+    eval_result_queue.put(
+        EvalResult(
+            checkpoint_step=2,
+            env_step=2,
+            learner_step=learner.learner_step,
+            summary_path=str(tmp_path / "eval_summary.json"),
+            summary={"env_step": 2, "mean_final_progress_index": 12.0},
+            timestamp=time.time(),
+        )
+    )
+    assert learner.drain_eval_results(timeout=0.01) == 1
+    assert learner.latest_eval_summary is not None
+    assert learner.latest_eval_summary["mean_final_progress_index"] == 12.0
+    assert learner.eval_history
+    assert learner.latest_checkpoint_path is not None
+
     checkpoint_path = learner.save_checkpoint()
     assert checkpoint_path.exists()
 
@@ -291,5 +341,64 @@ def test_learner_checkpoint_roundtrip_and_command_scheduling(tmp_path) -> None:
     restored.load_checkpoint(checkpoint_path)
     assert restored.env_step == learner.env_step
     assert restored.learner_step == learner.learner_step
+    worker_done_event.set()
+    final_checkpoint = learner.finalize_run(timeout_seconds=0.1)
+    assert final_checkpoint.exists()
+    assert learner.clean_shutdown is True
+    assert learner.latest_eval_summary is not None
+    summary_payload = learner.paths.summary_json.read_text(encoding="utf-8")
+    assert "latest_eval_summary" in summary_payload
+    assert "eval_history" in summary_payload
+    assert "checkpoint_history" in summary_payload
     learner.close()
     restored.close()
+
+
+def test_learner_treats_clean_worker_exit_at_env_limit_as_normal_completion(tmp_path) -> None:
+    config_path = tmp_path / "config.yaml"
+    artifacts_root = tmp_path / "artifacts"
+    trajectory_path = tmp_path / "reward" / "trajectory_0p5m.npz"
+    write_train_config(config_path, artifacts_root, trajectory_path)
+
+    learner = SACLearner(config_path=config_path, run_name="unit_train_exit_ok", max_env_steps=1)
+    command_queue: queue.Queue = queue.Queue()
+    output_queue: queue.Queue = queue.Queue()
+    eval_result_queue: queue.Queue = queue.Queue()
+    shutdown_event = threading.Event()
+    worker_done_event = threading.Event()
+    worker_done_event.set()
+    output_queue.put(
+        {
+            "type": "transition_batch",
+            "env_step": 1,
+            "transitions": [
+                {
+                    "obs_uint8": np.zeros((4, 64, 64), dtype=np.uint8),
+                    "telemetry_float": np.zeros((14,), dtype=np.float32),
+                    "action": np.zeros((3,), dtype=np.float32),
+                    "reward": 0.0,
+                    "next_obs_uint8": np.zeros((4, 64, 64), dtype=np.uint8),
+                    "next_telemetry_float": np.zeros((14,), dtype=np.float32),
+                    "terminated": False,
+                    "truncated": False,
+                    "episode_id": "episode",
+                    "map_uid": "test-map",
+                    "step_idx": 0,
+                }
+            ],
+        }
+    )
+    learner.attach_worker(
+        command_queue=command_queue,
+        output_queue=output_queue,
+        eval_result_queue=eval_result_queue,
+        shutdown_event=shutdown_event,
+        worker_done_event=worker_done_event,
+        worker_process=FakeWorkerProcess(alive=False, exitcode=0),
+    )
+
+    learner.run()
+
+    assert learner.env_step == 1
+    assert learner.termination_reason == "max_env_steps"
+    learner.close()

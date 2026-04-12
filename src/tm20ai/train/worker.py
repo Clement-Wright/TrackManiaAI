@@ -1,21 +1,23 @@
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
 import queue
+import threading
+import time
 import traceback
 from dataclasses import dataclass
 from time import monotonic
 from typing import Any, Callable, Mapping
 
 import numpy as np
-import torch
 
 from ..capture import lidar_feature_dim
 from ..config import TM20AIConfig, load_tm20ai_config
 from ..env import TM20AIGymEnv, make_env
-from ..models.full_actor_critic import FullObservationActor
-from ..models.lidar_actor_critic import LidarActor
-from .evaluator import ActorPolicyAdapter, run_policy_episodes_on_env
 from .features import TELEMETRY_DIM, TelemetryFeatureBuilder
+from .protocol import EvalResult
 
 
 @dataclass(slots=True)
@@ -36,48 +38,115 @@ class SACWorker:
         config_path: str,
         command_queue,
         output_queue,
+        eval_result_queue,
         shutdown_event,
+        worker_done_event,
+        bootstrap_log_path: str | None = None,
         env_factory: Callable[[str, bool], TM20AIGymEnv] | None = None,
     ) -> None:
         self.config_path = config_path
         self.config: TM20AIConfig = load_tm20ai_config(config_path)
         self.command_queue = command_queue
         self.output_queue = output_queue
+        self.eval_result_queue = eval_result_queue
         self.shutdown_event = shutdown_event
+        self.worker_done_event = worker_done_event
+        self.bootstrap_log_path = None if bootstrap_log_path is None else Path(bootstrap_log_path)
         self.env_factory = env_factory or (lambda path, benchmark=False: make_env(path, benchmark=benchmark))
         self._rng = np.random.default_rng(self.config.train.seed)
-        torch.manual_seed(self.config.train.seed)
 
         self.observation_mode = self.config.observation.mode
         if self.observation_mode == "full":
-            self.actor = FullObservationActor(telemetry_dim=TELEMETRY_DIM).cpu().eval()
             self._features: TelemetryFeatureBuilder | None = TelemetryFeatureBuilder()
         elif self.observation_mode == "lidar":
-            self.actor = LidarActor(observation_dim=lidar_feature_dim(self.config.lidar_observation)).cpu().eval()
             self._features = None
         else:
             raise ValueError(f"Unsupported observation mode: {self.observation_mode!r}")
 
+        self.actor = None
+        self._torch = None
         self._has_policy_weights = False
         self._env_step = 0
         self._episode_state = TrainingEpisodeState()
         self._last_heartbeat = monotonic()
         self._pending_transitions: list[dict[str, Any]] = []
+        self._shutdown_requested = False
+
+    def _write_bootstrap_log(self, phase: str, payload: Mapping[str, Any]) -> None:
+        if not self.config.capture.bootstrap_log or self.bootstrap_log_path is None:
+            return
+        self.bootstrap_log_path.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "timestamp": time.time(),
+            "phase": phase,
+            "pid": os.getpid(),
+            "payload": dict(payload),
+        }
+        with self.bootstrap_log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, sort_keys=True))
+            handle.write("\n")
+
+    def _initialize_policy_components(self) -> None:
+        if self.actor is not None and self._torch is not None:
+            return
+
+        import torch
+
+        torch.manual_seed(self.config.train.seed)
+        self._torch = torch
+        if self.observation_mode == "full":
+            from ..models.full_actor_critic import FullObservationActor
+
+            self.actor = FullObservationActor(telemetry_dim=TELEMETRY_DIM).cpu().eval()
+        else:
+            from ..models.lidar_actor_critic import LidarActor
+
+            self.actor = LidarActor(observation_dim=lidar_feature_dim(self.config.lidar_observation)).cpu().eval()
+
+    def _bootstrap_capture(self, env: TM20AIGymEnv) -> None:
+        interface = getattr(env, "interface", None)
+        if interface is None or not hasattr(interface, "bootstrap_capture"):
+            return
+        context = interface.describe_capture_bootstrap()
+        self._write_bootstrap_log("pre_capture", context)
+        started = interface.bootstrap_capture()
+        self._write_bootstrap_log("post_capture", started)
 
     def run(self, *, max_env_steps: int | None = None) -> None:
         env: TM20AIGymEnv | None = None
         try:
             env = self.env_factory(self.config_path, False)
+            self._bootstrap_capture(env)
+            self._initialize_policy_components()
+            if self._should_shutdown():
+                return
             observation, info, aux = self._reset_training_env(env)
-            while not self.shutdown_event.is_set():
+            if self._should_shutdown():
+                return
+            while not self._should_shutdown():
                 pending_eval = self._drain_commands()
+                if self._should_shutdown() and pending_eval is None:
+                    break
                 if pending_eval is not None:
                     self._flush_pending_transitions(force=True)
                     result = self._run_eval(env, pending_eval)
-                    self._put_message({"type": "eval_result", "result": result})
+                    self._put_eval_result(
+                        EvalResult.from_run_result(
+                            checkpoint_step=int(pending_eval.get("checkpoint_step", pending_eval.get("env_step", self._env_step))),
+                            env_step=int(pending_eval.get("env_step", self._env_step)),
+                            learner_step=int(pending_eval.get("learner_step", 0)),
+                            result=result,
+                        )
+                    )
+                    if self._should_shutdown():
+                        break
                     observation, info, aux = self._reset_training_env(env)
+                    if self._should_shutdown():
+                        break
                     continue
 
+                if self._should_shutdown():
+                    break
                 action = self._select_action(observation, aux)
                 next_observation, reward, terminated, truncated, next_info = env.step(action)
                 next_aux = self._build_aux_features(next_info, action)
@@ -116,6 +185,9 @@ class SACWorker:
                         }
                     )
 
+                if self._should_shutdown():
+                    observation, info, aux = next_observation, next_info, next_aux
+                    break
                 if terminated or truncated:
                     self._put_message(
                         {
@@ -133,20 +205,34 @@ class SACWorker:
                             },
                         }
                     )
+                    if self._should_shutdown():
+                        observation, info, aux = next_observation, next_info, next_aux
+                        break
                     observation, info, aux = self._reset_training_env(env)
+                    if self._should_shutdown():
+                        break
                 else:
                     observation, info, aux = next_observation, next_info, next_aux
 
                 if max_env_steps is not None and self._env_step >= max_env_steps:
-                    self.shutdown_event.set()
+                    self._shutdown_requested = True
                     break
         except Exception:  # noqa: BLE001
             self._put_message({"type": "fatal_error", "error": traceback.format_exc()})
             raise
         finally:
-            self._flush_pending_transitions(force=True)
-            if env is not None:
-                env.close()
+            self._shutdown_cleanup(env)
+
+    def run_bootstrap_probe(self) -> None:
+        env: TM20AIGymEnv | None = None
+        try:
+            env = self.env_factory(self.config_path, False)
+            self._bootstrap_capture(env)
+        except Exception:  # noqa: BLE001
+            self._put_message({"type": "fatal_error", "error": traceback.format_exc()})
+            raise
+        finally:
+            self._shutdown_cleanup(env)
 
     def _reset_training_env(self, env: TM20AIGymEnv) -> tuple[np.ndarray, Mapping[str, Any], np.ndarray | None]:
         seed = self.config.train.seed + self._episode_state.episode_index
@@ -170,6 +256,8 @@ class SACWorker:
         return None
 
     def _select_action(self, observation: np.ndarray, aux: np.ndarray | None) -> np.ndarray:
+        if self.actor is None or self._torch is None:
+            raise RuntimeError("Worker policy components are not initialized.")
         if self._env_step < self.config.train.environment_steps_before_training or not self._has_policy_weights:
             return np.asarray(
                 [
@@ -179,6 +267,7 @@ class SACWorker:
                 ],
                 dtype=np.float32,
             )
+        torch = self._torch
         if self.observation_mode == "full":
             observation_tensor = torch.as_tensor(observation, dtype=torch.float32).unsqueeze(0) / 255.0
             assert aux is not None
@@ -246,10 +335,16 @@ class SACWorker:
             elif command_type == "run_eval":
                 pending_eval = dict(command)
             elif command_type == "shutdown":
-                self.shutdown_event.set()
+                self._shutdown_requested = True
+        if self._shutdown_requested:
+            return None
         return pending_eval
 
     def _run_eval(self, env: TM20AIGymEnv, command: Mapping[str, Any]) -> dict[str, Any]:
+        if self.actor is None:
+            raise RuntimeError("Worker actor is not initialized for evaluation.")
+        from .evaluator import ActorPolicyAdapter, run_policy_episodes_on_env
+
         policy = ActorPolicyAdapter(self.actor, observation_mode=self.observation_mode, name="checkpoint")
         return run_policy_episodes_on_env(
             env=env,
@@ -284,21 +379,82 @@ class SACWorker:
         )
         self._pending_transitions.clear()
 
+    def _put_eval_result(self, result: EvalResult) -> None:
+        deadline = monotonic() + 5.0
+        while True:
+            try:
+                self.eval_result_queue.put(result, timeout=0.25)
+                return
+            except queue.Full:
+                if monotonic() >= deadline:
+                    raise RuntimeError("Timed out while publishing eval result during worker shutdown.")
+
     def _put_message(self, payload: Mapping[str, Any]) -> None:
+        deadline = monotonic() + 5.0
         while True:
             try:
                 self.output_queue.put(dict(payload), timeout=0.25)
                 return
             except queue.Full:
-                if self.shutdown_event.is_set():
+                if monotonic() >= deadline:
                     return
 
+    def _send_neutral_action(self, env: TM20AIGymEnv | None) -> None:
+        if env is None:
+            return
+        try:
+            interface = getattr(env, "interface", None)
+            default_action = getattr(env, "default_action", None)
+            if interface is not None and default_action is not None and hasattr(interface, "send_control"):
+                interface.send_control(default_action)
+        except Exception:
+            return
 
-def worker_entry(config_path: str, command_queue, output_queue, shutdown_event, max_env_steps: int | None = None) -> None:  # noqa: ANN001
+    def _should_shutdown(self) -> bool:
+        return self._shutdown_requested or self.shutdown_event.is_set()
+
+    def _shutdown_cleanup(self, env: TM20AIGymEnv | None) -> None:
+        try:
+            self._send_neutral_action(env)
+            self._flush_pending_transitions(force=True)
+        finally:
+            try:
+                if env is not None:
+                    env.close()
+            finally:
+                self.worker_done_event.set()
+
+
+def worker_entry(
+    config_path: str,
+    command_queue,
+    output_queue,
+    eval_result_queue,
+    shutdown_event,
+    worker_done_event,
+    bootstrap_log_path: str | None = None,
+    max_env_steps: int | None = None,
+) -> None:  # noqa: ANN001
     worker = SACWorker(
         config_path=config_path,
         command_queue=command_queue,
         output_queue=output_queue,
+        eval_result_queue=eval_result_queue,
         shutdown_event=shutdown_event,
+        worker_done_event=worker_done_event,
+        bootstrap_log_path=bootstrap_log_path,
     )
     worker.run(max_env_steps=max_env_steps)
+
+
+def worker_bootstrap_probe_entry(config_path: str, bootstrap_log_path: str | None = None) -> None:
+    worker = SACWorker(
+        config_path=config_path,
+        command_queue=queue.Queue(),
+        output_queue=queue.Queue(),
+        eval_result_queue=queue.Queue(),
+        shutdown_event=threading.Event(),
+        worker_done_event=threading.Event(),
+        bootstrap_log_path=bootstrap_log_path,
+    )
+    worker.run_bootstrap_probe()

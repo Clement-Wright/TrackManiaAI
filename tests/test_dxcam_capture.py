@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from tm20ai.capture.dxcam_capture import CaptureState, DXCamCapture
+from tm20ai.capture.dxcam_capture import CaptureBinding, CaptureState, DXCamCapture
 from tm20ai.capture.window import WindowGeometry
 from tm20ai.config import CaptureConfig
 
@@ -50,8 +50,24 @@ def make_frame(value: int) -> np.ndarray:
     return np.full((8, 8, 3), value, dtype=np.uint8)
 
 
+def fake_binding(_dxcam_module, _hwnd: int, _geometry: WindowGeometry) -> CaptureBinding:  # noqa: ANN001
+    return CaptureBinding(
+        device_idx=0,
+        output_idx=0,
+        backend="dxgi",
+        output_left=0,
+        output_top=0,
+        output_right=256,
+        output_bottom=128,
+        monitor_handle=1,
+        monitor_device_name="\\\\.\\DISPLAY1",
+        output_device_name="\\\\.\\DISPLAY1",
+        is_primary=True,
+    )
+
+
 def test_dxcam_capture_starts_once_and_keeps_running() -> None:
-    config = CaptureConfig(frame_timeout=0.01)
+    config = CaptureConfig(frame_timeout=0.01, require_stable_window_polls=1)
     camera = FakeCamera([make_frame(10)])
     created: list[FakeCamera] = []
 
@@ -60,7 +76,13 @@ def test_dxcam_capture_starts_once_and_keeps_running() -> None:
         return camera
 
     locator = FakeWindowLocator(windows=[(100, make_geometry(0, 0, 256, 128))])
-    capture = DXCamCapture(config, camera_factory=factory, window_locator=locator, region_refresh_interval_seconds=0.0)
+    capture = DXCamCapture(
+        config,
+        camera_factory=factory,
+        window_locator=locator,
+        region_refresh_interval_seconds=0.0,
+        binding_resolver=fake_binding,
+    )
 
     frame = capture.get_latest_frame()
 
@@ -71,8 +93,41 @@ def test_dxcam_capture_starts_once_and_keeps_running() -> None:
     assert capture.state == CaptureState.RUNNING
 
 
+def test_dxcam_capture_ensure_started_is_noop_while_running() -> None:
+    config = CaptureConfig(frame_timeout=0.01, require_stable_window_polls=1)
+    camera = FakeCamera([make_frame(10)])
+    create_count = 0
+
+    def factory(cfg: CaptureConfig) -> FakeCamera:
+        nonlocal create_count
+        create_count += 1
+        return camera
+
+    locator = FakeWindowLocator(
+        windows=[
+            (100, make_geometry(0, 0, 256, 128)),
+            (100, make_geometry(20, 0, 276, 128)),
+        ]
+    )
+    capture = DXCamCapture(
+        config,
+        camera_factory=factory,
+        window_locator=locator,
+        region_refresh_interval_seconds=0.0,
+        binding_resolver=fake_binding,
+    )
+
+    capture.ensure_started()
+    capture.ensure_started()
+
+    assert create_count == 1
+    assert camera.stop_calls == 0
+    assert len(camera.start_calls) == 1
+    assert capture.state == CaptureState.RUNNING
+
+
 def test_dxcam_capture_restarts_on_region_change_without_recreate() -> None:
-    config = CaptureConfig(frame_timeout=0.01)
+    config = CaptureConfig(frame_timeout=0.01, require_stable_window_polls=1)
     camera = FakeCamera([make_frame(10), make_frame(11)])
     create_count = 0
 
@@ -87,7 +142,13 @@ def test_dxcam_capture_restarts_on_region_change_without_recreate() -> None:
             (100, make_geometry(20, 0, 276, 128)),
         ]
     )
-    capture = DXCamCapture(config, camera_factory=factory, window_locator=locator, region_refresh_interval_seconds=0.0)
+    capture = DXCamCapture(
+        config,
+        camera_factory=factory,
+        window_locator=locator,
+        region_refresh_interval_seconds=0.0,
+        binding_resolver=fake_binding,
+    )
 
     capture.ensure_started()
     changed = capture.refresh_region_if_needed(force=True)
@@ -99,7 +160,7 @@ def test_dxcam_capture_restarts_on_region_change_without_recreate() -> None:
 
 
 def test_dxcam_capture_recreates_camera_after_repeated_invalid_frames() -> None:
-    config = CaptureConfig(frame_timeout=0.05, invalid_frame_limit=2)
+    config = CaptureConfig(frame_timeout=0.05, invalid_frame_limit=2, require_stable_window_polls=1)
     cameras = [
         FakeCamera([None, None]),
         FakeCamera([make_frame(42)]),
@@ -109,7 +170,13 @@ def test_dxcam_capture_recreates_camera_after_repeated_invalid_frames() -> None:
         return cameras.pop(0)
 
     locator = FakeWindowLocator(windows=[(100, make_geometry(0, 0, 256, 128))])
-    capture = DXCamCapture(config, camera_factory=factory, window_locator=locator, region_refresh_interval_seconds=0.0)
+    capture = DXCamCapture(
+        config,
+        camera_factory=factory,
+        window_locator=locator,
+        region_refresh_interval_seconds=0.0,
+        binding_resolver=fake_binding,
+    )
 
     frame = capture.get_latest_frame()
 
