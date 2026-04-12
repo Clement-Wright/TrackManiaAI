@@ -47,6 +47,7 @@ class TrainRunPaths:
     summary_json: Path
     tensorboard_dir: Path
     actor_sync_path: Path
+    actor_manifest_path: Path
 
 
 class SACLearner:
@@ -94,6 +95,7 @@ class SACLearner:
             summary_json=run_paths.summary_json,
             tensorboard_dir=run_paths.tensorboard_dir,
             actor_sync_path=ensure_directory(run_paths.run_dir / "worker_sync") / "latest_actor.pt",
+            actor_manifest_path=ensure_directory(run_paths.run_dir / "worker_sync") / "latest_actor.json",
         )
         self.writer = TensorBoardScalarLogger(self.paths.tensorboard_dir)
 
@@ -146,6 +148,10 @@ class SACLearner:
         self.latest_eval_summary_path: str | None = None
         self.latest_checkpoint_path: Path | None = None
         self.last_worker_heartbeat: dict[str, Any] | None = None
+        self.current_actor_version: int | None = None
+        self.last_seen_actor_version: int | None = None
+        self.last_actor_apply_env_step: int | None = None
+        self.latest_action_stats: dict[str, Any] | None = None
         self.eval_in_flight = False
         self.pending_eval: dict[str, Any] | None = None
         self.started_eval: dict[str, Any] | None = None
@@ -155,6 +161,7 @@ class SACLearner:
         self.eval_history: list[dict[str, Any]] = []
         self.termination_reason: str | None = None
         self.clean_shutdown: bool | None = None
+        self._actor_sync_version = 0
         self.worker_exit: dict[str, Any] = {
             "done_event_set": False,
             "exitcode": None,
@@ -246,20 +253,9 @@ class SACLearner:
             self.shutdown_event.set()
 
     def broadcast_actor(self, *, force: bool = False) -> None:
-        if self.command_queue is None:
-            return
         if not force and self.learner_step <= 0:
             return
-        actor_state_path = self._write_actor_sync_state()
-        self._put_command(
-            {
-                "type": "set_actor",
-                "actor_state_path": str(actor_state_path),
-                "env_step": self.env_step,
-                "learner_step": self.learner_step,
-                "observation_mode": self.config.observation.mode,
-            }
-        )
+        self._write_actor_sync_state()
 
     def drain_messages(self, *, timeout: float = 0.25) -> int:
         if self.output_queue is None:
@@ -316,7 +312,7 @@ class SACLearner:
         return updates
 
     def maybe_schedule_eval(self) -> None:
-        if self.command_queue is None or self.eval_in_flight:
+        if self.command_queue is None or self.eval_in_flight or self.eval_episodes <= 0:
             return
         if self.env_step < self.next_eval_step:
             return
@@ -424,6 +420,30 @@ class SACLearner:
             return 0
         if message_type == "eval_result":
             return 0
+        if message_type == "actor_sync_manifest_seen":
+            if message.get("version") is not None:
+                self.last_seen_actor_version = int(message["version"])
+            self._write_run_summary()
+            return 0
+        if message_type == "actor_sync_applied":
+            self.current_actor_version = int(message.get("version")) if message.get("version") is not None else None
+            self.last_seen_actor_version = int(message.get("last_seen_actor_version", self.current_actor_version or 0)) or self.current_actor_version
+            self.last_actor_apply_env_step = (
+                int(message["last_actor_apply_env_step"]) if message.get("last_actor_apply_env_step") is not None else None
+            )
+            self._write_run_summary()
+            return 0
+        if message_type == "action_stats":
+            action_stats = {key: value for key, value in dict(message).items() if key != "type"}
+            self.latest_action_stats = action_stats
+            if message.get("current_actor_version") is not None:
+                self.current_actor_version = int(message["current_actor_version"])
+            if message.get("last_seen_actor_version") is not None:
+                self.last_seen_actor_version = int(message["last_seen_actor_version"])
+            if message.get("last_actor_apply_env_step") is not None:
+                self.last_actor_apply_env_step = int(message["last_actor_apply_env_step"])
+            self._write_run_summary()
+            return 0
         if message_type == "eval_started":
             self.started_eval = {
                 "run_name": message.get("run_name"),
@@ -436,6 +456,14 @@ class SACLearner:
             return 0
         if message_type == "heartbeat":
             self.last_worker_heartbeat = dict(message)
+            if message.get("current_actor_version") is not None:
+                self.current_actor_version = int(message["current_actor_version"])
+            if message.get("last_seen_actor_version") is not None:
+                self.last_seen_actor_version = int(message["last_seen_actor_version"])
+            if message.get("last_actor_apply_env_step") is not None:
+                self.last_actor_apply_env_step = int(message["last_actor_apply_env_step"])
+            if message.get("latest_action_stats") is not None:
+                self.latest_action_stats = dict(message["latest_action_stats"])
             return 0
         if message_type == "fatal_error":
             self.termination_reason = self.termination_reason or "fatal_error"
@@ -454,10 +482,24 @@ class SACLearner:
 
     def _write_actor_sync_state(self) -> Path:
         actor_state_path = self.paths.actor_sync_path
+        actor_manifest_path = self.paths.actor_manifest_path
         actor_state_path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = actor_state_path.with_suffix(".tmp")
+        temp_manifest_path = actor_manifest_path.with_suffix(".tmp")
+        self._actor_sync_version += 1
         torch.save(self.agent.actor_state_dict_cpu(), temp_path)
         temp_path.replace(actor_state_path)
+        write_json(
+            temp_manifest_path,
+            {
+                "version": self._actor_sync_version,
+                "env_step": self.env_step,
+                "learner_step": self.learner_step,
+                "written_at": _utc_now(),
+                "actor_state_path": str(actor_state_path),
+            },
+        )
+        temp_manifest_path.replace(actor_manifest_path)
         return actor_state_path
 
     def _log_update(self, update: SACUpdateResult) -> None:
@@ -532,6 +574,10 @@ class SACLearner:
                 "checkpoint_history": self.checkpoint_history,
                 "eval_history": self.eval_history,
                 "last_worker_heartbeat": self.last_worker_heartbeat,
+                "current_actor_version": self.current_actor_version,
+                "last_seen_actor_version": self.last_seen_actor_version,
+                "last_actor_apply_env_step": self.last_actor_apply_env_step,
+                "latest_action_stats": self.latest_action_stats,
                 "termination_reason": self.termination_reason,
                 "clean_shutdown": self.clean_shutdown,
                 "worker_exit": self.worker_exit,

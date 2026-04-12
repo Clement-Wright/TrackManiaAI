@@ -216,12 +216,20 @@ def test_worker_emits_transition_batches_and_eval_results(tmp_path, monkeypatch)
 
     monkeypatch.setattr("tm20ai.train.evaluator.runtime_trajectory_path_for_map", lambda *args, **kwargs: trajectory_path)
 
+    learner = SACLearner(config_path=config_path, run_name="worker_sync_case")
+    learner.env_step = 3
+    learner.learner_step = 5
+    learner.broadcast_actor(force=True)
+    learner.env_step = 9
+    learner.learner_step = 11
+    learner.broadcast_actor(force=True)
+
     command_queue: queue.Queue = queue.Queue()
     output_queue: queue.Queue = queue.Queue()
     eval_result_queue: queue.Queue = queue.Queue()
     shutdown_event = threading.Event()
     worker_done_event = threading.Event()
-    bootstrap_log_path = tmp_path / "artifacts" / "train" / "worker_bootstrap.log"
+    bootstrap_log_path = learner.paths.run_dir / "worker_bootstrap.log"
     worker = SACWorker(
         config_path=str(config_path),
         command_queue=command_queue,
@@ -247,15 +255,23 @@ def test_worker_emits_transition_batches_and_eval_results(tmp_path, monkeypatch)
         eval_results.append(eval_result_queue.get())
     assert "transition_batch" in message_types
     assert "episode_summary" in message_types
+    assert "actor_sync_manifest_seen" in message_types
     assert "eval_started" in message_types
+    assert "actor_sync_applied" in message_types
     assert eval_results
     assert worker_done_event.is_set()
     worker_events = [json.loads(line) for line in bootstrap_log_path.with_name("worker_events.log").read_text(encoding="utf-8").splitlines()]
     events = [entry["event"] for entry in worker_events]
-    assert events.count("command_received") >= 1
+    assert "actor_sync_manifest_seen" in events
+    assert "actor_sync_applied" in events
     assert "eval_begin" in events
     assert "eval_end" in events
     assert "eval_result_published" in events
+    actor_sync_events = [entry for entry in worker_events if entry["event"] == "actor_sync_applied"]
+    assert actor_sync_events[-1]["payload"]["version"] == 2
+    manifest_seen_events = [entry for entry in worker_events if entry["event"] == "actor_sync_manifest_seen"]
+    assert manifest_seen_events[-1]["payload"]["version"] == 2
+    learner.close()
 
 
 def test_learner_checkpoint_roundtrip_and_command_scheduling(tmp_path) -> None:
@@ -319,9 +335,35 @@ def test_learner_checkpoint_roundtrip_and_command_scheduling(tmp_path) -> None:
     commands = []
     while not command_queue.empty():
         commands.append(command_queue.get()["type"])
-    assert "set_actor" in commands
     assert "run_eval" in commands
+    assert "set_actor" not in commands
+    manifest_payload = json.loads(learner.paths.actor_manifest_path.read_text(encoding="utf-8"))
+    assert manifest_payload["version"] >= 1
 
+    output_queue.put(
+        {
+            "type": "actor_sync_manifest_seen",
+            "version": manifest_payload["version"],
+            "env_step": learner.env_step,
+            "learner_step": learner.learner_step,
+            "actor_state_path": manifest_payload["actor_state_path"],
+            "written_at": manifest_payload["written_at"],
+            "manifest_mtime_ns": 123,
+        }
+    )
+    output_queue.put(
+        {
+            "type": "actor_sync_applied",
+            "version": manifest_payload["version"],
+            "env_step": learner.env_step,
+            "learner_step": learner.learner_step,
+            "actor_state_path": manifest_payload["actor_state_path"],
+            "written_at": manifest_payload["written_at"],
+            "manifest_mtime_ns": 123,
+            "last_seen_actor_version": manifest_payload["version"],
+            "last_actor_apply_env_step": learner.env_step,
+        }
+    )
     output_queue.put(
         {
             "type": "eval_started",
@@ -335,6 +377,9 @@ def test_learner_checkpoint_roundtrip_and_command_scheduling(tmp_path) -> None:
     assert learner.drain_messages(timeout=0.01) == 0
     assert learner.started_eval is not None
     assert learner.started_eval["run_name"] == "unit_train_step_00000002"
+    assert learner.current_actor_version == manifest_payload["version"]
+    assert learner.last_seen_actor_version == manifest_payload["version"]
+    assert learner.last_actor_apply_env_step == learner.env_step
 
     eval_result_queue.put(
         EvalResult(
@@ -380,6 +425,9 @@ def test_learner_checkpoint_roundtrip_and_command_scheduling(tmp_path) -> None:
     summary_payload = json.loads(learner.paths.summary_json.read_text(encoding="utf-8"))
     assert summary_payload["latest_eval_summary"] is not None
     assert summary_payload["started_eval"] is None
+    assert summary_payload["current_actor_version"] == manifest_payload["version"]
+    assert summary_payload["last_seen_actor_version"] == manifest_payload["version"]
+    assert summary_payload["last_actor_apply_env_step"] == learner.env_step
     assert summary_payload["eval_history"]
     assert summary_payload["checkpoint_history"]
     assert summary_payload["init_mode"] == "scratch"
@@ -441,4 +489,31 @@ def test_learner_treats_clean_worker_exit_at_env_limit_as_normal_completion(tmp_
 
     assert learner.env_step == 1
     assert learner.termination_reason == "max_env_steps"
+    learner.close()
+
+
+def test_learner_disables_eval_when_eval_episodes_is_zero(tmp_path) -> None:
+    config_path = tmp_path / "config.yaml"
+    artifacts_root = tmp_path / "artifacts"
+    trajectory_path = tmp_path / "reward" / "trajectory_0p5m.npz"
+    write_train_config(config_path, artifacts_root, trajectory_path)
+
+    learner = SACLearner(config_path=config_path, run_name="unit_train_no_eval", eval_episodes_override=0)
+    command_queue: queue.Queue = queue.Queue()
+    output_queue: queue.Queue = queue.Queue()
+    eval_result_queue: queue.Queue = queue.Queue()
+    shutdown_event = threading.Event()
+    worker_done_event = threading.Event()
+    learner.attach_worker(
+        command_queue=command_queue,
+        output_queue=output_queue,
+        eval_result_queue=eval_result_queue,
+        shutdown_event=shutdown_event,
+        worker_done_event=worker_done_event,
+    )
+    learner.env_step = 10
+    learner.maybe_schedule_eval()
+    assert command_queue.empty()
+    assert learner.pending_eval is None
+    assert learner.eval_in_flight is False
     learner.close()

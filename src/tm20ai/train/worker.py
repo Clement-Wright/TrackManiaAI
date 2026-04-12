@@ -7,6 +7,7 @@ import queue
 import threading
 import time
 import traceback
+from collections import deque
 from dataclasses import dataclass
 from time import monotonic
 from typing import Any, Callable, Mapping
@@ -55,6 +56,7 @@ class SACWorker:
         self.worker_events_log_path = None if self.bootstrap_log_path is None else self.bootstrap_log_path.with_name(
             "worker_events.log"
         )
+        self.actor_manifest_path = None if self.bootstrap_log_path is None else self.bootstrap_log_path.parent / "worker_sync" / "latest_actor.json"
         self.env_factory = env_factory or (lambda path, benchmark=False: make_env(path, benchmark=benchmark))
         self._rng = np.random.default_rng(self.config.train.seed)
 
@@ -74,6 +76,13 @@ class SACWorker:
         self._last_heartbeat = monotonic()
         self._pending_transitions: list[dict[str, Any]] = []
         self._shutdown_requested = False
+        self._action_stats_interval_steps = 100
+        self._last_manifest_mtime_ns: int | None = None
+        self._last_seen_actor_version: int | None = None
+        self._current_actor_version: int | None = None
+        self._last_actor_apply_env_step: int | None = None
+        self._last_action_stats: dict[str, Any] | None = None
+        self._recent_actions: deque[np.ndarray] = deque(maxlen=self._action_stats_interval_steps)
 
     def _write_worker_event(self, event: str, payload: Mapping[str, Any] | None = None) -> None:
         if self.worker_events_log_path is None:
@@ -138,17 +147,21 @@ class SACWorker:
             env = self.env_factory(self.config_path, False)
             self._bootstrap_capture(env)
             self._initialize_policy_components()
+            self._maybe_refresh_actor(force=True)
             if self._should_shutdown():
                 return
             observation, info, aux = self._reset_training_env(env)
+            self._maybe_refresh_actor(force=True)
             if self._should_shutdown():
                 return
             while not self._should_shutdown():
+                self._maybe_refresh_actor(force=not self._has_policy_weights)
                 pending_eval = self._drain_commands()
                 if self._should_shutdown() and pending_eval is None:
                     break
                 if pending_eval is not None:
                     self._flush_pending_transitions(force=True)
+                    self._maybe_refresh_actor(force=True)
                     eval_metadata = {
                         "run_name": pending_eval.get("run_name"),
                         "env_step": int(pending_eval.get("env_step", self._env_step)),
@@ -211,6 +224,7 @@ class SACWorker:
                 self._episode_state.step_count += 1
                 self._episode_state.episode_reward += float(reward)
                 self._env_step += 1
+                self._record_action_stats(action)
 
                 transition = self._build_transition(
                     observation=observation,
@@ -239,6 +253,10 @@ class SACWorker:
                             "type": "heartbeat",
                             "env_step": self._env_step,
                             "episode_index": self._episode_state.episode_index,
+                            "current_actor_version": self._current_actor_version,
+                            "last_seen_actor_version": self._last_seen_actor_version,
+                            "last_actor_apply_env_step": self._last_actor_apply_env_step,
+                            "latest_action_stats": self._last_action_stats,
                         }
                     )
 
@@ -266,6 +284,7 @@ class SACWorker:
                         observation, info, aux = next_observation, next_info, next_aux
                         break
                     observation, info, aux = self._reset_training_env(env)
+                    self._maybe_refresh_actor(force=True)
                     if self._should_shutdown():
                         break
                 else:
@@ -385,28 +404,7 @@ class SACWorker:
             except queue.Empty:
                 break
             command_type = str(command.get("type", ""))
-            if command_type == "set_actor":
-                self._write_worker_event(
-                    "command_received",
-                    {
-                        "command_type": "set_actor",
-                        "learner_step": int(command.get("learner_step", 0)),
-                        "requested_env_step": int(command.get("env_step", self._env_step)),
-                        "actor_state_path": command.get("actor_state_path"),
-                    },
-                )
-                if "actor_state_dict" in command:
-                    actor_state_dict = command["actor_state_dict"]
-                else:
-                    actor_state_path = command.get("actor_state_path")
-                    if actor_state_path is None:
-                        raise RuntimeError("set_actor command is missing actor_state_dict and actor_state_path.")
-                    assert self._torch is not None
-                    actor_state_dict = self._torch.load(actor_state_path, map_location="cpu")
-                self.actor.load_state_dict(actor_state_dict)
-                self.actor.eval()
-                self._has_policy_weights = True
-            elif command_type == "run_eval":
+            if command_type == "run_eval":
                 self._write_worker_event(
                     "command_received",
                     {
@@ -418,6 +416,14 @@ class SACWorker:
                     },
                 )
                 pending_eval = dict(command)
+            elif command_type == "set_actor":
+                self._write_worker_event(
+                    "command_received",
+                    {
+                        "command_type": "set_actor",
+                        "ignored": True,
+                    },
+                )
             elif command_type == "shutdown":
                 self._write_worker_event(
                     "command_received",
@@ -430,6 +436,117 @@ class SACWorker:
         if self._shutdown_requested:
             return None
         return pending_eval
+
+    def _maybe_refresh_actor(self, *, force: bool = False) -> None:
+        if self.actor_manifest_path is None:
+            return
+        if self._torch is None or self.actor is None:
+            return
+        try:
+            manifest_stat = self.actor_manifest_path.stat()
+        except FileNotFoundError:
+            return
+        try:
+            manifest_mtime_ns = int(manifest_stat.st_mtime_ns)
+            if not force and self._last_manifest_mtime_ns == manifest_mtime_ns:
+                return
+            manifest = json.loads(self.actor_manifest_path.read_text(encoding="utf-8"))
+            self._last_manifest_mtime_ns = manifest_mtime_ns
+            version = int(manifest["version"])
+            actor_state_path = Path(str(manifest["actor_state_path"]))
+            if self._last_seen_actor_version is None or version > self._last_seen_actor_version:
+                self._last_seen_actor_version = version
+                seen_payload = {
+                    "version": version,
+                    "learner_step": int(manifest.get("learner_step", 0)),
+                    "requested_env_step": int(manifest.get("env_step", self._env_step)),
+                    "actor_state_path": str(actor_state_path),
+                    "written_at": manifest.get("written_at"),
+                    "manifest_mtime_ns": manifest_mtime_ns,
+                }
+                self._write_worker_event("actor_sync_manifest_seen", seen_payload)
+                self._put_message(
+                    {
+                        "type": "actor_sync_manifest_seen",
+                        **seen_payload,
+                        "env_step": self._env_step,
+                    }
+                )
+            if self._current_actor_version is not None and version <= self._current_actor_version:
+                return
+            actor_state_dict = self._torch.load(actor_state_path, map_location="cpu")
+            self.actor.load_state_dict(actor_state_dict)
+            self.actor.eval()
+            self._has_policy_weights = True
+            self._current_actor_version = version
+            self._last_actor_apply_env_step = self._env_step
+            payload = {
+                "version": version,
+                "learner_step": int(manifest.get("learner_step", 0)),
+                "requested_env_step": int(manifest.get("env_step", self._env_step)),
+                "actor_state_path": str(actor_state_path),
+                "written_at": manifest.get("written_at"),
+                "manifest_mtime_ns": manifest_mtime_ns,
+                "last_actor_apply_env_step": self._last_actor_apply_env_step,
+            }
+            self._write_worker_event("actor_sync_applied", payload)
+            self._put_message(
+                {
+                    "type": "actor_sync_applied",
+                    "env_step": self._env_step,
+                    "last_seen_actor_version": self._last_seen_actor_version,
+                    "version": version,
+                    "learner_step": int(manifest.get("learner_step", 0)),
+                    "actor_state_path": str(actor_state_path),
+                    "written_at": manifest.get("written_at"),
+                    "manifest_mtime_ns": manifest_mtime_ns,
+                    "last_actor_apply_env_step": self._last_actor_apply_env_step,
+                }
+            )
+        except Exception:
+            self._write_worker_event(
+                "actor_sync_error",
+                {
+                    "error": traceback.format_exc(),
+                    "manifest_path": str(self.actor_manifest_path),
+                    "last_manifest_mtime_ns": self._last_manifest_mtime_ns,
+                    "last_seen_actor_version": self._last_seen_actor_version,
+                    "current_actor_version": self._current_actor_version,
+                },
+            )
+
+    def _record_action_stats(self, action: np.ndarray) -> None:
+        if self._env_step < self.config.train.environment_steps_before_training:
+            return
+        action_vector = np.asarray(action, dtype=np.float32)
+        self._recent_actions.append(action_vector.copy())
+        if self._env_step % self._action_stats_interval_steps != 0 or not self._recent_actions:
+            return
+        window = np.stack(list(self._recent_actions), axis=0)
+        gas = window[:, 0]
+        brake = window[:, 1]
+        steer = np.abs(window[:, 2])
+        stats = {
+            "env_step": self._env_step,
+            "window_size": int(window.shape[0]),
+            "current_actor_version": self._current_actor_version,
+            "last_seen_actor_version": self._last_seen_actor_version,
+            "last_actor_apply_env_step": self._last_actor_apply_env_step,
+            "steps_since_actor_apply": (
+                None
+                if self._last_actor_apply_env_step is None
+                else int(self._env_step - self._last_actor_apply_env_step)
+            ),
+            "mean_gas": float(np.mean(gas)),
+            "mean_brake": float(np.mean(brake)),
+            "mean_abs_steer": float(np.mean(steer)),
+            "fraction_gas_gt_0_1": float(np.mean(gas > 0.1)),
+            "fraction_brake_gt_0_1": float(np.mean(brake > 0.1)),
+            "fraction_gas_and_brake_gt_0_1": float(np.mean((gas > 0.1) & (brake > 0.1))),
+        }
+        self._last_action_stats = stats
+        self._write_worker_event("action_stats", stats)
+        self._put_message({"type": "action_stats", **stats})
 
     def _run_eval(self, env: TM20AIGymEnv, command: Mapping[str, Any]) -> dict[str, Any]:
         if self.actor is None:
