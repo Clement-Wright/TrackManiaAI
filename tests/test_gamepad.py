@@ -29,9 +29,9 @@ def test_gamepad_clamps_and_maps_action() -> None:
     fake = FakePad()
     controller = GamepadController(backend=fake)
 
-    applied = controller.apply([1.4, -0.2, -2.0])
+    applied = controller.apply([1.4, -2.0])
 
-    assert np.allclose(applied, np.asarray([1.0, 0.0, -1.0], dtype=np.float32))
+    assert np.allclose(applied, np.asarray([1.0, -1.0], dtype=np.float32))
     assert fake.right_trigger_value == 255
     assert fake.left_trigger_value == 0
     assert fake.left_stick == (-32768, 0)
@@ -41,4 +41,4 @@ def test_gamepad_clamps_and_maps_action() -> None:
 def test_gamepad_neutral_action_is_zeroed() -> None:
     neutral = GamepadController.neutral_action()
     assert neutral.dtype == np.float32
-    assert neutral.tolist() == [0.0, 0.0, 0.0]
+    assert neutral.tolist() == [0.0, 0.0]

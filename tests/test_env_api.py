@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 from gymnasium import spaces
 
+from tm20ai.action_space import ACTION_HIGH, ACTION_LOW
 from tm20ai.env import FROZEN_STEP_INFO_KEYS, build_rtgym_config
 from tm20ai.env.gym_env import TM20AIGymEnv
 
@@ -27,7 +28,7 @@ class FakeFullInterface:
         return spaces.Tuple((spaces.Box(low=0, high=255, shape=(4, 64, 64), dtype=np.uint8),))
 
     def get_default_action(self):
-        return np.zeros(3, dtype=np.float32)
+        return np.zeros(2, dtype=np.float32)
 
     def get_runtime_metrics(self):
         return {
@@ -39,10 +40,10 @@ class FakeFullInterface:
 
 class FakeLidarInterface:
     def get_observation_space(self):
-        return spaces.Tuple((spaces.Box(low=0.0, high=1.0, shape=(83,), dtype=np.float32),))
+        return spaces.Tuple((spaces.Box(low=0.0, high=1.0, shape=(81,), dtype=np.float32),))
 
     def get_default_action(self):
-        return np.zeros(3, dtype=np.float32)
+        return np.zeros(2, dtype=np.float32)
 
     def get_runtime_metrics(self):
         return {
@@ -56,8 +57,8 @@ class FakeFullRealTimeEnv:
     def __init__(self, _config):
         self.interface = FakeFullInterface()
         self.action_space = spaces.Box(
-            low=np.asarray([0.0, 0.0, -1.0], dtype=np.float32),
-            high=np.asarray([1.0, 1.0, 1.0], dtype=np.float32),
+            low=ACTION_LOW.copy(),
+            high=ACTION_HIGH.copy(),
             dtype=np.float32,
         )
 
@@ -102,19 +103,19 @@ class FakeLidarRealTimeEnv(FakeFullRealTimeEnv):
     def __init__(self, _config):
         self.interface = FakeLidarInterface()
         self.action_space = spaces.Box(
-            low=np.asarray([0.0, 0.0, -1.0], dtype=np.float32),
-            high=np.asarray([1.0, 1.0, 1.0], dtype=np.float32),
+            low=ACTION_LOW.copy(),
+            high=ACTION_HIGH.copy(),
             dtype=np.float32,
         )
 
     def reset(self, seed=None, options=None):  # noqa: ANN001
         del seed, options
-        return (np.zeros((83,), dtype=np.float32),), {"map_uid": "test-map", "run_id": "run"}
+        return (np.zeros((81,), dtype=np.float32),), {"map_uid": "test-map", "run_id": "run"}
 
     def step(self, action):  # noqa: ANN001
         del action
         return (
-            (np.zeros((83,), dtype=np.float32),),
+            (np.zeros((81,), dtype=np.float32),),
             1.0,
             True,
             False,
@@ -165,7 +166,7 @@ def test_gym_env_step_normalizes_frozen_info_for_full(tmp_path, monkeypatch) -> 
         assert observation.shape == (4, 64, 64)
         assert info["map_uid"] == "test-map"
 
-        observation, reward, terminated, truncated, info = env.step(np.zeros(3, dtype=np.float32))
+        observation, reward, terminated, truncated, info = env.step(np.zeros(2, dtype=np.float32))
         assert observation.shape == (4, 64, 64)
         assert reward == 0.0
         assert terminated is False
@@ -185,12 +186,12 @@ def test_gym_env_step_normalizes_frozen_info_for_lidar(tmp_path, monkeypatch) ->
     env = TM20AIGymEnv(config_path, benchmark=True)
     try:
         observation, info = env.reset()
-        assert observation.shape == (83,)
+        assert observation.shape == (81,)
         assert observation.dtype == np.float32
         assert info["map_uid"] == "test-map"
 
-        observation, reward, terminated, truncated, info = env.step(np.zeros(3, dtype=np.float32))
-        assert observation.shape == (83,)
+        observation, reward, terminated, truncated, info = env.step(np.zeros(2, dtype=np.float32))
+        assert observation.shape == (81,)
         assert reward == 1.0
         assert terminated is True
         assert truncated is False

@@ -182,3 +182,21 @@ def test_dxcam_capture_recreates_camera_after_repeated_invalid_frames() -> None:
 
     assert int(frame[0, 0, 0]) == 42
     assert capture.state == CaptureState.RUNNING
+
+
+def test_dxcam_capture_rejects_unexpected_client_size() -> None:
+    config = CaptureConfig(frame_timeout=0.01, require_stable_window_polls=1)
+    camera = FakeCamera([make_frame(10)])
+
+    locator = FakeWindowLocator(windows=[(100, make_geometry(0, 0, 320, 180))])
+    capture = DXCamCapture(
+        config,
+        camera_factory=lambda _cfg: camera,
+        window_locator=locator,
+        region_refresh_interval_seconds=0.0,
+        binding_resolver=fake_binding,
+        expected_client_size=(256, 128),
+    )
+
+    with np.testing.assert_raises_regex(RuntimeError, "expected 256x128"):
+        capture.ensure_started()

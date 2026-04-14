@@ -73,7 +73,7 @@ class FakeGamepad:
 
     @staticmethod
     def neutral_action() -> np.ndarray:
-        return np.zeros(3, dtype=np.float32)
+        return np.zeros(2, dtype=np.float32)
 
     def apply(self, action) -> np.ndarray:  # noqa: ANN001
         array = np.asarray(action, dtype=np.float32)

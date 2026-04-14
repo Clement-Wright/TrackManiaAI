@@ -35,9 +35,9 @@ def test_lidar_observation_builder_resets_and_tracks_action_history() -> None:
     assert observation.dtype == np.float32
     assert observation[0] == np.float32(0.25)
 
-    builder.observe_action(np.asarray([1.0, 0.0, -0.5], dtype=np.float32))
+    builder.observe_action(np.asarray([1.0, -0.5], dtype=np.float32))
     next_observation = builder.append_frame(make_test_frame(), speed_norm=0.5)
     assert next_observation.shape == (lidar_feature_dim(config),)
     assert np.isclose(next_observation[0], 0.5)
-    assert np.isclose(next_observation[-3], 1.0)
+    assert np.isclose(next_observation[-2], 1.0)
     assert np.isclose(next_observation[-1], -0.5)

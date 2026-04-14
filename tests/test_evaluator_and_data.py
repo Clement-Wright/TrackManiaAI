@@ -9,11 +9,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from tm20ai.action_space import ACTION_DIM
 from tm20ai.data.dataset import (
     FullBehaviorCloningDataset,
     split_demo_dataset,
     validate_full_demo_dataset,
 )
+from tm20ai.train.features import TELEMETRY_DIM
 from tm20ai.train.evaluator import (
     FixedActionPolicy,
     KeyboardTeleopPolicy,
@@ -28,7 +30,7 @@ from tm20ai.train.evaluator import (
 
 class FakeEnv:
     def __init__(self) -> None:
-        self.default_action = np.zeros(3, dtype=np.float32)
+        self.default_action = np.zeros(ACTION_DIM, dtype=np.float32)
         self._episode_index = -1
         self._step_index = 0
 
@@ -181,7 +183,7 @@ sac:
   alpha_lr: 3.0e-4
   learn_entropy_coef: false
   alpha: 0.01
-  target_entropy: -3.0
+  target_entropy: -2.0
 bc:
   epochs: 2
   learning_rate: 3.0e-4
@@ -206,8 +208,8 @@ def test_run_policy_episodes_writes_scalar_artifacts(tmp_path, monkeypatch) -> N
 
     for policy in (
         ZeroPolicy(),
-        FixedActionPolicy(action=np.asarray([1.0, 0.0, 0.0], dtype=np.float32)),
-        ScriptedPolicyAdapter(callback=lambda obs, info: np.asarray([0.5, 0.0, 0.0], dtype=np.float32)),
+        FixedActionPolicy(action=np.asarray([1.0, 0.0], dtype=np.float32)),
+        ScriptedPolicyAdapter(callback=lambda obs, info: np.asarray([0.5, 0.0], dtype=np.float32)),
     ):
         result = run_policy_episodes(
             config_path=config_path,
@@ -236,7 +238,7 @@ def test_demo_runs_write_sidecars_and_dataset_split(tmp_path, monkeypatch) -> No
     result = run_policy_episodes(
         config_path=config_path,
         mode="demos",
-        policy=FixedActionPolicy(action=np.asarray([1.0, 0.0, 0.0], dtype=np.float32)),
+        policy=FixedActionPolicy(action=np.asarray([1.0, 0.0], dtype=np.float32)),
         episodes=2,
         seed_base=123,
         record_video=False,
@@ -254,19 +256,19 @@ def test_demo_runs_write_sidecars_and_dataset_split(tmp_path, monkeypatch) -> No
     assert len(dataset) > 0
     observation, telemetry, action = dataset[0]
     assert observation.shape == (4, 64, 64)
-    assert telemetry.shape == (14,)
-    assert action.shape == (3,)
+    assert telemetry.shape == (TELEMETRY_DIM,)
+    assert action.shape == (ACTION_DIM,)
 
 
 def test_keyboard_teleop_policy_maps_keys() -> None:
     pressed = {VK_W, VK_D}
     policy = KeyboardTeleopPolicy(key_state_reader=lambda key: 0x8000 if key in pressed else 0)
     action = policy.act(np.zeros((4, 64, 64), dtype=np.uint8), {})
-    assert np.allclose(action, np.asarray([1.0, 0.0, 1.0], dtype=np.float32))
+    assert np.allclose(action, np.asarray([1.0, 1.0], dtype=np.float32))
 
     conflicting = KeyboardTeleopPolicy(key_state_reader=lambda key: 0x8000 if key in {VK_A, VK_D} else 0)
     conflicting_action = conflicting.act(np.zeros((4, 64, 64), dtype=np.uint8), {})
-    assert np.allclose(conflicting_action, np.asarray([0.0, 0.0, 0.0], dtype=np.float32))
+    assert np.allclose(conflicting_action, np.asarray([0.0, 0.0], dtype=np.float32))
 
 
 def test_validate_full_demo_dataset_rejects_missing_sidecar(tmp_path, monkeypatch) -> None:
@@ -281,7 +283,7 @@ def test_validate_full_demo_dataset_rejects_missing_sidecar(tmp_path, monkeypatc
     result = run_policy_episodes(
         config_path=config_path,
         mode="demos",
-        policy=FixedActionPolicy(action=np.asarray([1.0, 0.0, 0.0], dtype=np.float32)),
+        policy=FixedActionPolicy(action=np.asarray([1.0, 0.0], dtype=np.float32)),
         episodes=2,
         seed_base=123,
         record_video=False,
@@ -306,7 +308,7 @@ def test_validate_full_demo_dataset_rejects_mixed_map_uids_without_override(tmp_
     result = run_policy_episodes(
         config_path=config_path,
         mode="demos",
-        policy=FixedActionPolicy(action=np.asarray([1.0, 0.0, 0.0], dtype=np.float32)),
+        policy=FixedActionPolicy(action=np.asarray([1.0, 0.0], dtype=np.float32)),
         episodes=2,
         seed_base=123,
         record_video=False,
@@ -367,7 +369,7 @@ def test_validate_full_demo_dataset_rejects_zero_action_demos(tmp_path, monkeypa
     result = run_policy_episodes(
         config_path=config_path,
         mode="demos",
-        policy=FixedActionPolicy(action=np.asarray([1.0, 0.0, 0.0], dtype=np.float32)),
+        policy=FixedActionPolicy(action=np.asarray([1.0, 0.0], dtype=np.float32)),
         episodes=1,
         seed_base=123,
         record_video=False,
@@ -394,7 +396,7 @@ def test_pretrain_bc_writes_best_and_final_checkpoints(tmp_path, monkeypatch) ->
     demo_result = run_policy_episodes(
         config_path=config_path,
         mode="demos",
-        policy=FixedActionPolicy(action=np.asarray([1.0, 0.0, 0.0], dtype=np.float32)),
+        policy=FixedActionPolicy(action=np.asarray([1.0, 0.0], dtype=np.float32)),
         episodes=2,
         seed_base=123,
         record_video=False,
