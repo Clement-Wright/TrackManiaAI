@@ -100,7 +100,7 @@ sac:
   alpha_lr: 3.0e-4
   learn_entropy_coef: false
   alpha: 0.01
-  target_entropy: -3.0
+  target_entropy: -2.0
 
 bc:
   epochs: 20
