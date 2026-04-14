@@ -13,6 +13,7 @@ __all__ = [
     "KeyboardTeleopPolicy",
     "PolicyAdapter",
     "ReplayBuffer",
+    "REDQLearner",
     "SACLearner",
     "ScriptedPolicyAdapter",
     "TelemetryFeatureBuilder",
@@ -44,7 +45,7 @@ if TYPE_CHECKING:
     )
     from ..data.dataset import FullBehaviorCloningDataset, seed_replay_from_demo_sidecars, split_demo_dataset
     from .features import TelemetryFeatureBuilder
-    from .learner import SACLearner
+    from .learner import REDQLearner, SACLearner
     from .protocol import EvalResult
     from .replay import ReplayBuffer
     from .reporting import (
@@ -72,7 +73,7 @@ def __getattr__(name: str) -> Any:
         )
         from ..data.dataset import FullBehaviorCloningDataset, seed_replay_from_demo_sidecars, split_demo_dataset
         from .features import TelemetryFeatureBuilder
-        from .learner import SACLearner
+        from .learner import REDQLearner, SACLearner
         from .protocol import EvalResult
         from .replay import ReplayBuffer
         from .reporting import (
@@ -93,6 +94,7 @@ def __getattr__(name: str) -> Any:
             "KeyboardTeleopPolicy": KeyboardTeleopPolicy,
             "PolicyAdapter": PolicyAdapter,
             "ReplayBuffer": ReplayBuffer,
+            "REDQLearner": REDQLearner,
             "SACLearner": SACLearner,
             "ScriptedPolicyAdapter": ScriptedPolicyAdapter,
             "seed_replay_from_demo_sidecars": seed_replay_from_demo_sidecars,

@@ -240,6 +240,9 @@ class TrainConfig:
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "TrainConfig":
+        algorithm = str(payload.get("algorithm", "sac")).strip().lower()
+        if algorithm not in {"sac", "redq"}:
+            raise ConfigError(f"train.algorithm must be one of ['sac', 'redq'], got {algorithm!r}.")
         max_env_steps = payload.get("max_env_steps")
         memory_size = payload.get("memory_size", payload.get("replay_capacity", 1_000_000))
         env_steps_before_training = payload.get(
@@ -251,7 +254,7 @@ class TrainConfig:
             payload.get("updates_per_step", 4.0),
         )
         return cls(
-            algorithm=str(payload.get("algorithm", "sac")).strip().lower(),
+            algorithm=algorithm,
             seed=int(payload.get("seed", 12345)),
             memory_size=int(memory_size),
             batch_size=int(payload.get("batch_size", 256)),
@@ -298,6 +301,37 @@ class SACConfig:
 
 
 @dataclass(slots=True)
+class REDQConfig:
+    n_critics: int = 10
+    m_subset: int = 2
+    q_updates_per_policy_update: int = 20
+    share_encoders: bool = False
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any]) -> "REDQConfig":
+        n_critics = int(payload.get("n_critics", 10))
+        m_subset = int(payload.get("m_subset", 2))
+        q_updates_per_policy_update = int(payload.get("q_updates_per_policy_update", 20))
+        if n_critics < 2:
+            raise ConfigError(f"redq.n_critics must be >= 2, got {n_critics}.")
+        if m_subset < 1 or m_subset > n_critics:
+            raise ConfigError(
+                f"redq.m_subset must satisfy 1 <= m_subset <= n_critics, got m_subset={m_subset}, n_critics={n_critics}."
+            )
+        if q_updates_per_policy_update < 1:
+            raise ConfigError(
+                "redq.q_updates_per_policy_update must be >= 1, "
+                f"got {q_updates_per_policy_update}."
+            )
+        return cls(
+            n_critics=n_critics,
+            m_subset=m_subset,
+            q_updates_per_policy_update=q_updates_per_policy_update,
+            share_encoders=_bool(payload.get("share_encoders", False), context="redq.share_encoders"),
+        )
+
+
+@dataclass(slots=True)
 class BCConfig:
     epochs: int = 20
     learning_rate: float = 3e-4
@@ -335,6 +369,7 @@ class TM20AIConfig:
     eval: EvalConfig
     train: TrainConfig
     sac: SACConfig
+    redq: REDQConfig
     bc: BCConfig
     artifacts: ArtifactConfig
 
@@ -357,6 +392,7 @@ class TM20AIConfig:
             eval=EvalConfig.from_mapping(_mapping(payload.get("eval", {}), context="eval")),
             train=TrainConfig.from_mapping(_mapping(payload.get("train", {}), context="train")),
             sac=SACConfig.from_mapping(_mapping(payload.get("sac", {}), context="sac")),
+            redq=REDQConfig.from_mapping(_mapping(payload.get("redq", {}), context="redq")),
             bc=BCConfig.from_mapping(_mapping(payload.get("bc", {}), context="bc")),
             artifacts=ArtifactConfig.from_mapping(_mapping(payload.get("artifacts", {}), context="artifacts")),
         )
