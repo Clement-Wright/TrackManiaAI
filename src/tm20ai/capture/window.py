@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import ctypes
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+
+_DPI_AWARENESS_INITIALIZED = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -55,6 +59,7 @@ class TrackmaniaWindowLocator:
 
 
 def _load_win32_modules():
+    _ensure_dpi_awareness()
     try:
         import win32api
         import win32con
@@ -63,6 +68,33 @@ def _load_win32_modules():
     except ImportError as exc:  # pragma: no cover - Windows dependency guard
         raise RuntimeError("pywin32 is required to locate the Trackmania window.") from exc
     return win32api, win32con, win32gui, win32process
+
+
+def _ensure_dpi_awareness() -> None:
+    global _DPI_AWARENESS_INITIALIZED
+    if _DPI_AWARENESS_INITIALIZED:
+        return
+    _DPI_AWARENESS_INITIALIZED = True
+    try:
+        user32 = ctypes.windll.user32
+    except Exception:  # noqa: BLE001
+        return
+    try:
+        awareness_context = ctypes.c_void_p(-4)
+        if bool(user32.SetProcessDpiAwarenessContext(awareness_context)):
+            return
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        shcore = ctypes.windll.shcore
+        if int(shcore.SetProcessDpiAwareness(2)) in {0, 0x80070005}:
+            return
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        user32.SetProcessDPIAware()
+    except Exception:  # noqa: BLE001
+        return
 
 
 def _window_matches(title_fragment: str, *, title: str, process_path: str | None) -> bool:

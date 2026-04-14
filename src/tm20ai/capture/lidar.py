@@ -7,26 +7,12 @@ from math import ceil
 import cv2
 import numpy as np
 
+from ..action_space import ACTION_DIM, clamp_action, neutral_action
 from ..config import LidarObservationConfig
 
 
 LIDAR_SPEED_DIM = 1
-LIDAR_ACTION_DIM = 3
-
-
-def _clamp_action(action: np.ndarray | list[float] | tuple[float, ...]) -> np.ndarray:
-    array = np.asarray(action, dtype=np.float32).reshape(-1)
-    if array.shape != (LIDAR_ACTION_DIM,):
-        raise ValueError(f"Expected an action with shape ({LIDAR_ACTION_DIM},), got {array.shape}.")
-    return np.asarray(
-        [
-            np.clip(array[0], 0.0, 1.0),
-            np.clip(array[1], 0.0, 1.0),
-            np.clip(array[2], -1.0, 1.0),
-        ],
-        dtype=np.float32,
-    )
-
+LIDAR_ACTION_DIM = ACTION_DIM
 
 def lidar_feature_dim(config: LidarObservationConfig) -> int:
     return LIDAR_SPEED_DIM + (config.lidar_hist_len * config.ray_count) + (
@@ -130,12 +116,12 @@ class LidarObservationBuilder:
 
     def reset_action_history(self) -> None:
         self._action_history.clear()
-        neutral = np.zeros((LIDAR_ACTION_DIM,), dtype=np.float32)
+        neutral = neutral_action()
         for _ in range(self.config.prev_action_hist_len):
             self._action_history.append(neutral.copy())
 
     def observe_action(self, action: np.ndarray | list[float] | tuple[float, ...]) -> None:
-        self._action_history.append(_clamp_action(action))
+        self._action_history.append(clamp_action(action))
 
     def reset(self, fresh_frames: list[np.ndarray], *, speed_norm: float) -> np.ndarray:
         if not fresh_frames:

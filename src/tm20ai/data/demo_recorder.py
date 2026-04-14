@@ -8,6 +8,7 @@ from typing import Any, Mapping, Sequence
 import cv2
 import numpy as np
 
+from ..action_space import ACTION_DIM, ThrottleAction, clamp_action
 from ..env.trajectory import RuntimeTrajectory
 from ..train.metrics import summarize_episode_trace
 from .parquet_writer import EpisodeArtifactPaths, RunArtifactPaths, build_episode_artifact_paths, write_json, write_parquet_rows
@@ -51,9 +52,9 @@ class DemoRecorder:
         self._current_observations: list[np.ndarray] = []
         self._current_telemetry: list[np.ndarray] = []
         self._current_actions: list[np.ndarray] = []
-        self._current_action_abs_sum = np.zeros(3, dtype=np.float64)
+        self._current_action_abs_sum = np.zeros(ACTION_DIM, dtype=np.float64)
         self._current_nonzero_action_steps = 0
-        self._run_action_abs_sum = np.zeros(3, dtype=np.float64)
+        self._run_action_abs_sum = np.zeros(ACTION_DIM, dtype=np.float64)
         self._run_action_step_count = 0
         self._run_nonzero_action_steps = 0
 
@@ -88,7 +89,7 @@ class DemoRecorder:
         self._current_observations = []
         self._current_telemetry = []
         self._current_actions = []
-        self._current_action_abs_sum = np.zeros(3, dtype=np.float64)
+        self._current_action_abs_sum = np.zeros(ACTION_DIM, dtype=np.float64)
         self._current_nonzero_action_steps = 0
         return self._current_episode_paths
 
@@ -110,6 +111,8 @@ class DemoRecorder:
             if isinstance(observation, np.ndarray) and observation.ndim >= 3
             else None
         )
+        action_array = clamp_action(action)
+        analog_action = ThrottleAction.from_iterable(action_array)
         progress_index = int(info["progress_index"])
         sector_index = self._trajectory.sector_index_for_progress(progress_index, self._sector_count)
         row = {
@@ -117,9 +120,10 @@ class DemoRecorder:
             "step_index": self._current_step_index,
             "timestamp_ns": int(info["timestamp_ns"]),
             "race_time_ms": int(info["race_time_ms"]),
-            "action_gas": float(action[0]),
-            "action_brake": float(action[1]),
-            "action_steer": float(action[2]),
+            "action_throttle": float(analog_action.throttle),
+            "action_gas": float(analog_action.gas),
+            "action_brake": float(analog_action.brake),
+            "action_steer": float(analog_action.steer),
             "reward": float(reward),
             "progress_index": progress_index,
             "progress_delta": int(info["progress_delta"]),
@@ -142,7 +146,6 @@ class DemoRecorder:
             "stray_distance": info.get("stray_distance"),
         }
         self._current_rows.append(row)
-        action_array = np.asarray(action, dtype=np.float32)
         abs_action = np.abs(action_array)
         self._current_action_abs_sum += abs_action
         self._run_action_abs_sum += abs_action
@@ -162,7 +165,7 @@ class DemoRecorder:
             if policy_telemetry is None:
                 raise RuntimeError("policy_telemetry is required when observation sidecars are enabled.")
             self._current_telemetry.append(np.asarray(policy_telemetry, dtype=np.float32))
-            self._current_actions.append(np.asarray(action, dtype=np.float32))
+            self._current_actions.append(action_array)
 
         self._current_step_index += 1
 
@@ -240,7 +243,7 @@ class DemoRecorder:
         self._current_observations = []
         self._current_telemetry = []
         self._current_actions = []
-        self._current_action_abs_sum = np.zeros(3, dtype=np.float64)
+        self._current_action_abs_sum = np.zeros(ACTION_DIM, dtype=np.float64)
         self._current_nonzero_action_steps = 0
         return result
 

@@ -183,12 +183,14 @@ class DXCamCapture:
         window_title: str | None = None,
         region_refresh_interval_seconds: float = 1.0,
         binding_resolver: Callable[[Any, int, WindowGeometry], CaptureBinding] | None = None,
+        expected_client_size: tuple[int, int] | None = None,
     ) -> None:
         self.config = config
         self._camera_factory = camera_factory or _default_camera_factory
         self._window_locator = window_locator or TrackmaniaWindowLocator(window_title or config.window_title)
         self._region_refresh_interval_seconds = region_refresh_interval_seconds
         self._binding_resolver = binding_resolver
+        self._expected_client_size = expected_client_size
 
         self._camera: Any | None = None
         self._geometry: WindowGeometry | None = None
@@ -216,7 +218,19 @@ class DXCamCapture:
 
     def _locate_window(self) -> tuple[int, WindowGeometry]:
         hwnd, geometry = self._window_locator.locate_tm_window()
+        self._validate_geometry(geometry)
         return hwnd, geometry
+
+    def _validate_geometry(self, geometry: WindowGeometry) -> None:
+        if self._expected_client_size is None:
+            return
+        expected_width, expected_height = self._expected_client_size
+        if geometry.width == expected_width and geometry.height == expected_height:
+            return
+        raise RuntimeError(
+            "Trackmania window client rect drifted from the configured observation size: "
+            f"observed {geometry.width}x{geometry.height}, expected {expected_width}x{expected_height}."
+        )
 
     def _wait_for_stable_window(self) -> tuple[int, WindowGeometry]:
         required = max(1, self.config.require_stable_window_polls)

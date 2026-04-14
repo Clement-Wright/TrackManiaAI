@@ -9,11 +9,13 @@ import time
 import traceback
 from collections import deque
 from dataclasses import dataclass
+import math
 from time import monotonic
 from typing import Any, Callable, Mapping
 
 import numpy as np
 
+from ..action_space import clamp_action
 from ..capture import lidar_feature_dim
 from ..config import TM20AIConfig, load_tm20ai_config
 from ..env import TM20AIGymEnv, make_env
@@ -30,6 +32,26 @@ class TrainingEpisodeState:
     @property
     def episode_id(self) -> str:
         return f"train_episode_{self.episode_index:06d}"
+
+
+@dataclass(slots=True)
+class MovementEpisodeState:
+    run_id: str | None = None
+    episode_index: int | None = None
+    start_pos: tuple[float, float, float] | None = None
+    movement_started: bool = False
+    movement_start_env_step: int | None = None
+    movement_start_frame_id: int | None = None
+    movement_start_race_time_ms: int | None = None
+    candidate_stall_env_step: int | None = None
+    candidate_stall_frame_id: int | None = None
+    candidate_stall_race_time_ms: int | None = None
+    candidate_stall_timestamp_ns: int | None = None
+    candidate_stall_pos: tuple[float, float, float] | None = None
+    first_stall: dict[str, Any] | None = None
+    stall_count: int = 0
+    max_speed_kmh: float = 0.0
+    max_distance_from_start_m: float = 0.0
 
 
 class SACWorker:
@@ -56,7 +78,10 @@ class SACWorker:
         self.worker_events_log_path = None if self.bootstrap_log_path is None else self.bootstrap_log_path.with_name(
             "worker_events.log"
         )
-        self.actor_manifest_path = None if self.bootstrap_log_path is None else self.bootstrap_log_path.parent / "worker_sync" / "latest_actor.json"
+        self.desired_actor_path = None if self.bootstrap_log_path is None else self.bootstrap_log_path.parent / "worker_sync" / "desired_actor.json"
+        self.worker_actor_status_path = (
+            None if self.bootstrap_log_path is None else self.bootstrap_log_path.parent / "worker_sync" / "worker_actor_status.json"
+        )
         self.env_factory = env_factory or (lambda path, benchmark=False: make_env(path, benchmark=benchmark))
         self._rng = np.random.default_rng(self.config.train.seed)
 
@@ -77,12 +102,29 @@ class SACWorker:
         self._pending_transitions: list[dict[str, Any]] = []
         self._shutdown_requested = False
         self._action_stats_interval_steps = 100
-        self._last_manifest_mtime_ns: int | None = None
-        self._last_seen_actor_version: int | None = None
-        self._current_actor_version: int | None = None
+        self._desired_actor_version: int | None = None
+        self._desired_actor_ready_for_control = False
+        self._control_ready_reason: str | None = None
+        self._seen_actor_version: int | None = None
+        self._ready_for_control_seen = False
+        self._applied_actor_version: int | None = None
+        self._actor_ready_for_control = False
+        self._applied_source_learner_step: int | None = None
         self._last_actor_apply_env_step: int | None = None
+        self._last_actor_apply_episode_index: int | None = None
+        self._eval_actor_version: int | None = None
+        self._eval_actor_source_learner_step: int | None = None
         self._last_action_stats: dict[str, Any] | None = None
-        self._recent_actions: deque[np.ndarray] = deque(maxlen=self._action_stats_interval_steps)
+        self._recent_executed_actions: deque[np.ndarray] = deque(maxlen=self._action_stats_interval_steps)
+        self._recent_raw_actions: deque[np.ndarray] = deque(maxlen=self._action_stats_interval_steps)
+        self._action_guard_active = False
+        self._status_mode = "train"
+        self._movement_state = MovementEpisodeState()
+        self._movement_start_speed_threshold_kmh = 5.0
+        self._movement_start_distance_threshold_m = 0.5
+        self._movement_stall_speed_threshold_kmh = 2.0
+        self._movement_stall_position_epsilon_m = 0.15
+        self._movement_stall_duration_seconds = 1.0
 
     def _write_worker_event(self, event: str, payload: Mapping[str, Any] | None = None) -> None:
         if self.worker_events_log_path is None:
@@ -114,6 +156,58 @@ class SACWorker:
         with self.bootstrap_log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, sort_keys=True))
             handle.write("\n")
+
+    def _write_actor_status(self) -> None:
+        if self.worker_actor_status_path is None:
+            return
+        self.worker_actor_status_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "desired_actor_version": self._desired_actor_version,
+            "desired_actor_ready_for_control": self._desired_actor_ready_for_control,
+            "seen_actor_version": self._seen_actor_version,
+            "ready_for_control_seen": self._ready_for_control_seen,
+            "applied_actor_version": self._applied_actor_version,
+            "actor_ready_for_control": self._actor_ready_for_control,
+            "applied_source_learner_step": self._applied_source_learner_step,
+            "applied_at_env_step": self._last_actor_apply_env_step,
+            "applied_at_episode_index": self._last_actor_apply_episode_index,
+            "control_ready_reason": self._control_ready_reason,
+            "mode": self._status_mode,
+            "updated_at": time.time(),
+        }
+        temp_path = self.worker_actor_status_path.with_suffix(".tmp")
+        temp_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        temp_path.replace(self.worker_actor_status_path)
+
+    def _actor_sync_payload(
+        self,
+        *,
+        desired_version: int | None = None,
+        seen_version: int | None = None,
+        applied_version: int | None = None,
+        actor_state_path: str | None = None,
+        written_at: str | None = None,
+        learner_step: int | None = None,
+        requested_env_step: int | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "desired_actor_version": self._desired_actor_version if desired_version is None else desired_version,
+            "desired_actor_ready_for_control": self._desired_actor_ready_for_control,
+            "seen_actor_version": self._seen_actor_version if seen_version is None else seen_version,
+            "ready_for_control_seen": self._ready_for_control_seen,
+            "applied_actor_version": self._applied_actor_version if applied_version is None else applied_version,
+            "actor_ready_for_control": self._actor_ready_for_control,
+            "applied_source_learner_step": self._applied_source_learner_step,
+            "env_step": self._env_step,
+            "episode_index": self._episode_state.episode_index,
+            "last_actor_apply_env_step": self._last_actor_apply_env_step,
+            "last_actor_apply_episode_index": self._last_actor_apply_episode_index,
+            "actor_state_path": actor_state_path,
+            "written_at": written_at,
+            "learner_step": learner_step,
+            "requested_env_step": requested_env_step,
+            "control_ready_reason": self._control_ready_reason,
+        }
 
     def _initialize_policy_components(self) -> None:
         if self.actor is not None and self._torch is not None:
@@ -147,26 +241,31 @@ class SACWorker:
             env = self.env_factory(self.config_path, False)
             self._bootstrap_capture(env)
             self._initialize_policy_components()
-            self._maybe_refresh_actor(force=True)
             if self._should_shutdown():
                 return
-            observation, info, aux = self._reset_training_env(env)
-            self._maybe_refresh_actor(force=True)
+            observation, info, aux = self._start_training_episode(env)
             if self._should_shutdown():
                 return
             while not self._should_shutdown():
-                self._maybe_refresh_actor(force=not self._has_policy_weights)
                 pending_eval = self._drain_commands()
                 if self._should_shutdown() and pending_eval is None:
                     break
                 if pending_eval is not None:
                     self._flush_pending_transitions(force=True)
-                    self._maybe_refresh_actor(force=True)
+                    self._apply_latest_desired_actor(mode="eval")
+                    if not self._actor_ready_for_control:
+                        raise RuntimeError("run_eval received before a control-ready actor was applied.")
+                    self._status_mode = "eval"
+                    self._eval_actor_version = self._applied_actor_version
+                    self._eval_actor_source_learner_step = self._applied_source_learner_step
+                    self._write_actor_status()
                     eval_metadata = {
                         "run_name": pending_eval.get("run_name"),
                         "env_step": int(pending_eval.get("env_step", self._env_step)),
                         "learner_step": int(pending_eval.get("learner_step", 0)),
                         "episodes": int(pending_eval.get("episodes", self.config.eval.episodes)),
+                        "eval_actor_version": self._eval_actor_version,
+                        "eval_actor_source_learner_step": self._eval_actor_source_learner_step,
                     }
                     self._put_message(
                         {
@@ -210,21 +309,27 @@ class SACWorker:
                     )
                     if self._should_shutdown():
                         break
-                    observation, info, aux = self._reset_training_env(env)
+                    self._status_mode = "train"
+                    self._eval_actor_version = None
+                    self._eval_actor_source_learner_step = None
+                    self._write_actor_status()
+                    observation, info, aux = self._start_training_episode(env)
                     if self._should_shutdown():
                         break
                     continue
 
                 if self._should_shutdown():
                     break
-                action = self._select_action(observation, aux)
+                raw_action = self._select_action(observation, aux)
+                action = self._execute_training_action(raw_action)
                 next_observation, reward, terminated, truncated, next_info = env.step(action)
                 next_aux = self._build_aux_features(next_info, action)
 
                 self._episode_state.step_count += 1
                 self._episode_state.episode_reward += float(reward)
                 self._env_step += 1
-                self._record_action_stats(action)
+                self._observe_movement(next_info)
+                self._record_action_stats(raw_action=raw_action, executed_action=action)
 
                 transition = self._build_transition(
                     observation=observation,
@@ -253,10 +358,17 @@ class SACWorker:
                             "type": "heartbeat",
                             "env_step": self._env_step,
                             "episode_index": self._episode_state.episode_index,
-                            "current_actor_version": self._current_actor_version,
-                            "last_seen_actor_version": self._last_seen_actor_version,
+                            "desired_actor_version": self._desired_actor_version,
+                            "desired_actor_ready_for_control": self._desired_actor_ready_for_control,
+                            "seen_actor_version": self._seen_actor_version,
+                            "ready_for_control_seen": self._ready_for_control_seen,
+                            "applied_actor_version": self._applied_actor_version,
+                            "actor_ready_for_control": self._actor_ready_for_control,
+                            "applied_source_learner_step": self._applied_source_learner_step,
                             "last_actor_apply_env_step": self._last_actor_apply_env_step,
+                            "last_actor_apply_episode_index": self._last_actor_apply_episode_index,
                             "latest_action_stats": self._last_action_stats,
+                            "control_ready_reason": self._control_ready_reason,
                         }
                     )
 
@@ -280,11 +392,11 @@ class SACWorker:
                             },
                         }
                     )
+                    self._finalize_movement_episode(next_info)
                     if self._should_shutdown():
                         observation, info, aux = next_observation, next_info, next_aux
                         break
-                    observation, info, aux = self._reset_training_env(env)
-                    self._maybe_refresh_actor(force=True)
+                    observation, info, aux = self._start_training_episode(env)
                     if self._should_shutdown():
                         break
                 else:
@@ -310,12 +422,26 @@ class SACWorker:
         finally:
             self._shutdown_cleanup(env)
 
-    def _reset_training_env(self, env: TM20AIGymEnv) -> tuple[np.ndarray, Mapping[str, Any], np.ndarray | None]:
+    def _start_training_episode(self, env: TM20AIGymEnv) -> tuple[np.ndarray, Mapping[str, Any], np.ndarray | None]:
+        self._clear_action_guard(reason="episode_reset")
         seed = self.config.train.seed + self._episode_state.episode_index
         observation, info = env.reset(seed=seed)
-        aux = self._reset_aux_features(info)
         self._episode_state = TrainingEpisodeState(episode_index=self._episode_state.episode_index + 1)
+        self._status_mode = "train"
+        self._begin_movement_episode(info)
+        aux = self._reset_aux_features(info)
+        self._apply_latest_desired_actor(mode="train")
+        self._write_actor_status()
         return observation, info, aux
+
+    def _clear_action_guard(self, *, reason: str) -> None:
+        if self._action_guard_active:
+            payload = self._actor_sync_payload()
+            payload["reason"] = reason
+            self._write_worker_event("action_guard_cleared", payload)
+        self._action_guard_active = False
+        self._recent_executed_actions.clear()
+        self._recent_raw_actions.clear()
 
     def _reset_aux_features(self, info: Mapping[str, Any]) -> np.ndarray | None:
         if self.observation_mode == "full":
@@ -323,6 +449,151 @@ class SACWorker:
             self._features.reset(None if info.get("run_id") is None else str(info["run_id"]))
             return self._features.encode(info)
         return None
+
+    @staticmethod
+    def _normalize_position(value: Any) -> tuple[float, float, float] | None:
+        if value is None or not isinstance(value, (tuple, list)) or len(value) != 3:
+            return None
+        try:
+            return (float(value[0]), float(value[1]), float(value[2]))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _distance(a: tuple[float, float, float] | None, b: tuple[float, float, float] | None) -> float | None:
+        if a is None or b is None:
+            return None
+        dx = float(a[0] - b[0])
+        dy = float(a[1] - b[1])
+        dz = float(a[2] - b[2])
+        return math.sqrt(dx * dx + dy * dy + dz * dz)
+
+    def _begin_movement_episode(self, info: Mapping[str, Any]) -> None:
+        self._movement_state = MovementEpisodeState(
+            run_id=None if info.get("run_id") is None else str(info.get("run_id")),
+            episode_index=self._episode_state.episode_index,
+            start_pos=self._normalize_position(info.get("pos_xyz")),
+        )
+
+    def _clear_stall_candidate(self) -> None:
+        self._movement_state.candidate_stall_env_step = None
+        self._movement_state.candidate_stall_frame_id = None
+        self._movement_state.candidate_stall_race_time_ms = None
+        self._movement_state.candidate_stall_timestamp_ns = None
+        self._movement_state.candidate_stall_pos = None
+
+    def _observe_movement(self, info: Mapping[str, Any]) -> None:
+        state = self._movement_state
+        run_id = None if info.get("run_id") is None else str(info.get("run_id"))
+        if run_id is None:
+            return
+        if state.run_id is None:
+            self._begin_movement_episode(info)
+            state = self._movement_state
+        elif run_id != state.run_id:
+            self._finalize_movement_episode(info={"run_id": state.run_id, "reward_reason": "run_id_changed"})
+            self._begin_movement_episode(info)
+            state = self._movement_state
+
+        speed_kmh = float(info.get("speed_kmh", 0.0) or 0.0)
+        pos_xyz = self._normalize_position(info.get("pos_xyz"))
+        distance_from_start = self._distance(state.start_pos, pos_xyz)
+        state.max_speed_kmh = max(state.max_speed_kmh, speed_kmh)
+        if distance_from_start is not None:
+            state.max_distance_from_start_m = max(state.max_distance_from_start_m, distance_from_start)
+
+        frame_id = int(info.get("frame_id", 0) or 0)
+        race_time_ms = int(info.get("race_time_ms", 0) or 0)
+        timestamp_ns = int(info.get("timestamp_ns", 0) or 0)
+
+        if not state.movement_started:
+            started = speed_kmh >= self._movement_start_speed_threshold_kmh
+            if distance_from_start is not None and distance_from_start >= self._movement_start_distance_threshold_m:
+                started = True
+            if started:
+                state.movement_started = True
+                state.movement_start_env_step = self._env_step
+                state.movement_start_frame_id = frame_id
+                state.movement_start_race_time_ms = race_time_ms
+                self._write_worker_event(
+                    "movement_started",
+                    {
+                        "run_id": state.run_id,
+                        "episode_index": state.episode_index,
+                        "env_step": self._env_step,
+                        "frame_id": frame_id,
+                        "race_time_ms": race_time_ms,
+                        "speed_kmh": speed_kmh,
+                        "distance_from_start_m": distance_from_start,
+                    },
+                )
+
+        if not state.movement_started or state.first_stall is not None:
+            return
+        if speed_kmh > self._movement_stall_speed_threshold_kmh:
+            self._clear_stall_candidate()
+            return
+        if state.candidate_stall_frame_id is None:
+            state.candidate_stall_env_step = self._env_step
+            state.candidate_stall_frame_id = frame_id
+            state.candidate_stall_race_time_ms = race_time_ms
+            state.candidate_stall_timestamp_ns = timestamp_ns
+            state.candidate_stall_pos = pos_xyz
+            return
+
+        distance_in_candidate = self._distance(state.candidate_stall_pos, pos_xyz)
+        if distance_in_candidate is not None and distance_in_candidate > self._movement_stall_position_epsilon_m:
+            state.candidate_stall_env_step = self._env_step
+            state.candidate_stall_frame_id = frame_id
+            state.candidate_stall_race_time_ms = race_time_ms
+            state.candidate_stall_timestamp_ns = timestamp_ns
+            state.candidate_stall_pos = pos_xyz
+            return
+
+        if state.candidate_stall_timestamp_ns is None:
+            return
+        stall_duration = max(0.0, (timestamp_ns - state.candidate_stall_timestamp_ns) / 1_000_000_000.0)
+        if stall_duration < self._movement_stall_duration_seconds:
+            return
+        state.stall_count += 1
+        state.first_stall = {
+            "run_id": state.run_id,
+            "episode_index": state.episode_index,
+            "env_step": state.candidate_stall_env_step,
+            "frame_id": state.candidate_stall_frame_id,
+            "race_time_ms": state.candidate_stall_race_time_ms,
+            "timestamp_ns": state.candidate_stall_timestamp_ns,
+            "speed_kmh": speed_kmh,
+            "pos_xyz": state.candidate_stall_pos,
+            "stall_duration_seconds": stall_duration,
+            "movement_start_env_step": state.movement_start_env_step,
+            "movement_start_frame_id": state.movement_start_frame_id,
+            "movement_start_race_time_ms": state.movement_start_race_time_ms,
+        }
+        self._write_worker_event("movement_stall_detected", dict(state.first_stall))
+
+    def _finalize_movement_episode(self, info: Mapping[str, Any] | None = None) -> None:
+        state = self._movement_state
+        if state.run_id is None:
+            return
+        payload = {
+            "run_id": state.run_id,
+            "episode_index": state.episode_index,
+            "movement_started": state.movement_started,
+            "movement_start_env_step": state.movement_start_env_step,
+            "movement_start_frame_id": state.movement_start_frame_id,
+            "movement_start_race_time_ms": state.movement_start_race_time_ms,
+            "max_speed_kmh": state.max_speed_kmh,
+            "max_distance_from_start_m": state.max_distance_from_start_m,
+            "stall_count": state.stall_count,
+            "first_stall": state.first_stall,
+        }
+        if info is not None:
+            payload["final_frame_id"] = int(info.get("frame_id", 0) or 0)
+            payload["final_race_time_ms"] = int(info.get("race_time_ms", 0) or 0)
+            payload["termination_reason"] = info.get("reward_reason") or info.get("terminal_reason")
+        self._write_worker_event("movement_episode_summary", payload)
+        self._movement_state = MovementEpisodeState()
 
     def _build_aux_features(self, info: Mapping[str, Any], action: np.ndarray) -> np.ndarray | None:
         if self.observation_mode == "full":
@@ -334,11 +605,10 @@ class SACWorker:
     def _select_action(self, observation: np.ndarray, aux: np.ndarray | None) -> np.ndarray:
         if self.actor is None or self._torch is None:
             raise RuntimeError("Worker policy components are not initialized.")
-        if self._env_step < self.config.train.environment_steps_before_training or not self._has_policy_weights:
+        if self._env_step < self.config.train.environment_steps_before_training or not self._actor_ready_for_control:
             return np.asarray(
                 [
-                    self._rng.random(),
-                    self._rng.random(),
+                    self._rng.uniform(-1.0, 1.0),
                     self._rng.uniform(-1.0, 1.0),
                 ],
                 dtype=np.float32,
@@ -354,7 +624,7 @@ class SACWorker:
             observation_tensor = torch.as_tensor(observation, dtype=torch.float32).unsqueeze(0)
             with torch.no_grad():
                 action = self.actor.act(observation_tensor, deterministic=False)
-        return action.squeeze(0).cpu().numpy().astype(np.float32)
+        return clamp_action(action.squeeze(0).cpu().numpy().astype(np.float32))
 
     def _build_transition(
         self,
@@ -437,112 +707,145 @@ class SACWorker:
             return None
         return pending_eval
 
-    def _maybe_refresh_actor(self, *, force: bool = False) -> None:
-        if self.actor_manifest_path is None:
+    def _apply_latest_desired_actor(self, *, mode: str) -> None:
+        if self.desired_actor_path is None:
             return
         if self._torch is None or self.actor is None:
             return
         try:
-            manifest_stat = self.actor_manifest_path.stat()
+            desired_actor = json.loads(self.desired_actor_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return
+        except Exception:
+            self._write_worker_event(
+                "actor_sync_error",
+                {
+                    **self._actor_sync_payload(),
+                    "error": traceback.format_exc(),
+                    "desired_actor_path": str(self.desired_actor_path),
+                },
+            )
+            self._write_actor_status()
+            return
         try:
-            manifest_mtime_ns = int(manifest_stat.st_mtime_ns)
-            if not force and self._last_manifest_mtime_ns == manifest_mtime_ns:
-                return
-            manifest = json.loads(self.actor_manifest_path.read_text(encoding="utf-8"))
-            self._last_manifest_mtime_ns = manifest_mtime_ns
-            version = int(manifest["version"])
-            actor_state_path = Path(str(manifest["actor_state_path"]))
-            if self._last_seen_actor_version is None or version > self._last_seen_actor_version:
-                self._last_seen_actor_version = version
-                seen_payload = {
-                    "version": version,
-                    "learner_step": int(manifest.get("learner_step", 0)),
-                    "requested_env_step": int(manifest.get("env_step", self._env_step)),
-                    "actor_state_path": str(actor_state_path),
-                    "written_at": manifest.get("written_at"),
-                    "manifest_mtime_ns": manifest_mtime_ns,
-                }
-                self._write_worker_event("actor_sync_manifest_seen", seen_payload)
-                self._put_message(
-                    {
-                        "type": "actor_sync_manifest_seen",
-                        **seen_payload,
-                        "env_step": self._env_step,
-                    }
+            desired_version = int(desired_actor["desired_actor_version"])
+            actor_state_path = Path(str(desired_actor["actor_state_path"]))
+            learner_step = int(desired_actor.get("learner_step", 0))
+            requested_env_step = int(desired_actor.get("env_step", self._env_step))
+            written_at = desired_actor.get("written_at")
+            ready_for_control = bool(desired_actor.get("ready_for_control", False))
+            control_ready_reason = str(desired_actor.get("control_ready_reason", "unspecified"))
+            self._desired_actor_version = desired_version
+            self._desired_actor_ready_for_control = ready_for_control
+            self._control_ready_reason = control_ready_reason
+            self._status_mode = mode
+            if self._seen_actor_version is None or desired_version > self._seen_actor_version:
+                self._seen_actor_version = desired_version
+                self._ready_for_control_seen = ready_for_control
+                seen_payload = self._actor_sync_payload(
+                    desired_version=desired_version,
+                    seen_version=desired_version,
+                    actor_state_path=str(actor_state_path),
+                    written_at=written_at,
+                    learner_step=learner_step,
+                    requested_env_step=requested_env_step,
                 )
-            if self._current_actor_version is not None and version <= self._current_actor_version:
+                self._write_worker_event("actor_sync_desired_seen", seen_payload)
+                self._put_message({"type": "actor_sync_desired_seen", **seen_payload})
+            self._write_actor_status()
+            if self._applied_actor_version is not None and desired_version <= self._applied_actor_version:
                 return
             actor_state_dict = self._torch.load(actor_state_path, map_location="cpu")
             self.actor.load_state_dict(actor_state_dict)
             self.actor.eval()
             self._has_policy_weights = True
-            self._current_actor_version = version
+            self._applied_actor_version = desired_version
+            self._actor_ready_for_control = ready_for_control
+            self._applied_source_learner_step = learner_step
             self._last_actor_apply_env_step = self._env_step
-            payload = {
-                "version": version,
-                "learner_step": int(manifest.get("learner_step", 0)),
-                "requested_env_step": int(manifest.get("env_step", self._env_step)),
-                "actor_state_path": str(actor_state_path),
-                "written_at": manifest.get("written_at"),
-                "manifest_mtime_ns": manifest_mtime_ns,
-                "last_actor_apply_env_step": self._last_actor_apply_env_step,
-            }
-            self._write_worker_event("actor_sync_applied", payload)
-            self._put_message(
-                {
-                    "type": "actor_sync_applied",
-                    "env_step": self._env_step,
-                    "last_seen_actor_version": self._last_seen_actor_version,
-                    "version": version,
-                    "learner_step": int(manifest.get("learner_step", 0)),
-                    "actor_state_path": str(actor_state_path),
-                    "written_at": manifest.get("written_at"),
-                    "manifest_mtime_ns": manifest_mtime_ns,
-                    "last_actor_apply_env_step": self._last_actor_apply_env_step,
-                }
+            self._last_actor_apply_episode_index = self._episode_state.episode_index
+            payload = self._actor_sync_payload(
+                desired_version=desired_version,
+                seen_version=self._seen_actor_version,
+                applied_version=desired_version,
+                actor_state_path=str(actor_state_path),
+                written_at=written_at,
+                learner_step=learner_step,
+                requested_env_step=requested_env_step,
             )
+            self._write_worker_event("actor_sync_applied", payload)
+            self._put_message({"type": "actor_sync_applied", **payload})
+            self._write_actor_status()
         except Exception:
             self._write_worker_event(
                 "actor_sync_error",
                 {
+                    **self._actor_sync_payload(),
                     "error": traceback.format_exc(),
-                    "manifest_path": str(self.actor_manifest_path),
-                    "last_manifest_mtime_ns": self._last_manifest_mtime_ns,
-                    "last_seen_actor_version": self._last_seen_actor_version,
-                    "current_actor_version": self._current_actor_version,
+                    "desired_actor_path": str(self.desired_actor_path),
                 },
             )
+            self._write_actor_status()
 
-    def _record_action_stats(self, action: np.ndarray) -> None:
+    def _execute_training_action(self, raw_action: np.ndarray) -> np.ndarray:
+        raw_action = clamp_action(raw_action)
+        if self._status_mode != "train":
+            return raw_action
         if self._env_step < self.config.train.environment_steps_before_training:
+            return raw_action
+        executed_action = raw_action.copy()
+        self._recent_raw_actions.append(raw_action.copy())
+        self._recent_executed_actions.append(executed_action.copy())
+        return executed_action
+
+    def _record_action_stats(self, *, raw_action: np.ndarray, executed_action: np.ndarray) -> None:
+        del raw_action, executed_action
+        if self._status_mode != "train" or self._env_step < self.config.train.environment_steps_before_training:
             return
-        action_vector = np.asarray(action, dtype=np.float32)
-        self._recent_actions.append(action_vector.copy())
-        if self._env_step % self._action_stats_interval_steps != 0 or not self._recent_actions:
+        if not self._recent_executed_actions:
             return
-        window = np.stack(list(self._recent_actions), axis=0)
-        gas = window[:, 0]
-        brake = window[:, 1]
-        steer = np.abs(window[:, 2])
+        if self._env_step % self._action_stats_interval_steps != 0:
+            return
+        executed_window = np.stack(list(self._recent_executed_actions), axis=0)
+        raw_window = np.stack(list(self._recent_raw_actions), axis=0) if self._recent_raw_actions else executed_window
+        throttle = executed_window[:, 0]
+        steer = np.abs(executed_window[:, 1])
+        raw_throttle = raw_window[:, 0]
+        gas = np.maximum(throttle, 0.0)
+        brake = np.maximum(-throttle, 0.0)
+        raw_gas = np.maximum(raw_throttle, 0.0)
+        raw_brake = np.maximum(-raw_throttle, 0.0)
         stats = {
             "env_step": self._env_step,
-            "window_size": int(window.shape[0]),
-            "current_actor_version": self._current_actor_version,
-            "last_seen_actor_version": self._last_seen_actor_version,
+            "window_size": int(executed_window.shape[0]),
+            "desired_actor_version": self._desired_actor_version,
+            "desired_actor_ready_for_control": self._desired_actor_ready_for_control,
+            "seen_actor_version": self._seen_actor_version,
+            "ready_for_control_seen": self._ready_for_control_seen,
+            "applied_actor_version": self._applied_actor_version,
+            "actor_ready_for_control": self._actor_ready_for_control,
+            "applied_source_learner_step": self._applied_source_learner_step,
             "last_actor_apply_env_step": self._last_actor_apply_env_step,
+            "last_actor_apply_episode_index": self._last_actor_apply_episode_index,
             "steps_since_actor_apply": (
                 None
                 if self._last_actor_apply_env_step is None
                 else int(self._env_step - self._last_actor_apply_env_step)
             ),
+            "action_guard_active": self._action_guard_active,
+            "control_source": "policy" if self._actor_ready_for_control else "exploration",
+            "mean_throttle": float(np.mean(throttle)),
             "mean_gas": float(np.mean(gas)),
             "mean_brake": float(np.mean(brake)),
             "mean_abs_steer": float(np.mean(steer)),
             "fraction_gas_gt_0_1": float(np.mean(gas > 0.1)),
             "fraction_brake_gt_0_1": float(np.mean(brake > 0.1)),
             "fraction_gas_and_brake_gt_0_1": float(np.mean((gas > 0.1) & (brake > 0.1))),
+            "raw_mean_throttle": float(np.mean(raw_throttle)),
+            "raw_mean_gas": float(np.mean(raw_gas)),
+            "raw_mean_brake": float(np.mean(raw_brake)),
+            "raw_fraction_gas_and_brake_gt_0_1": float(np.mean((raw_gas > 0.1) & (raw_brake > 0.1))),
+            "control_ready_reason": self._control_ready_reason,
         }
         self._last_action_stats = stats
         self._write_worker_event("action_stats", stats)
@@ -568,6 +871,8 @@ class SACWorker:
                 "learner_step": int(command.get("learner_step", 0)),
                 "env_step": int(command.get("env_step", self._env_step)),
                 "observation_mode": self.observation_mode,
+                "eval_actor_version": self._eval_actor_version,
+                "eval_actor_source_learner_step": self._eval_actor_source_learner_step,
             },
             close_env=False,
         )
@@ -625,6 +930,8 @@ class SACWorker:
         try:
             self._send_neutral_action(env)
             self._flush_pending_transitions(force=True)
+            self._finalize_movement_episode()
+            self._write_actor_status()
         finally:
             try:
                 if env is not None:

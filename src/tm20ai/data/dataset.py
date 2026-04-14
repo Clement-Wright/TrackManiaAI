@@ -8,6 +8,7 @@ import numpy as np
 import pyarrow.parquet as pq
 from torch.utils.data import Dataset
 
+from ..action_space import ACTION_DIM, LEGACY_ACTION_DIM, clamp_action
 from .parquet_writer import read_json
 
 
@@ -73,7 +74,7 @@ class FullDemoDatasetValidation:
     valid_episode_count: int
     sample_count: int
     total_nonzero_action_steps: int
-    mean_abs_action: tuple[float, float, float]
+    mean_abs_action: tuple[float, float]
 
 
 def split_episode_records(
@@ -122,7 +123,7 @@ def validate_full_demo_dataset(
     map_uids: set[str] = set()
     sample_count = 0
     total_nonzero_action_steps = 0
-    total_abs_action = np.zeros(3, dtype=np.float64)
+    total_abs_action = np.zeros(ACTION_DIM, dtype=np.float64)
     for episode in dataset.episodes:
         observation_mode = str(episode.metadata.get("observation_mode", "")).strip().lower()
         if observation_mode != "full":
@@ -142,11 +143,13 @@ def validate_full_demo_dataset(
         map_uids.add(str(map_uid))
         payload = np.load(episode.observation_npz_path)
         actions = np.asarray(payload["action"], dtype=np.float32)
-        if actions.ndim != 2 or actions.shape[1] != 3:
+        if actions.ndim != 2 or actions.shape[1] not in {ACTION_DIM, LEGACY_ACTION_DIM}:
             invalid_messages.append(
-                f"{episode.observation_npz_path}: expected action sidecar shape (N, 3), got {actions.shape}."
+                f"{episode.observation_npz_path}: expected action sidecar shape (N, {ACTION_DIM}) or legacy (N, {LEGACY_ACTION_DIM}), got {actions.shape}."
             )
             continue
+        if actions.shape[1] != ACTION_DIM:
+            actions = np.stack([clamp_action(action) for action in actions], axis=0)
         valid_episodes.append(episode)
         sample_count += int(actions.shape[0])
         total_nonzero_action_steps += int(np.count_nonzero(np.any(np.abs(actions) > 1.0e-6, axis=1)))
@@ -186,13 +189,13 @@ class FullBehaviorCloningDataset(Dataset):
             payload = np.load(episode.observation_npz_path)
             observations = payload["obs_uint8"]
             telemetry = payload["telemetry_float"]
-            actions = payload["action"]
+            actions = np.asarray(payload["action"], dtype=np.float32)
             for obs, telem, action in zip(observations, telemetry, actions, strict=True):
                 self._samples.append(
                     (
                         np.asarray(obs, dtype=np.uint8),
                         np.asarray(telem, dtype=np.float32),
-                        np.asarray(action, dtype=np.float32),
+                        clamp_action(action),
                     )
                 )
 
@@ -212,7 +215,7 @@ def seed_replay_from_demo_sidecars(replay, root: Path) -> int:  # noqa: ANN001
         payload = np.load(episode.observation_npz_path)
         observations = payload["obs_uint8"]
         telemetry = payload["telemetry_float"]
-        actions = payload["action"]
+        actions = np.asarray(payload["action"], dtype=np.float32)
         rows = pq.read_table(episode.steps_path).to_pylist()
         if len(observations) != len(rows):
             continue
@@ -222,7 +225,7 @@ def seed_replay_from_demo_sidecars(replay, root: Path) -> int:  # noqa: ANN001
                 {
                     "obs_uint8": observations[index],
                     "telemetry_float": telemetry[index],
-                    "action": actions[index],
+                    "action": clamp_action(actions[index]),
                     "reward": float(row["reward"]),
                     "next_obs_uint8": observations[next_index],
                     "next_telemetry_float": telemetry[next_index],

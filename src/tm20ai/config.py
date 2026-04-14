@@ -278,7 +278,7 @@ class SACConfig:
     alpha_lr: float = 3e-4
     learn_entropy_coef: bool = False
     alpha: float = 0.01
-    target_entropy: float = -3.0
+    target_entropy: float = -2.0
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "SACConfig":
@@ -293,7 +293,7 @@ class SACConfig:
                 context="sac.learn_entropy_coef",
             ),
             alpha=float(payload.get("alpha", 0.01)),
-            target_entropy=float(payload.get("target_entropy", -3.0)),
+            target_entropy=float(payload.get("target_entropy", -2.0)),
         )
 
 

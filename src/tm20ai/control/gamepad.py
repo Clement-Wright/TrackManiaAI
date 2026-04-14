@@ -5,6 +5,8 @@ from typing import Iterable, Protocol
 
 import numpy as np
 
+from ..action_space import neutral_action
+
 try:
     import vgamepad as vg
 except ImportError:  # pragma: no cover - exercised on machines without vgamepad installed
@@ -20,21 +22,26 @@ class XboxPadLike(Protocol):
 
 @dataclass(slots=True, frozen=True)
 class AnalogAction:
-    gas: float
-    brake: float
+    throttle: float
     steer: float
 
     @classmethod
     def from_iterable(cls, action: Iterable[float]) -> "AnalogAction":
-        gas, brake, steer = (float(value) for value in action)
-        return cls(
-            gas=min(1.0, max(0.0, gas)),
-            brake=min(1.0, max(0.0, brake)),
-            steer=min(1.0, max(-1.0, steer)),
-        )
+        from ..action_space import ThrottleAction
+
+        throttle_action = ThrottleAction.from_iterable(action)
+        return cls(throttle=throttle_action.throttle, steer=throttle_action.steer)
+
+    @property
+    def gas(self) -> float:
+        return max(0.0, self.throttle)
+
+    @property
+    def brake(self) -> float:
+        return max(0.0, -self.throttle)
 
     def as_array(self) -> np.ndarray:
-        return np.asarray([self.gas, self.brake, self.steer], dtype=np.float32)
+        return np.asarray([self.throttle, self.steer], dtype=np.float32)
 
 
 def _steer_to_thumb_x(steer: float) -> int:
@@ -44,7 +51,7 @@ def _steer_to_thumb_x(steer: float) -> int:
 
 
 class GamepadController:
-    """Thin vgamepad shim for the base [gas, brake, steer] action space."""
+    """Thin vgamepad shim for the canonical [throttle, steer] action space."""
 
     def __init__(self, backend: XboxPadLike | None = None):
         if backend is None:
@@ -57,7 +64,7 @@ class GamepadController:
 
     @staticmethod
     def neutral_action() -> np.ndarray:
-        return np.zeros(3, dtype=np.float32)
+        return neutral_action()
 
     def apply(self, action: Iterable[float]) -> np.ndarray:
         analog = AnalogAction.from_iterable(action)

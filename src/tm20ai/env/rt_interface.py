@@ -9,6 +9,7 @@ import numpy as np
 from gymnasium import spaces
 from rtgym.envs.real_time_env import RealTimeGymInterface
 
+from ..action_space import ACTION_HIGH, ACTION_LOW
 from ..bridge import BridgeClient
 from ..capture import DXCamCapture, FrameStackPreprocessor, LidarObservationBuilder, lidar_feature_dim
 from ..config import TM20AIConfig, load_tm20ai_config
@@ -59,11 +60,21 @@ class TM20AIRtInterface(RealTimeGymInterface):
     def __init__(self, *, config_path: str | Path):
         self.config: TM20AIConfig = load_tm20ai_config(config_path)
         self.observation_mode = self.config.observation.mode
+        if self.observation_mode == "full":
+            expected_window_shape = (
+                self.config.full_observation.window_width,
+                self.config.full_observation.window_height,
+            )
+        else:
+            expected_window_shape = (
+                self.config.lidar_observation.window_width,
+                self.config.lidar_observation.window_height,
+            )
 
         self._bridge = BridgeClient(self.config.bridge)
         self._bridge.start()
         self._gamepad = GamepadController()
-        self._capture = DXCamCapture(self.config.capture)
+        self._capture = DXCamCapture(self.config.capture, expected_client_size=expected_window_shape)
         self._preprocessor: FrameStackPreprocessor | None = None
         self._lidar_builder: LidarObservationBuilder | None = None
         if self.observation_mode == "full":
@@ -109,8 +120,8 @@ class TM20AIRtInterface(RealTimeGymInterface):
 
     def get_action_space(self):
         return spaces.Box(
-            low=np.asarray([0.0, 0.0, -1.0], dtype=np.float32),
-            high=np.asarray([1.0, 1.0, 1.0], dtype=np.float32),
+            low=ACTION_LOW.copy(),
+            high=ACTION_HIGH.copy(),
             dtype=np.float32,
         )
 
