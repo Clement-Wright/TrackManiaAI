@@ -6,6 +6,7 @@ from typing import Any, Mapping
 import numpy as np
 import torch
 
+from ..action_space import clamp_action
 from ..capture import lidar_feature_dim
 from ..config import TM20AIConfig
 from .features import ACTION_DIM, TELEMETRY_DIM
@@ -103,7 +104,7 @@ class ReplayBuffer:
             self._obs[index] = np.asarray(transition["obs_float"], dtype=np.float32)
             self._next_obs[index] = np.asarray(transition["next_obs_float"], dtype=np.float32)
 
-        self._action[index] = np.asarray(transition["action"], dtype=np.float32)
+        self._action[index] = clamp_action(transition["action"])
         self._reward[index] = float(transition["reward"])
         self._terminated[index] = bool(transition["terminated"])
         self._truncated[index] = bool(transition["truncated"])

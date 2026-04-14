@@ -100,8 +100,8 @@ class FullObservationActor(nn.Module):
         )
         self.mean_head = nn.Linear(256, action_dim)
         self.log_std_head = nn.Linear(256, action_dim)
-        self.register_buffer("action_scale", torch.tensor([0.5, 0.5, 1.0], dtype=torch.float32))
-        self.register_buffer("action_bias", torch.tensor([0.5, 0.5, 0.0], dtype=torch.float32))
+        self.register_buffer("action_scale", torch.ones(action_dim, dtype=torch.float32))
+        self.register_buffer("action_bias", torch.zeros(action_dim, dtype=torch.float32))
 
     def encode(self, observation: Tensor, telemetry: Tensor) -> Tensor:
         observation = normalize_image_batch(observation)

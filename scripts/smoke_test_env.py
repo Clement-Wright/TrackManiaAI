@@ -12,6 +12,7 @@ import numpy as np
 import win32con
 import win32gui
 from tmrl import get_environment
+from tm20ai.action_space import clamp_action
 from tm20ai.capture.window import find_window
 
 
@@ -42,12 +43,15 @@ def load_tmrl_config() -> dict[str, Any]:
 
 def parse_action(action_text: str) -> np.ndarray:
     parts = [part.strip() for part in action_text.split(",")]
-    if len(parts) != 3:
-        raise ValueError("Action must have exactly three comma-separated values: gas, brake, steer")
+    if len(parts) not in {2, 3}:
+        raise ValueError(
+            "Action must have either two comma-separated values (throttle, steer) "
+            "or the legacy three-value form (gas, brake, steer)."
+        )
     values = np.array([float(part) for part in parts], dtype=np.float32)
     if np.any(values < -1.0) or np.any(values > 1.0):
         raise ValueError("Action values must be between -1.0 and 1.0")
-    return values
+    return clamp_action(values)
 
 
 def describe_observation(value: Any) -> Any:
@@ -218,7 +222,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run a plain TMRL smoke loop for Trackmania 2020.")
     parser.add_argument("--env", choices=sorted(INTERFACE_BY_ENV), required=True)
     parser.add_argument("--seconds", type=float, default=3.0)
-    parser.add_argument("--action", default="0.8,0.0,0.0")
+    parser.add_argument("--action", default="0.8,0.0")
     args = parser.parse_args()
 
     action = parse_action(args.action)

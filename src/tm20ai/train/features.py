@@ -6,26 +6,13 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from ..action_space import ACTION_DIM, clamp_action, neutral_action
 
-TELEMETRY_DIM = 14
-ACTION_DIM = 3
+
 ACTION_HISTORY_LENGTH = 2
+TELEMETRY_DIM = 2 + 6 + (ACTION_HISTORY_LENGTH * ACTION_DIM)
 MAX_SPEED_KMH = 1_000.0
 MAX_RPM = 11_000.0
-
-
-def clamp_action(action: Sequence[float] | np.ndarray) -> np.ndarray:
-    array = np.asarray(action, dtype=np.float32).reshape(-1)
-    if array.shape != (ACTION_DIM,):
-        raise ValueError(f"Expected an action with shape ({ACTION_DIM},), got {array.shape}.")
-    return np.asarray(
-        [
-            np.clip(array[0], 0.0, 1.0),
-            np.clip(array[1], 0.0, 1.0),
-            np.clip(array[2], -1.0, 1.0),
-        ],
-        dtype=np.float32,
-    )
 
 
 @dataclass(slots=True)
@@ -45,7 +32,7 @@ class TelemetryFeatureBuilder:
     def reset(self, run_id: str | None = None) -> None:
         self._run_id = run_id
         self._history.clear()
-        neutral = np.zeros(ACTION_DIM, dtype=np.float32)
+        neutral = neutral_action()
         for _ in range(self.action_history_len):
             self._history.append(neutral.copy())
 

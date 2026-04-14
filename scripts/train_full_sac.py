@@ -43,7 +43,7 @@ class SummaryProgressMonitor:
     def stop(self) -> None:
         self._stop_event.set()
         self._thread.join(timeout=2.0)
-        self._tick()
+        self._tick(force_progress_log=True)
 
     def _run(self) -> None:
         while not self._stop_event.wait(self.poll_interval_seconds):
@@ -57,7 +57,7 @@ class SummaryProgressMonitor:
         except (OSError, json.JSONDecodeError):
             return None
 
-    def _tick(self) -> None:
+    def _tick(self, *, force_progress_log: bool = False) -> None:
         summary = self._read_summary()
         if summary is None:
             return
@@ -66,9 +66,9 @@ class SummaryProgressMonitor:
         learner_step = int(summary.get("learner_step", 0))
         replay_size = int(summary.get("replay_size", 0))
         episode_count = int(summary.get("episode_count", 0))
-        if env_step >= self._last_logged_progress_step + self.progress_log_interval:
+        if force_progress_log or env_step >= self._last_logged_progress_step + self.progress_log_interval:
             log(
-                "progress "
+                f"{'progress_final' if force_progress_log else 'progress'} "
                 f"env_step={env_step} learner_step={learner_step} "
                 f"replay_size={replay_size} episodes={episode_count}"
             )

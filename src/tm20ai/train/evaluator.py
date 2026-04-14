@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping, Protocol
 
 import numpy as np
 
+from ..action_space import ACTION_DIM, clamp_action, neutral_action
 from ..capture import lidar_feature_dim
 from ..config import TM20AIConfig, load_tm20ai_config
 from ..data.demo_recorder import DemoRecorder
@@ -33,7 +34,7 @@ class ZeroPolicy:
 
     def act(self, observation: np.ndarray, info: Mapping[str, Any]) -> np.ndarray:
         del observation, info
-        return np.zeros(3, dtype=np.float32)
+        return neutral_action()
 
 
 @dataclass(slots=True)
@@ -43,7 +44,7 @@ class FixedActionPolicy:
 
     def act(self, observation: np.ndarray, info: Mapping[str, Any]) -> np.ndarray:
         del observation, info
-        return np.asarray(self.action, dtype=np.float32)
+        return clamp_action(self.action)
 
 
 VK_UP = 0x26
@@ -80,10 +81,18 @@ class KeyboardTeleopPolicy:
 
     def act(self, observation: np.ndarray, info: Mapping[str, Any]) -> np.ndarray:
         del observation, info
-        gas = 1.0 if (self._pressed(VK_UP) or self._pressed(VK_W)) else 0.0
-        brake = 1.0 if (self._pressed(VK_DOWN) or self._pressed(VK_S)) else 0.0
+        accelerate = self._pressed(VK_UP) or self._pressed(VK_W)
+        brake = self._pressed(VK_DOWN) or self._pressed(VK_S)
         steer_left = self._pressed(VK_LEFT) or self._pressed(VK_A)
         steer_right = self._pressed(VK_RIGHT) or self._pressed(VK_D)
+        if accelerate and brake:
+            throttle = 0.0
+        elif accelerate:
+            throttle = 1.0
+        elif brake:
+            throttle = -1.0
+        else:
+            throttle = 0.0
         if steer_left and steer_right:
             steer = 0.0
         elif steer_left:
@@ -92,7 +101,7 @@ class KeyboardTeleopPolicy:
             steer = 1.0
         else:
             steer = 0.0
-        return np.asarray([gas, brake, steer], dtype=np.float32)
+        return np.asarray([throttle, steer], dtype=np.float32)
 
 
 @dataclass(slots=True)
@@ -102,7 +111,7 @@ class ScriptedPolicyAdapter:
 
     def act(self, observation: np.ndarray, info: Mapping[str, Any]) -> np.ndarray:
         action = self.callback(observation, info)
-        return np.asarray(action, dtype=np.float32)
+        return clamp_action(action)
 
 
 class ActorPolicyAdapter:
@@ -122,13 +131,13 @@ class ActorPolicyAdapter:
             telemetry_tensor = torch.as_tensor(telemetry, dtype=torch.float32).unsqueeze(0)
             with torch.no_grad():
                 action = self._actor.act(observation_tensor, telemetry_tensor, deterministic=True)
-            action_np = action.squeeze(0).cpu().numpy().astype(np.float32)
+            action_np = clamp_action(action.squeeze(0).cpu().numpy().astype(np.float32))
             self._features.observe_action(action_np, run_id=None if info.get("run_id") is None else str(info.get("run_id")))
             return action_np
         observation_tensor = torch.as_tensor(observation, dtype=torch.float32).unsqueeze(0)
         with torch.no_grad():
             action = self._actor.act(observation_tensor, deterministic=True)
-        return action.squeeze(0).cpu().numpy().astype(np.float32)
+        return clamp_action(action.squeeze(0).cpu().numpy().astype(np.float32))
 
 
 class TorchCheckpointPolicyAdapter:
@@ -145,7 +154,7 @@ class TorchCheckpointPolicyAdapter:
         if actor_state is None:
             return None
         observation_mode = str(payload.get("observation_mode", "full"))
-        action_dim = int(payload.get("action_dim", 3))
+        action_dim = int(payload.get("action_dim", ACTION_DIM))
         if observation_mode == "full":
             from ..models.full_actor_critic import FullObservationActor
 
@@ -159,7 +168,7 @@ class TorchCheckpointPolicyAdapter:
         else:
             from ..models.lidar_actor_critic import LidarActor
 
-            observation_shape = tuple(payload.get("observation_shape", (83,)))
+            observation_shape = tuple(payload.get("observation_shape", (81,)))
             actor = LidarActor(observation_dim=int(observation_shape[0]), action_dim=action_dim)
         actor.load_state_dict(actor_state)
         return ActorPolicyAdapter(actor, observation_mode=observation_mode, name=self.name)
@@ -191,7 +200,7 @@ class TorchCheckpointPolicyAdapter:
         array = np.asarray(result, dtype=np.float32)
         if array.ndim > 1:
             array = array.reshape(-1)
-        return array
+        return clamp_action(array)
 
 
 def load_scripted_policy(spec: str) -> ScriptedPolicyAdapter:

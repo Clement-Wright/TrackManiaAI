@@ -7,13 +7,15 @@ import torch
 from torch import Tensor, nn
 from torch.distributions import Normal
 
+from ..action_space import ACTION_DIM
+
 
 LOG_STD_MIN: Final[float] = -20.0
 LOG_STD_MAX: Final[float] = 2.0
 
 
 class LidarActor(nn.Module):
-    def __init__(self, *, observation_dim: int = 83, action_dim: int = 3) -> None:
+    def __init__(self, *, observation_dim: int = 81, action_dim: int = ACTION_DIM) -> None:
         super().__init__()
         self.observation_dim = observation_dim
         self.action_dim = action_dim
@@ -25,8 +27,8 @@ class LidarActor(nn.Module):
         )
         self.mean_head = nn.Linear(256, action_dim)
         self.log_std_head = nn.Linear(256, action_dim)
-        self.register_buffer("action_scale", torch.tensor([0.5, 0.5, 1.0], dtype=torch.float32))
-        self.register_buffer("action_bias", torch.tensor([0.5, 0.5, 0.0], dtype=torch.float32))
+        self.register_buffer("action_scale", torch.ones(action_dim, dtype=torch.float32))
+        self.register_buffer("action_bias", torch.zeros(action_dim, dtype=torch.float32))
 
     def forward(self, observation: Tensor) -> tuple[Tensor, Tensor]:
         hidden = self.shared_trunk(observation.float())
@@ -62,7 +64,7 @@ class LidarActor(nn.Module):
 
 
 class LidarCritic(nn.Module):
-    def __init__(self, *, observation_dim: int = 83, action_dim: int = 3) -> None:
+    def __init__(self, *, observation_dim: int = 81, action_dim: int = ACTION_DIM) -> None:
         super().__init__()
         self.q_network = nn.Sequential(
             nn.Linear(observation_dim + action_dim, 256),
@@ -79,5 +81,5 @@ class LidarCritic(nn.Module):
 
 @dataclass(frozen=True, slots=True)
 class LidarActorSpec:
-    observation_dim: int = 83
-    action_dim: int = 3
+    observation_dim: int = 81
+    action_dim: int = ACTION_DIM

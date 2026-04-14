@@ -46,8 +46,9 @@ class TrainRunPaths:
     checkpoints_dir: Path
     summary_json: Path
     tensorboard_dir: Path
-    actor_sync_path: Path
-    actor_manifest_path: Path
+    worker_sync_dir: Path
+    desired_actor_path: Path
+    worker_actor_status_path: Path
 
 
 class SACLearner:
@@ -89,13 +90,15 @@ class SACLearner:
         self._run_start_monotonic = time.monotonic()
 
         run_paths = build_run_artifact_paths(self.config, mode="train", run_name=self.run_name)
+        worker_sync_dir = ensure_directory(run_paths.run_dir / "worker_sync")
         self.paths = TrainRunPaths(
             run_dir=run_paths.run_dir,
             checkpoints_dir=ensure_directory(run_paths.run_dir / "checkpoints"),
             summary_json=run_paths.summary_json,
             tensorboard_dir=run_paths.tensorboard_dir,
-            actor_sync_path=ensure_directory(run_paths.run_dir / "worker_sync") / "latest_actor.pt",
-            actor_manifest_path=ensure_directory(run_paths.run_dir / "worker_sync") / "latest_actor.json",
+            worker_sync_dir=worker_sync_dir,
+            desired_actor_path=worker_sync_dir / "desired_actor.json",
+            worker_actor_status_path=worker_sync_dir / "worker_actor_status.json",
         )
         self.writer = TensorBoardScalarLogger(self.paths.tensorboard_dir)
 
@@ -148,10 +151,19 @@ class SACLearner:
         self.latest_eval_summary_path: str | None = None
         self.latest_checkpoint_path: Path | None = None
         self.last_worker_heartbeat: dict[str, Any] | None = None
-        self.current_actor_version: int | None = None
-        self.last_seen_actor_version: int | None = None
+        self.desired_actor_version: int | None = None
+        self.desired_actor_ready_for_control = False
+        self.desired_actor_control_ready_reason: str | None = None
+        self.seen_actor_version: int | None = None
+        self.ready_for_control_seen = False
+        self.applied_actor_version: int | None = None
+        self.actor_ready_for_control = False
+        self.applied_source_learner_step: int | None = None
         self.last_actor_apply_env_step: int | None = None
+        self.last_actor_apply_episode_index: int | None = None
         self.latest_action_stats: dict[str, Any] | None = None
+        self.eval_actor_version: int | None = None
+        self.eval_actor_source_learner_step: int | None = None
         self.eval_in_flight = False
         self.pending_eval: dict[str, Any] | None = None
         self.started_eval: dict[str, Any] | None = None
@@ -224,6 +236,18 @@ class SACLearner:
                 "observation_mode": self.config.observation.mode,
                 "latest_eval_summary_path": self.latest_eval_summary_path,
                 "latest_eval_env_step": None if self.latest_eval_summary is None else self.latest_eval_summary.get("env_step"),
+                "desired_actor_version": self.desired_actor_version,
+                "desired_actor_ready_for_control": self.desired_actor_ready_for_control,
+                "desired_actor_control_ready_reason": self.desired_actor_control_ready_reason,
+                "seen_actor_version": self.seen_actor_version,
+                "ready_for_control_seen": self.ready_for_control_seen,
+                "applied_actor_version": self.applied_actor_version,
+                "actor_ready_for_control": self.actor_ready_for_control,
+                "applied_source_learner_step": self.applied_source_learner_step,
+                "last_actor_apply_env_step": self.last_actor_apply_env_step,
+                "last_actor_apply_episode_index": self.last_actor_apply_episode_index,
+                "eval_actor_version": self.eval_actor_version,
+                "eval_actor_source_learner_step": self.eval_actor_source_learner_step,
                 "init_mode": self.init_mode,
                 "bc_checkpoint_path": self.bc_checkpoint_path,
                 "demo_root": self.demo_root,
@@ -314,6 +338,8 @@ class SACLearner:
     def maybe_schedule_eval(self) -> None:
         if self.command_queue is None or self.eval_in_flight or self.eval_episodes <= 0:
             return
+        if not self.actor_ready_for_control or self.applied_actor_version is None:
+            return
         if self.env_step < self.next_eval_step:
             return
         scheduled_step = self.next_eval_step
@@ -326,6 +352,8 @@ class SACLearner:
                 "run_name": f"{self.run_name}_step_{scheduled_step:08d}",
                 "learner_step": self.learner_step,
                 "env_step": scheduled_step,
+                "eval_actor_version": self.applied_actor_version,
+                "eval_actor_source_learner_step": self.applied_source_learner_step,
                 "checkpoint_path": str(self.latest_checkpoint_path) if self.latest_checkpoint_path is not None else None,
             }
         )
@@ -335,6 +363,8 @@ class SACLearner:
             "env_step": scheduled_step,
             "learner_step": self.learner_step,
             "episodes": self.eval_episodes,
+            "eval_actor_version": self.applied_actor_version,
+            "eval_actor_source_learner_step": self.applied_source_learner_step,
             "scheduled_at": _utc_now(),
         }
         if self.env_step >= self.next_checkpoint_step:
@@ -420,28 +450,75 @@ class SACLearner:
             return 0
         if message_type == "eval_result":
             return 0
-        if message_type == "actor_sync_manifest_seen":
-            if message.get("version") is not None:
-                self.last_seen_actor_version = int(message["version"])
+        if message_type == "actor_sync_desired_seen":
+            if message.get("desired_actor_version") is not None:
+                self.desired_actor_version = int(message["desired_actor_version"])
+            if message.get("desired_actor_ready_for_control") is not None:
+                self.desired_actor_ready_for_control = bool(message["desired_actor_ready_for_control"])
+            if message.get("seen_actor_version") is not None:
+                self.seen_actor_version = int(message["seen_actor_version"])
+            if message.get("ready_for_control_seen") is not None:
+                self.ready_for_control_seen = bool(message["ready_for_control_seen"])
+            if message.get("control_ready_reason") is not None:
+                self.desired_actor_control_ready_reason = str(message["control_ready_reason"])
             self._write_run_summary()
             return 0
         if message_type == "actor_sync_applied":
-            self.current_actor_version = int(message.get("version")) if message.get("version") is not None else None
-            self.last_seen_actor_version = int(message.get("last_seen_actor_version", self.current_actor_version or 0)) or self.current_actor_version
+            if message.get("desired_actor_version") is not None:
+                self.desired_actor_version = int(message["desired_actor_version"])
+            if message.get("desired_actor_ready_for_control") is not None:
+                self.desired_actor_ready_for_control = bool(message["desired_actor_ready_for_control"])
+            if message.get("seen_actor_version") is not None:
+                self.seen_actor_version = int(message["seen_actor_version"])
+            if message.get("ready_for_control_seen") is not None:
+                self.ready_for_control_seen = bool(message["ready_for_control_seen"])
+            self.applied_actor_version = (
+                int(message.get("applied_actor_version"))
+                if message.get("applied_actor_version") is not None
+                else None
+            )
+            if message.get("actor_ready_for_control") is not None:
+                self.actor_ready_for_control = bool(message["actor_ready_for_control"])
+            self.applied_source_learner_step = (
+                int(message["applied_source_learner_step"])
+                if message.get("applied_source_learner_step") is not None
+                else None
+            )
             self.last_actor_apply_env_step = (
                 int(message["last_actor_apply_env_step"]) if message.get("last_actor_apply_env_step") is not None else None
             )
+            self.last_actor_apply_episode_index = (
+                int(message["last_actor_apply_episode_index"])
+                if message.get("last_actor_apply_episode_index") is not None
+                else None
+            )
+            if message.get("control_ready_reason") is not None:
+                self.desired_actor_control_ready_reason = str(message["control_ready_reason"])
             self._write_run_summary()
             return 0
         if message_type == "action_stats":
             action_stats = {key: value for key, value in dict(message).items() if key != "type"}
             self.latest_action_stats = action_stats
-            if message.get("current_actor_version") is not None:
-                self.current_actor_version = int(message["current_actor_version"])
-            if message.get("last_seen_actor_version") is not None:
-                self.last_seen_actor_version = int(message["last_seen_actor_version"])
+            if message.get("desired_actor_version") is not None:
+                self.desired_actor_version = int(message["desired_actor_version"])
+            if message.get("desired_actor_ready_for_control") is not None:
+                self.desired_actor_ready_for_control = bool(message["desired_actor_ready_for_control"])
+            if message.get("seen_actor_version") is not None:
+                self.seen_actor_version = int(message["seen_actor_version"])
+            if message.get("ready_for_control_seen") is not None:
+                self.ready_for_control_seen = bool(message["ready_for_control_seen"])
+            if message.get("applied_actor_version") is not None:
+                self.applied_actor_version = int(message["applied_actor_version"])
+            if message.get("actor_ready_for_control") is not None:
+                self.actor_ready_for_control = bool(message["actor_ready_for_control"])
+            if message.get("applied_source_learner_step") is not None:
+                self.applied_source_learner_step = int(message["applied_source_learner_step"])
             if message.get("last_actor_apply_env_step") is not None:
                 self.last_actor_apply_env_step = int(message["last_actor_apply_env_step"])
+            if message.get("last_actor_apply_episode_index") is not None:
+                self.last_actor_apply_episode_index = int(message["last_actor_apply_episode_index"])
+            if message.get("control_ready_reason") is not None:
+                self.desired_actor_control_ready_reason = str(message["control_ready_reason"])
             self._write_run_summary()
             return 0
         if message_type == "eval_started":
@@ -451,19 +528,43 @@ class SACLearner:
                 "learner_step": int(message.get("learner_step", self.learner_step)),
                 "episodes": int(message.get("episodes", self.eval_episodes)),
                 "timestamp": message.get("timestamp"),
+                "eval_actor_version": (
+                    int(message["eval_actor_version"]) if message.get("eval_actor_version") is not None else None
+                ),
+                "eval_actor_source_learner_step": (
+                    int(message["eval_actor_source_learner_step"])
+                    if message.get("eval_actor_source_learner_step") is not None
+                    else None
+                ),
             }
+            self.eval_actor_version = self.started_eval["eval_actor_version"]
+            self.eval_actor_source_learner_step = self.started_eval["eval_actor_source_learner_step"]
             self._write_run_summary()
             return 0
         if message_type == "heartbeat":
             self.last_worker_heartbeat = dict(message)
-            if message.get("current_actor_version") is not None:
-                self.current_actor_version = int(message["current_actor_version"])
-            if message.get("last_seen_actor_version") is not None:
-                self.last_seen_actor_version = int(message["last_seen_actor_version"])
+            if message.get("desired_actor_version") is not None:
+                self.desired_actor_version = int(message["desired_actor_version"])
+            if message.get("desired_actor_ready_for_control") is not None:
+                self.desired_actor_ready_for_control = bool(message["desired_actor_ready_for_control"])
+            if message.get("seen_actor_version") is not None:
+                self.seen_actor_version = int(message["seen_actor_version"])
+            if message.get("ready_for_control_seen") is not None:
+                self.ready_for_control_seen = bool(message["ready_for_control_seen"])
+            if message.get("applied_actor_version") is not None:
+                self.applied_actor_version = int(message["applied_actor_version"])
+            if message.get("actor_ready_for_control") is not None:
+                self.actor_ready_for_control = bool(message["actor_ready_for_control"])
+            if message.get("applied_source_learner_step") is not None:
+                self.applied_source_learner_step = int(message["applied_source_learner_step"])
             if message.get("last_actor_apply_env_step") is not None:
                 self.last_actor_apply_env_step = int(message["last_actor_apply_env_step"])
+            if message.get("last_actor_apply_episode_index") is not None:
+                self.last_actor_apply_episode_index = int(message["last_actor_apply_episode_index"])
             if message.get("latest_action_stats") is not None:
                 self.latest_action_stats = dict(message["latest_action_stats"])
+            if message.get("control_ready_reason") is not None:
+                self.desired_actor_control_ready_reason = str(message["control_ready_reason"])
             return 0
         if message_type == "fatal_error":
             self.termination_reason = self.termination_reason or "fatal_error"
@@ -481,25 +582,34 @@ class SACLearner:
                     return
 
     def _write_actor_sync_state(self) -> Path:
-        actor_state_path = self.paths.actor_sync_path
-        actor_manifest_path = self.paths.actor_manifest_path
-        actor_state_path.parent.mkdir(parents=True, exist_ok=True)
+        desired_actor_path = self.paths.desired_actor_path
+        desired_actor_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_manifest_path = desired_actor_path.with_suffix(".tmp")
+        next_version = self._actor_sync_version + 1
+        actor_state_path = self.paths.worker_sync_dir / f"actor_v{next_version:06d}.pt"
         temp_path = actor_state_path.with_suffix(".tmp")
-        temp_manifest_path = actor_manifest_path.with_suffix(".tmp")
-        self._actor_sync_version += 1
+        self._actor_sync_version = next_version
+        ready_for_control = self.learner_step > 0
+        control_ready_reason = "trained_updates_available" if ready_for_control else "startup_untrained"
         torch.save(self.agent.actor_state_dict_cpu(), temp_path)
         temp_path.replace(actor_state_path)
         write_json(
             temp_manifest_path,
             {
-                "version": self._actor_sync_version,
+                "desired_actor_version": self._actor_sync_version,
                 "env_step": self.env_step,
                 "learner_step": self.learner_step,
                 "written_at": _utc_now(),
                 "actor_state_path": str(actor_state_path),
+                "ready_for_control": ready_for_control,
+                "control_ready_reason": control_ready_reason,
             },
         )
-        temp_manifest_path.replace(actor_manifest_path)
+        temp_manifest_path.replace(desired_actor_path)
+        self.desired_actor_version = self._actor_sync_version
+        self.desired_actor_ready_for_control = ready_for_control
+        self.desired_actor_control_ready_reason = control_ready_reason
+        self._write_run_summary()
         return actor_state_path
 
     def _log_update(self, update: SACUpdateResult) -> None:
@@ -514,6 +624,14 @@ class SACLearner:
         self.latest_eval_step = payload.env_step
         self.latest_eval_summary = dict(payload.summary)
         self.latest_eval_summary_path = payload.summary_path
+        self.eval_actor_version = (
+            int(payload.summary["eval_actor_version"]) if payload.summary.get("eval_actor_version") is not None else None
+        )
+        self.eval_actor_source_learner_step = (
+            int(payload.summary["eval_actor_source_learner_step"])
+            if payload.summary.get("eval_actor_source_learner_step") is not None
+            else None
+        )
         self.eval_in_flight = False
         self.pending_eval = None
         self.started_eval = None
@@ -523,6 +641,8 @@ class SACLearner:
             "learner_step": payload.learner_step,
             "summary_path": payload.summary_path,
             "summary": dict(payload.summary),
+            "eval_actor_version": self.eval_actor_version,
+            "eval_actor_source_learner_step": self.eval_actor_source_learner_step,
             "timestamp": payload.timestamp,
         }
         self.eval_history.append(eval_entry)
@@ -574,10 +694,19 @@ class SACLearner:
                 "checkpoint_history": self.checkpoint_history,
                 "eval_history": self.eval_history,
                 "last_worker_heartbeat": self.last_worker_heartbeat,
-                "current_actor_version": self.current_actor_version,
-                "last_seen_actor_version": self.last_seen_actor_version,
+                "desired_actor_version": self.desired_actor_version,
+                "desired_actor_ready_for_control": self.desired_actor_ready_for_control,
+                "desired_actor_control_ready_reason": self.desired_actor_control_ready_reason,
+                "seen_actor_version": self.seen_actor_version,
+                "ready_for_control_seen": self.ready_for_control_seen,
+                "applied_actor_version": self.applied_actor_version,
+                "actor_ready_for_control": self.actor_ready_for_control,
+                "applied_source_learner_step": self.applied_source_learner_step,
                 "last_actor_apply_env_step": self.last_actor_apply_env_step,
+                "last_actor_apply_episode_index": self.last_actor_apply_episode_index,
                 "latest_action_stats": self.latest_action_stats,
+                "eval_actor_version": self.eval_actor_version,
+                "eval_actor_source_learner_step": self.eval_actor_source_learner_step,
                 "termination_reason": self.termination_reason,
                 "clean_shutdown": self.clean_shutdown,
                 "worker_exit": self.worker_exit,

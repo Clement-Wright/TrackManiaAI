@@ -23,6 +23,7 @@ from tm20ai.data.dataset import (
 )
 from tm20ai.data.parquet_writer import build_run_artifact_paths, sha256_file, timestamp_tag, write_json
 from tm20ai.models.full_actor_critic import FullObservationActor
+from tm20ai.train.features import ACTION_DIM, TELEMETRY_DIM
 from tm20ai.train.metrics import TensorBoardScalarLogger
 
 
@@ -60,8 +61,8 @@ def _save_actor_checkpoint(
             "observation_mode": "full",
             "actor_state_dict": actor_state_dict,
             "observation_shape": (4, 64, 64),
-            "telemetry_dim": 14,
-            "action_dim": 3,
+            "telemetry_dim": TELEMETRY_DIM,
+            "action_dim": ACTION_DIM,
             "map_uid": map_uid,
             "demo_root": str(demos_root),
             "config_snapshot": {
