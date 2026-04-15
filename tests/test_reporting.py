@@ -211,3 +211,88 @@ def test_write_comparison_report_builds_bc_comparison(tmp_path) -> None:
     assert report["best_progress_by_run"]["actor_only"] == 240.0
     assert "actor_only" in report["time_to_progress_thresholds"]
     assert "BC warm-start gain" in report["conclusion"]
+
+
+def test_write_training_report_includes_diagnostics_sections_and_event_logs(tmp_path) -> None:
+    run_dir = tmp_path / "artifacts" / "train" / "full_redq_diag"
+    checkpoint_rows = [
+        {
+            "path": str(run_dir / "checkpoints" / "checkpoint_00002500.pt"),
+            "env_step": 2500,
+            "learner_step": 5000,
+            "replay_size": 2500,
+            "timestamp": "2026-04-11T00:05:00+00:00",
+            "final": False,
+        }
+    ]
+    _write_summary(
+        run_dir,
+        run_name="full_redq_diag",
+        init_mode="scratch",
+        env_step=2500,
+        learner_step=5000,
+        replay_size=2500,
+        eval_rows=[],
+        checkpoint_rows=checkpoint_rows,
+    )
+    summary_path = run_dir / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary.update(
+        {
+            "primary_metric": "mean_final_progress_index",
+            "runtime_profile": {
+                "bottleneck_verdict": {
+                    "label": "worker_env",
+                    "breakdown_seconds": {
+                        "learner_backprop": 10.0,
+                        "worker_env": 20.0,
+                        "ipc_backpressure": 1.0,
+                        "actor_sync": 0.5,
+                    },
+                }
+            },
+            "queue_profile": {"learner": {"command_put": {"attempts": 2}}, "worker": {"output_put": {"attempts": 3}}},
+            "actor_sync_profile": {
+                "policy_control_fraction": 0.75,
+                "time_to_first_ready_actor_seconds": 12.0,
+                "time_to_first_applied_ready_actor_seconds": 13.0,
+                "time_to_first_policy_control_window_seconds": 15.0,
+                "time_to_applied_seconds": {"p50": 0.25, "p95": 0.5},
+            },
+            "episode_diagnostics": {
+                "positive_progress_fraction": {"mean": 0.6},
+                "nonpositive_progress_fraction": {"mean": 0.4},
+                "max_no_progress_streak": {"p95": 18.0},
+            },
+            "movement_diagnostics": {
+                "no_movement_episode_count": 2,
+                "stall_episode_rate": 0.4,
+                "first_stall_delay_ms": {"p95": 800.0},
+            },
+            "resource_profile": {
+                "actor_parameter_count": 100,
+                "critic_parameter_count": 200,
+                "unique_critic_encoder_parameter_count": 50,
+            },
+        }
+    )
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    (run_dir / "learner_events.log").write_text(
+        json.dumps({"event": "actor_broadcast", "payload": {}}) + "\n",
+        encoding="utf-8",
+    )
+    (run_dir / "worker_events.log").write_text(
+        json.dumps({"event": "movement_episode_summary", "payload": {}}) + "\n",
+        encoding="utf-8",
+    )
+
+    report_paths = write_training_report(run_dir)
+    report = json.loads(report_paths.json_path.read_text(encoding="utf-8"))
+
+    assert report["primary_metric"] == "mean_final_progress_index"
+    assert report["runtime_profile"]["bottleneck_verdict"]["label"] == "worker_env"
+    assert report["actor_sync_profile"]["policy_control_fraction"] == 0.75
+    assert report["event_logs"]["learner"]["event_count"] == 1
+    markdown = report_paths.markdown_path.read_text(encoding="utf-8")
+    assert "## Diagnostics" in markdown
+    assert "Bottleneck verdict: worker_env" in markdown
