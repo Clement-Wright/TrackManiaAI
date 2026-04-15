@@ -2,10 +2,11 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.tmp/
+.pytest_tmp*/
 .ruff_cache/
 build/
 dist/
-.pytest_tmp/
 artifacts/
 data/reward/*/raw_lap.parquet
 data/reward/*/trajectory_0p5m.npz

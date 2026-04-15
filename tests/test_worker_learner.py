@@ -790,8 +790,12 @@ def test_worker_logs_first_sustained_movement_stall(tmp_path) -> None:
         for line in (artifacts_root / "worker_events.log").read_text(encoding="utf-8").splitlines()
     ]
     events = [entry["event"] for entry in worker_events]
+    output_message_types: list[str] = []
+    while not worker.output_queue.empty():
+        output_message_types.append(worker.output_queue.get()["type"])
     assert "movement_started" in events
     assert "movement_stall_detected" in events
+    assert "movement_episode_summary" in output_message_types
     summary = next(entry for entry in worker_events if entry["event"] == "movement_episode_summary")
     assert summary["payload"]["movement_started"] is True
     assert summary["payload"]["stall_count"] == 1

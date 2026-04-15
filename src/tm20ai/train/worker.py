@@ -19,6 +19,7 @@ from ..action_space import clamp_action
 from ..capture import lidar_feature_dim
 from ..config import TM20AIConfig, load_tm20ai_config
 from ..env import TM20AIGymEnv, make_env
+from .diagnostics import QueueAccumulator, TimingAccumulator
 from .features import TELEMETRY_DIM, TelemetryFeatureBuilder
 from .protocol import EvalResult
 
@@ -32,6 +33,18 @@ class TrainingEpisodeState:
     @property
     def episode_id(self) -> str:
         return f"train_episode_{self.episode_index:06d}"
+
+
+@dataclass(slots=True)
+class RewardEpisodeState:
+    step_count: int = 0
+    positive_progress_steps: int = 0
+    nonpositive_progress_steps: int = 0
+    current_no_progress_streak: int = 0
+    max_no_progress_streak: int = 0
+    current_nonpositive_reward_streak: int = 0
+    max_nonpositive_reward_streak: int = 0
+    final_no_progress_steps: int = 0
 
 
 @dataclass(slots=True)
@@ -98,6 +111,7 @@ class SACWorker:
         self._has_policy_weights = False
         self._env_step = 0
         self._episode_state = TrainingEpisodeState()
+        self._reward_episode_state = RewardEpisodeState()
         self._last_heartbeat = monotonic()
         self._pending_transitions: list[dict[str, Any]] = []
         self._shutdown_requested = False
@@ -125,6 +139,19 @@ class SACWorker:
         self._movement_stall_speed_threshold_kmh = 2.0
         self._movement_stall_position_epsilon_m = 0.15
         self._movement_stall_duration_seconds = 1.0
+        self._control_step_count = 0
+        self._policy_control_step_count = 0
+        self._worker_runtime = {
+            "env_step": TimingAccumulator(),
+            "env_reset": TimingAccumulator(),
+            "command_drain": TimingAccumulator(),
+            "actor_apply": TimingAccumulator(),
+        }
+        self._worker_queue = {
+            "output_put": QueueAccumulator(),
+            "eval_result_put": QueueAccumulator(),
+        }
+        self._latest_env_benchmarks: dict[str, Any] = {}
 
     def _write_worker_event(self, event: str, payload: Mapping[str, Any] | None = None) -> None:
         if self.worker_events_log_path is None:
@@ -209,6 +236,83 @@ class SACWorker:
             "control_ready_reason": self._control_ready_reason,
         }
 
+    def _begin_reward_episode(self) -> None:
+        self._reward_episode_state = RewardEpisodeState()
+
+    def _observe_reward_step(self, *, reward: float, info: Mapping[str, Any]) -> None:
+        state = self._reward_episode_state
+        state.step_count += 1
+        progress_delta = int(info.get("progress_delta", 0) or 0)
+        if progress_delta > 0:
+            state.positive_progress_steps += 1
+            state.current_no_progress_streak = 0
+        else:
+            state.nonpositive_progress_steps += 1
+            state.current_no_progress_streak += 1
+            state.max_no_progress_streak = max(state.max_no_progress_streak, state.current_no_progress_streak)
+        if float(reward) <= 0.0:
+            state.current_nonpositive_reward_streak += 1
+            state.max_nonpositive_reward_streak = max(
+                state.max_nonpositive_reward_streak,
+                state.current_nonpositive_reward_streak,
+            )
+        else:
+            state.current_nonpositive_reward_streak = 0
+        state.final_no_progress_steps = int(info.get("no_progress_steps", 0) or 0)
+
+    def _reward_episode_summary(self, info: Mapping[str, Any]) -> dict[str, Any]:
+        state = self._reward_episode_state
+        steps = max(1, state.step_count)
+        return {
+            "positive_progress_fraction": state.positive_progress_steps / steps,
+            "nonpositive_progress_fraction": state.nonpositive_progress_steps / steps,
+            "max_no_progress_streak": state.max_no_progress_streak,
+            "max_nonpositive_reward_streak": state.max_nonpositive_reward_streak,
+            "final_no_progress_steps": state.final_no_progress_steps,
+            "reset_reason": info.get("reward_reason") or info.get("terminal_reason"),
+        }
+
+    def _control_metrics_snapshot(self) -> dict[str, Any]:
+        return {
+            "control_step_count": self._control_step_count,
+            "policy_control_step_count": self._policy_control_step_count,
+            "policy_control_fraction": self._policy_control_step_count / max(1, self._control_step_count),
+        }
+
+    def _update_env_benchmarks(self, env: TM20AIGymEnv | None) -> None:
+        if env is None:
+            return
+        try:
+            benchmarks = env.benchmarks()
+        except Exception:  # noqa: BLE001
+            return
+        tm20ai_metrics = dict(benchmarks.get("tm20ai", {}))
+        observation_calls = int(tm20ai_metrics.get("observation_calls", 0) or 0)
+        if observation_calls > 0:
+            for key in ("avg_obs_retrieval_seconds", "avg_preprocess_seconds", "avg_reward_compute_seconds"):
+                if tm20ai_metrics.get(key) is not None:
+                    total_key = key.replace("avg_", "total_")
+                    tm20ai_metrics[total_key] = float(tm20ai_metrics[key]) * observation_calls
+        self._latest_env_benchmarks = {
+            "tm20ai": tm20ai_metrics,
+            "rtgym": dict(benchmarks.get("rtgym", {})),
+        }
+
+    def _runtime_profile_snapshot(self) -> dict[str, Any]:
+        env_step_snapshot = self._worker_runtime["env_step"].snapshot()
+        env_reset_snapshot = self._worker_runtime["env_reset"].snapshot()
+        return {
+            "env_step": env_step_snapshot,
+            "env_reset": env_reset_snapshot,
+            "command_drain": self._worker_runtime["command_drain"].snapshot(),
+            "actor_apply": self._worker_runtime["actor_apply"].snapshot(),
+            "env_loop_total_seconds": env_step_snapshot["total_seconds"] + env_reset_snapshot["total_seconds"],
+            "env_benchmarks": dict(self._latest_env_benchmarks),
+        }
+
+    def _queue_profile_snapshot(self) -> dict[str, Any]:
+        return {key: value.snapshot() for key, value in self._worker_queue.items()}
+
     def _initialize_policy_components(self) -> None:
         if self.actor is not None and self._torch is not None:
             return
@@ -247,7 +351,9 @@ class SACWorker:
             if self._should_shutdown():
                 return
             while not self._should_shutdown():
+                command_drain_start = time.perf_counter()
                 pending_eval = self._drain_commands()
+                self._worker_runtime["command_drain"].record(time.perf_counter() - command_drain_start)
                 if self._should_shutdown() and pending_eval is None:
                     break
                 if pending_eval is not None:
@@ -322,12 +428,15 @@ class SACWorker:
                     break
                 raw_action = self._select_action(observation, aux)
                 action = self._execute_training_action(raw_action)
+                step_start = time.perf_counter()
                 next_observation, reward, terminated, truncated, next_info = env.step(action)
+                self._worker_runtime["env_step"].record(time.perf_counter() - step_start)
                 next_aux = self._build_aux_features(next_info, action)
 
                 self._episode_state.step_count += 1
                 self._episode_state.episode_reward += float(reward)
                 self._env_step += 1
+                self._observe_reward_step(reward=reward, info=next_info)
                 self._observe_movement(next_info)
                 self._record_action_stats(raw_action=raw_action, executed_action=action)
 
@@ -353,6 +462,7 @@ class SACWorker:
 
                 if monotonic() - self._last_heartbeat >= 1.0:
                     self._last_heartbeat = monotonic()
+                    self._update_env_benchmarks(env)
                     self._put_message(
                         {
                             "type": "heartbeat",
@@ -369,6 +479,8 @@ class SACWorker:
                             "last_actor_apply_episode_index": self._last_actor_apply_episode_index,
                             "latest_action_stats": self._last_action_stats,
                             "control_ready_reason": self._control_ready_reason,
+                            "runtime_profile": self._runtime_profile_snapshot(),
+                            "queue_profile": self._queue_profile_snapshot(),
                         }
                     )
 
@@ -389,6 +501,7 @@ class SACWorker:
                                 "map_uid": next_info.get("map_uid"),
                                 "run_id": next_info.get("run_id"),
                                 "observation_mode": self.observation_mode,
+                                **self._reward_episode_summary(next_info),
                             },
                         }
                     )
@@ -425,8 +538,11 @@ class SACWorker:
     def _start_training_episode(self, env: TM20AIGymEnv) -> tuple[np.ndarray, Mapping[str, Any], np.ndarray | None]:
         self._clear_action_guard(reason="episode_reset")
         seed = self.config.train.seed + self._episode_state.episode_index
+        reset_start = time.perf_counter()
         observation, info = env.reset(seed=seed)
+        self._worker_runtime["env_reset"].record(time.perf_counter() - reset_start)
         self._episode_state = TrainingEpisodeState(episode_index=self._episode_state.episode_index + 1)
+        self._begin_reward_episode()
         self._status_mode = "train"
         self._begin_movement_episode(info)
         aux = self._reset_aux_features(info)
@@ -593,6 +709,7 @@ class SACWorker:
             payload["final_race_time_ms"] = int(info.get("race_time_ms", 0) or 0)
             payload["termination_reason"] = info.get("reward_reason") or info.get("terminal_reason")
         self._write_worker_event("movement_episode_summary", payload)
+        self._put_message({"type": "movement_episode_summary", "summary": payload})
         self._movement_state = MovementEpisodeState()
 
     def _build_aux_features(self, info: Mapping[str, Any], action: np.ndarray) -> np.ndarray | None:
@@ -755,9 +872,12 @@ class SACWorker:
             self._write_actor_status()
             if self._applied_actor_version is not None and desired_version <= self._applied_actor_version:
                 return
+            apply_start = time.perf_counter()
             actor_state_dict = self._torch.load(actor_state_path, map_location="cpu")
             self.actor.load_state_dict(actor_state_dict)
             self.actor.eval()
+            apply_duration_seconds = time.perf_counter() - apply_start
+            self._worker_runtime["actor_apply"].record(apply_duration_seconds)
             self._has_policy_weights = True
             self._applied_actor_version = desired_version
             self._actor_ready_for_control = ready_for_control
@@ -773,6 +893,7 @@ class SACWorker:
                 learner_step=learner_step,
                 requested_env_step=requested_env_step,
             )
+            payload["apply_duration_seconds"] = apply_duration_seconds
             self._write_worker_event("actor_sync_applied", payload)
             self._put_message({"type": "actor_sync_applied", **payload})
             self._write_actor_status()
@@ -793,6 +914,9 @@ class SACWorker:
             return raw_action
         if self._env_step < self.config.train.environment_steps_before_training:
             return raw_action
+        self._control_step_count += 1
+        if self._actor_ready_for_control:
+            self._policy_control_step_count += 1
         executed_action = raw_action.copy()
         self._recent_raw_actions.append(raw_action.copy())
         self._recent_executed_actions.append(executed_action.copy())
@@ -811,10 +935,23 @@ class SACWorker:
         throttle = executed_window[:, 0]
         steer = np.abs(executed_window[:, 1])
         raw_throttle = raw_window[:, 0]
+        steer_raw = executed_window[:, 1]
         gas = np.maximum(throttle, 0.0)
         brake = np.maximum(-throttle, 0.0)
         raw_gas = np.maximum(raw_throttle, 0.0)
         raw_brake = np.maximum(-raw_throttle, 0.0)
+        throttle_delta = np.diff(throttle) if executed_window.shape[0] > 1 else np.zeros((0,), dtype=np.float32)
+        steer_delta = np.diff(steer_raw) if executed_window.shape[0] > 1 else np.zeros((0,), dtype=np.float32)
+        throttle_sign_flip_rate = (
+            float(np.mean(np.sign(throttle[:-1]) != np.sign(throttle[1:])))
+            if executed_window.shape[0] > 1
+            else 0.0
+        )
+        steer_sign_flip_rate = (
+            float(np.mean(np.sign(steer_raw[:-1]) != np.sign(steer_raw[1:])))
+            if executed_window.shape[0] > 1
+            else 0.0
+        )
         stats = {
             "env_step": self._env_step,
             "window_size": int(executed_window.shape[0]),
@@ -832,12 +969,21 @@ class SACWorker:
                 if self._last_actor_apply_env_step is None
                 else int(self._env_step - self._last_actor_apply_env_step)
             ),
+            "versions_behind": (
+                None
+                if self._desired_actor_version is None or self._applied_actor_version is None
+                else int(max(0, self._desired_actor_version - self._applied_actor_version))
+            ),
             "action_guard_active": self._action_guard_active,
             "control_source": "policy" if self._actor_ready_for_control else "exploration",
             "mean_throttle": float(np.mean(throttle)),
             "mean_gas": float(np.mean(gas)),
             "mean_brake": float(np.mean(brake)),
             "mean_abs_steer": float(np.mean(steer)),
+            "mean_abs_throttle_delta": float(np.mean(np.abs(throttle_delta))) if throttle_delta.size else 0.0,
+            "mean_abs_steer_delta": float(np.mean(np.abs(steer_delta))) if steer_delta.size else 0.0,
+            "throttle_sign_flip_rate": throttle_sign_flip_rate,
+            "steer_sign_flip_rate": steer_sign_flip_rate,
             "fraction_gas_gt_0_1": float(np.mean(gas > 0.1)),
             "fraction_brake_gt_0_1": float(np.mean(brake > 0.1)),
             "fraction_gas_and_brake_gt_0_1": float(np.mean((gas > 0.1) & (brake > 0.1))),
@@ -845,6 +991,7 @@ class SACWorker:
             "raw_mean_gas": float(np.mean(raw_gas)),
             "raw_mean_brake": float(np.mean(raw_brake)),
             "raw_fraction_gas_and_brake_gt_0_1": float(np.mean((raw_gas > 0.1) & (raw_brake > 0.1))),
+            **self._control_metrics_snapshot(),
             "control_ready_reason": self._control_ready_reason,
         }
         self._last_action_stats = stats
@@ -894,22 +1041,50 @@ class SACWorker:
 
     def _put_eval_result(self, result: EvalResult) -> None:
         deadline = monotonic() + 5.0
+        wait_start = time.perf_counter()
+        full_retries = 0
         while True:
             try:
                 self.eval_result_queue.put(result, timeout=0.25)
+                self._worker_queue["eval_result_put"].record(
+                    time.perf_counter() - wait_start,
+                    success=True,
+                    full_retries=full_retries,
+                )
                 return
             except queue.Full:
+                full_retries += 1
                 if monotonic() >= deadline:
+                    self._worker_queue["eval_result_put"].record(
+                        time.perf_counter() - wait_start,
+                        success=False,
+                        full_retries=full_retries,
+                        timed_out=True,
+                    )
                     raise RuntimeError("Timed out while publishing eval result during worker shutdown.")
 
     def _put_message(self, payload: Mapping[str, Any]) -> None:
         deadline = monotonic() + 5.0
+        wait_start = time.perf_counter()
+        full_retries = 0
         while True:
             try:
                 self.output_queue.put(dict(payload), timeout=0.25)
+                self._worker_queue["output_put"].record(
+                    time.perf_counter() - wait_start,
+                    success=True,
+                    full_retries=full_retries,
+                )
                 return
             except queue.Full:
+                full_retries += 1
                 if monotonic() >= deadline:
+                    self._worker_queue["output_put"].record(
+                        time.perf_counter() - wait_start,
+                        success=False,
+                        full_retries=full_retries,
+                        timed_out=True,
+                    )
                     return
 
     def _send_neutral_action(self, env: TM20AIGymEnv | None) -> None:
@@ -931,6 +1106,27 @@ class SACWorker:
             self._send_neutral_action(env)
             self._flush_pending_transitions(force=True)
             self._finalize_movement_episode()
+            self._update_env_benchmarks(env)
+            self._put_message(
+                {
+                    "type": "heartbeat",
+                    "env_step": self._env_step,
+                    "episode_index": self._episode_state.episode_index,
+                    "desired_actor_version": self._desired_actor_version,
+                    "desired_actor_ready_for_control": self._desired_actor_ready_for_control,
+                    "seen_actor_version": self._seen_actor_version,
+                    "ready_for_control_seen": self._ready_for_control_seen,
+                    "applied_actor_version": self._applied_actor_version,
+                    "actor_ready_for_control": self._actor_ready_for_control,
+                    "applied_source_learner_step": self._applied_source_learner_step,
+                    "last_actor_apply_env_step": self._last_actor_apply_env_step,
+                    "last_actor_apply_episode_index": self._last_actor_apply_episode_index,
+                    "latest_action_stats": self._last_action_stats,
+                    "control_ready_reason": self._control_ready_reason,
+                    "runtime_profile": self._runtime_profile_snapshot(),
+                    "queue_profile": self._queue_profile_snapshot(),
+                }
+            )
             self._write_actor_status()
         finally:
             try:

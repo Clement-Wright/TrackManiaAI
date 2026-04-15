@@ -266,3 +266,158 @@ def test_redq_learner_marks_actor_ready_only_after_actor_update(tmp_path) -> Non
 
     learner.close()
     restored.close()
+
+
+def test_redq_learner_collects_diagnostics_profiles(tmp_path) -> None:
+    config_path = tmp_path / "config.yaml"
+    artifacts_root = tmp_path / "artifacts"
+    write_redq_train_config(config_path, artifacts_root, q_updates_per_policy_update=1)
+
+    learner = REDQLearner(
+        config_path=config_path,
+        run_name="unit_redq_diagnostics",
+        eval_episodes_override=1,
+        diagnostics_enabled=True,
+    )
+    command_queue: queue.Queue = queue.Queue()
+    output_queue: queue.Queue = queue.Queue()
+    eval_result_queue: queue.Queue = queue.Queue()
+    shutdown_event = threading.Event()
+    worker_done_event = threading.Event()
+    learner.attach_worker(
+        command_queue=command_queue,
+        output_queue=output_queue,
+        eval_result_queue=eval_result_queue,
+        shutdown_event=shutdown_event,
+        worker_done_event=worker_done_event,
+    )
+
+    for step in range(4):
+        output_queue.put(
+            {
+                "type": "transition_batch",
+                "env_step": step + 1,
+                "transitions": [_transition(step)],
+            }
+        )
+    assert learner.drain_messages(timeout=0.01) == 4
+    assert learner.maybe_train() == 4
+    learner.broadcast_actor(force=True)
+    desired_actor_payload = json.loads(learner.paths.desired_actor_path.read_text(encoding="utf-8"))
+
+    output_queue.put(
+        {
+            "type": "actor_sync_desired_seen",
+            "desired_actor_version": desired_actor_payload["desired_actor_version"],
+            "desired_actor_ready_for_control": True,
+            "seen_actor_version": desired_actor_payload["desired_actor_version"],
+            "ready_for_control_seen": True,
+            "requested_env_step": 1,
+            "control_ready_reason": desired_actor_payload["control_ready_reason"],
+        }
+    )
+    output_queue.put(
+        {
+            "type": "actor_sync_applied",
+            "desired_actor_version": desired_actor_payload["desired_actor_version"],
+            "desired_actor_ready_for_control": True,
+            "seen_actor_version": desired_actor_payload["desired_actor_version"],
+            "ready_for_control_seen": True,
+            "applied_actor_version": desired_actor_payload["desired_actor_version"],
+            "actor_ready_for_control": True,
+            "applied_source_learner_step": 1,
+            "requested_env_step": 1,
+            "apply_duration_seconds": 0.02,
+            "last_actor_apply_env_step": 2,
+            "last_actor_apply_episode_index": 1,
+            "control_ready_reason": desired_actor_payload["control_ready_reason"],
+        }
+    )
+    output_queue.put(
+        {
+            "type": "action_stats",
+            "env_step": 4,
+            "desired_actor_version": desired_actor_payload["desired_actor_version"],
+            "desired_actor_ready_for_control": True,
+            "seen_actor_version": desired_actor_payload["desired_actor_version"],
+            "ready_for_control_seen": True,
+            "applied_actor_version": desired_actor_payload["desired_actor_version"],
+            "actor_ready_for_control": True,
+            "applied_source_learner_step": 1,
+            "last_actor_apply_env_step": 2,
+            "last_actor_apply_episode_index": 1,
+            "control_source": "policy",
+            "policy_control_fraction": 0.5,
+            "versions_behind": 0,
+            "window_size": 10,
+        }
+    )
+    output_queue.put(
+        {
+            "type": "movement_episode_summary",
+            "summary": {
+                "run_id": "run-0",
+                "episode_index": 1,
+                "movement_started": False,
+                "stall_count": 1,
+                "first_stall": {
+                    "race_time_ms": 400,
+                    "movement_start_race_time_ms": 200,
+                },
+                "termination_reason": "no_progress",
+            },
+        }
+    )
+    output_queue.put(
+        {
+            "type": "heartbeat",
+            "env_step": 4,
+            "desired_actor_version": desired_actor_payload["desired_actor_version"],
+            "desired_actor_ready_for_control": True,
+            "seen_actor_version": desired_actor_payload["desired_actor_version"],
+            "ready_for_control_seen": True,
+            "applied_actor_version": desired_actor_payload["desired_actor_version"],
+            "actor_ready_for_control": True,
+            "applied_source_learner_step": 1,
+            "last_actor_apply_env_step": 2,
+            "last_actor_apply_episode_index": 1,
+            "latest_action_stats": {
+                "control_source": "policy",
+                "policy_control_fraction": 0.5,
+                "desired_actor_version": desired_actor_payload["desired_actor_version"],
+                "applied_actor_version": desired_actor_payload["desired_actor_version"],
+                "applied_source_learner_step": 1,
+                "last_actor_apply_env_step": 2,
+            },
+            "runtime_profile": {
+                "env_loop_total_seconds": 1.25,
+                "env_step": {"total_seconds": 1.0},
+                "env_reset": {"total_seconds": 0.25},
+                "actor_apply": {"total_seconds": 0.02},
+            },
+            "queue_profile": {
+                "output_put": {"total_wait_seconds": 0.01},
+                "eval_result_put": {"total_wait_seconds": 0.0},
+            },
+        }
+    )
+    assert learner.drain_messages(timeout=0.01) == 0
+
+    learner.maybe_schedule_eval()
+    scheduled_commands = []
+    while not command_queue.empty():
+        scheduled_commands.append(command_queue.get())
+    assert any(command["type"] == "run_eval" for command in scheduled_commands)
+
+    summary_payload = json.loads(learner.paths.summary_json.read_text(encoding="utf-8"))
+    assert summary_payload["primary_metric"] == "mean_final_progress_index"
+    assert summary_payload["runtime_profile"]["learner"]["replay_sample"]["count"] > 0
+    assert summary_payload["runtime_profile"]["worker"]["env_loop_total_seconds"] == 1.25
+    assert summary_payload["queue_profile"]["learner"]["command_put"]["attempts"] >= 1
+    assert summary_payload["actor_sync_profile"]["time_to_applied_seconds"]["count"] >= 1
+    assert summary_payload["actor_sync_profile"]["time_to_first_policy_control_window_seconds"] is not None
+    assert summary_payload["episode_diagnostics"]["episode_count"] == 0
+    assert summary_payload["movement_diagnostics"]["no_movement_episode_count"] == 1
+    assert summary_payload["resource_profile"]["n_critics"] == 4
+
+    learner.close()

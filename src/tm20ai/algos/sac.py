@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,8 @@ class SACUpdateResult:
     target_q_mean: float
     q1_mean: float
     q2_mean: float
+    critic_update_seconds: float
+    actor_update_seconds: float
 
 
 class SACAgent:
@@ -147,11 +150,13 @@ class SACAgent:
         q2 = self._critic_forward(self.critic2, obs, batch.telemetry, batch.action)
         critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
 
+        critic_update_start = time.perf_counter()
         self.critic1_optimizer.zero_grad(set_to_none=True)
         self.critic2_optimizer.zero_grad(set_to_none=True)
         critic_loss.backward()
         self.critic1_optimizer.step()
         self.critic2_optimizer.step()
+        critic_update_seconds = time.perf_counter() - critic_update_start
 
         pi_action, log_prob = self._actor_sample(obs, batch.telemetry, deterministic=False)
         q1_pi = self._critic_forward(self.critic1, obs, batch.telemetry, pi_action)
@@ -159,6 +164,7 @@ class SACAgent:
         min_q_pi = torch.min(q1_pi, q2_pi)
         actor_loss = (self.alpha.detach() * log_prob - min_q_pi).mean()
 
+        actor_update_start = time.perf_counter()
         self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
         self.actor_optimizer.step()
@@ -171,6 +177,7 @@ class SACAgent:
             self.alpha_optimizer.step()
         else:
             alpha_loss = torch.zeros((), device=self.device)
+        actor_update_seconds = time.perf_counter() - actor_update_start
 
         self.soft_update_targets()
         return SACUpdateResult(
@@ -182,6 +189,8 @@ class SACAgent:
             target_q_mean=float(target_q.mean().detach().cpu().item()),
             q1_mean=float(q1.mean().detach().cpu().item()),
             q2_mean=float(q2.mean().detach().cpu().item()),
+            critic_update_seconds=float(critic_update_seconds),
+            actor_update_seconds=float(actor_update_seconds),
         )
 
     def soft_update_targets(self) -> None:

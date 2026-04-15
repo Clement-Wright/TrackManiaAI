@@ -1,0 +1,118 @@
+runtime:
+  time_step_duration: 0.05
+  start_obs_capture: 0.04
+  time_step_timeout_factor: 1.0
+  act_buf_len: 2
+  wait_on_done: true
+  ep_max_length: 1000
+  sleep_time_at_reset: 1.5
+
+bridge:
+  host: "127.0.0.1"
+  telemetry_port: 9100
+  command_port: 9101
+  connect_timeout: 5.0
+  command_timeout: 5.0
+  initial_frame_timeout: 10.0
+  reconnect_delay: 1.0
+  stale_timeout: 0.25
+  reset_timeout: 5.0
+
+observation:
+  mode: full
+
+capture:
+  window_title: "Trackmania"
+  target_fps: 60
+  max_buffer_len: 64
+  backend: dxgi
+  device_idx: null
+  output_idx: null
+  bootstrap_log: true
+  require_stable_window_polls: 5
+  stable_window_poll_interval_seconds: 0.1
+  latest_frame_only: true
+  frame_timeout: 1.0
+  post_reset_flush_seconds: 0.25
+  invalid_frame_limit: 3
+  region_change_tolerance_pixels: 4
+
+full_observation:
+  window_width: 256
+  window_height: 128
+  output_width: 64
+  output_height: 64
+  grayscale: true
+  frame_stack: 4
+
+lidar_observation:
+  window_width: 958
+  window_height: 488
+  ray_count: 19
+  lidar_hist_len: 4
+  prev_action_hist_len: 2
+  fixed_crop: [0.18, 0.34, 0.82, 0.96]
+  border_threshold: 48
+  ray_min_angle_degrees: -80.0
+  ray_max_angle_degrees: 80.0
+  max_ray_length_fraction: 1.0
+
+reward:
+  mode: trajectory_progress
+  spacing_meters: 0.5
+  end_of_track: 100.0
+  constant_penalty: 0.0
+  check_forward: 500
+  check_backward: 10
+  failure_countdown: 10
+  min_steps: 70
+  max_stray: 100.0
+
+eval:
+  episodes: 5
+  seed_base: 12345
+  sector_count: 10
+  record_video: false
+  video_fps: 20
+
+train:
+  algorithm: redq
+  seed: 12345
+  memory_size: 1000000
+  batch_size: 256
+  environment_steps_before_training: 1000
+  max_training_steps_per_environment_step: 20.0
+  update_model_interval: 200
+  update_buffer_interval: 200
+  eval_interval_steps: 2500
+  checkpoint_interval_steps: 2500
+  queue_capacity: 8192
+  max_env_steps: null
+  cuda_training: true
+  cuda_inference: false
+  single_live_env: true
+
+sac:
+  gamma: 0.995
+  polyak: 0.995
+  actor_lr: 3.0e-4
+  critic_lr: 5.0e-5
+  alpha_lr: 3.0e-4
+  learn_entropy_coef: false
+  alpha: 0.37
+  target_entropy: -2.0
+
+redq:
+  n_critics: 10
+  m_subset: 2
+  q_updates_per_policy_update: 20
+  share_encoders: false
+
+bc:
+  epochs: 20
+  learning_rate: 3.0e-4
+  weight_decay: 0.0
+  validation_fraction: 0.2
+
+artifacts:
+  root: ".tmp/artifacts"

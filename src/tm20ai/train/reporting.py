@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -61,6 +62,35 @@ def _build_eval_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def _load_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+
+def _summarize_event_log(path: Path) -> dict[str, Any]:
+    rows = _load_jsonl(path)
+    counts: dict[str, int] = {}
+    for row in rows:
+        event = str(row.get("event", "unknown"))
+        counts[event] = counts.get(event, 0) + 1
+    return {
+        "path": str(path.resolve()),
+        "exists": path.exists(),
+        "event_count": len(rows),
+        "event_type_counts": dict(sorted(counts.items())),
+    }
+
+
 def build_training_report(
     run_dir: str | Path,
     *,
@@ -108,6 +138,7 @@ def build_training_report(
         "config_path": summary.get("config_path"),
         "config_sha256": None if config_path is None or not config_path.exists() else sha256_file(config_path),
         "observation_mode": summary.get("observation_mode"),
+        "primary_metric": summary.get("primary_metric", "mean_final_progress_index"),
         "init_mode": summary.get("init_mode", "scratch"),
         "bc_checkpoint_path": summary.get("bc_checkpoint_path"),
         "demo_root": summary.get("demo_root"),
@@ -135,6 +166,16 @@ def build_training_report(
         ],
         "videos": _discover_video_paths(resolved_run_dir, str(summary.get("run_name", "")), extra_video_paths),
         "failure_notes": failure_notes,
+        "runtime_profile": dict(summary.get("runtime_profile", {})),
+        "queue_profile": dict(summary.get("queue_profile", {})),
+        "actor_sync_profile": dict(summary.get("actor_sync_profile", {})),
+        "episode_diagnostics": dict(summary.get("episode_diagnostics", {})),
+        "movement_diagnostics": dict(summary.get("movement_diagnostics", {})),
+        "resource_profile": dict(summary.get("resource_profile", {})),
+        "event_logs": {
+            "learner": _summarize_event_log(resolved_run_dir / "learner_events.log"),
+            "worker": _summarize_event_log(resolved_run_dir / "worker_events.log"),
+        },
     }
     return report
 
@@ -252,12 +293,20 @@ def build_comparison_report(
 
 
 def _render_run_report_markdown(report: dict[str, Any]) -> str:
+    runtime_profile = dict(report.get("runtime_profile", {}))
+    bottleneck = dict(runtime_profile.get("bottleneck_verdict", {}))
+    actor_sync_profile = dict(report.get("actor_sync_profile", {}))
+    episode_diagnostics = dict(report.get("episode_diagnostics", {}))
+    movement_diagnostics = dict(report.get("movement_diagnostics", {}))
+    resource_profile = dict(report.get("resource_profile", {}))
+    event_logs = dict(report.get("event_logs", {}))
     lines = [
         f"# Training Report: {report['run_name']}",
         "",
         "## Summary",
         f"- Observation mode: {report['observation_mode']}",
         f"- Init mode: {report['init_mode']}",
+        f"- Primary metric: {report.get('primary_metric')}",
         f"- Env steps: {report['env_step']}",
         f"- Learner steps: {report['learner_step']}",
         f"- Replay size: {report['replay_size']}",
@@ -274,6 +323,45 @@ def _render_run_report_markdown(report: dict[str, Any]) -> str:
         lines.append(
             f"- env_step={row['env_step']} mean_progress={row['mean_final_progress_index']} "
             f"median_progress={row['median_final_progress_index']} completion_rate={row['completion_rate']}"
+        )
+    lines.extend(["", "## Diagnostics"])
+    if bottleneck:
+        lines.append(f"- Bottleneck verdict: {bottleneck.get('label')}")
+        for key, value in dict(bottleneck.get("breakdown_seconds", {})).items():
+            lines.append(f"- {key}_seconds={value}")
+    if actor_sync_profile:
+        lines.append(
+            f"- time_to_first_ready_actor_seconds={actor_sync_profile.get('time_to_first_ready_actor_seconds')} "
+            f"time_to_first_applied_ready_actor_seconds={actor_sync_profile.get('time_to_first_applied_ready_actor_seconds')} "
+            f"time_to_first_policy_control_window_seconds={actor_sync_profile.get('time_to_first_policy_control_window_seconds')}"
+        )
+        lines.append(
+            f"- policy_control_fraction={actor_sync_profile.get('policy_control_fraction')} "
+            f"applied_lag_p50={dict(actor_sync_profile.get('time_to_applied_seconds', {})).get('p50')} "
+            f"applied_lag_p95={dict(actor_sync_profile.get('time_to_applied_seconds', {})).get('p95')}"
+        )
+    if episode_diagnostics:
+        lines.append(
+            f"- positive_progress_mean={dict(episode_diagnostics.get('positive_progress_fraction', {})).get('mean')} "
+            f"nonpositive_progress_mean={dict(episode_diagnostics.get('nonpositive_progress_fraction', {})).get('mean')} "
+            f"max_no_progress_p95={dict(episode_diagnostics.get('max_no_progress_streak', {})).get('p95')}"
+        )
+    if movement_diagnostics:
+        lines.append(
+            f"- no_movement_episode_count={movement_diagnostics.get('no_movement_episode_count')} "
+            f"stall_episode_rate={movement_diagnostics.get('stall_episode_rate')} "
+            f"first_stall_delay_p95_ms={dict(movement_diagnostics.get('first_stall_delay_ms', {})).get('p95')}"
+        )
+    if resource_profile:
+        lines.append(
+            f"- actor_params={resource_profile.get('actor_parameter_count')} "
+            f"critic_params={resource_profile.get('critic_parameter_count')} "
+            f"unique_critic_encoder_params={resource_profile.get('unique_critic_encoder_parameter_count')}"
+        )
+    lines.extend(["", "## Event Logs"])
+    for label, payload in event_logs.items():
+        lines.append(
+            f"- {label}: events={payload.get('event_count')} path={payload.get('path')}"
         )
     lines.extend(["", "## Videos"])
     videos = report.get("videos", [])

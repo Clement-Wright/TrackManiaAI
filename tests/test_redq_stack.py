@@ -11,6 +11,7 @@ from tm20ai.algos.redq import REDQSACAgent
 from tm20ai.capture import lidar_feature_dim
 from tm20ai.config import ConfigError, LidarObservationConfig, REDQConfig, SACConfig, TM20AIConfig
 from tm20ai.models.full_actor_critic import FullObservationActor
+from tm20ai.train.diagnostics import benchmark_redq_sweep
 from tm20ai.train.evaluator import resolve_policy_adapter
 from tm20ai.train.features import TELEMETRY_DIM
 from tm20ai.train.replay import ReplayBuffer
@@ -288,3 +289,20 @@ def test_redq_agent_load_bc_warm_start_actor_plus_critic_encoders(tmp_path) -> N
             assert torch.equal(critic.vision_encoder.state_dict()[key], value)
         for key, value in expected_telemetry.items():
             assert torch.equal(critic.telemetry_encoder.state_dict()[key], value)
+
+
+def test_benchmark_redq_sweep_reports_resource_and_timing_sections() -> None:
+    result = benchmark_redq_sweep(
+        device=torch.device("cpu"),
+        batch_size=4,
+        warmup_updates=1,
+        measured_updates=2,
+        sweep=[{"n_critics": 4, "m_subset": 2, "share_encoders": True}],
+    )
+
+    assert result["results"]
+    row = result["results"][0]
+    assert row["critic_update_ms"]["count"] == 2
+    assert row["resource_profile"]["n_critics"] == 4
+    assert row["resource_profile"]["unique_critic_encoder_parameter_count"] > 0
+    assert row["critic_updates_per_second"] > 0.0
