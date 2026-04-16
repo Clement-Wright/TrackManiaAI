@@ -208,15 +208,37 @@ class EvalConfig:
     sector_count: int = 10
     record_video: bool = False
     video_fps: int = 20
+    modes: tuple[str, ...] = ("deterministic",)
+    trace_seconds: float = 3.0
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "EvalConfig":
+        raw_modes = payload.get("modes", ("deterministic",))
+        if isinstance(raw_modes, str):
+            modes = (str(raw_modes).strip().lower(),)
+        elif isinstance(raw_modes, Sequence):
+            modes = tuple(str(value).strip().lower() for value in raw_modes if str(value).strip())
+        else:
+            raise ConfigError("eval.modes must be a sequence of mode names.")
+        if not modes:
+            raise ConfigError("eval.modes must contain at least one mode.")
+        invalid_modes = sorted({mode for mode in modes if mode not in {"deterministic", "stochastic"}})
+        if invalid_modes:
+            raise ConfigError(
+                "eval.modes must only contain 'deterministic' and/or 'stochastic', "
+                f"got {invalid_modes!r}."
+            )
+        trace_seconds = float(payload.get("trace_seconds", 3.0))
+        if trace_seconds <= 0.0:
+            raise ConfigError(f"eval.trace_seconds must be > 0, got {trace_seconds}.")
         return cls(
             episodes=int(payload.get("episodes", 20)),
             seed_base=int(payload.get("seed_base", 12345)),
             sector_count=int(payload.get("sector_count", 10)),
             record_video=_bool(payload.get("record_video", False), context="eval.record_video"),
             video_fps=int(payload.get("video_fps", 20)),
+            modes=modes,
+            trace_seconds=trace_seconds,
         )
 
 
@@ -237,6 +259,8 @@ class TrainConfig:
     cuda_training: bool = True
     cuda_inference: bool = False
     single_live_env: bool = True
+    broadcast_after_actor_update: bool = False
+    actor_publish_every: int = 1
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "TrainConfig":
@@ -253,6 +277,9 @@ class TrainConfig:
             "max_training_steps_per_environment_step",
             payload.get("updates_per_step", 4.0),
         )
+        actor_publish_every = int(payload.get("actor_publish_every", 1))
+        if actor_publish_every < 1:
+            raise ConfigError(f"train.actor_publish_every must be >= 1, got {actor_publish_every}.")
         return cls(
             algorithm=algorithm,
             seed=int(payload.get("seed", 12345)),
@@ -269,6 +296,11 @@ class TrainConfig:
             cuda_training=_bool(payload.get("cuda_training", True), context="train.cuda_training"),
             cuda_inference=_bool(payload.get("cuda_inference", False), context="train.cuda_inference"),
             single_live_env=_bool(payload.get("single_live_env", True), context="train.single_live_env"),
+            broadcast_after_actor_update=_bool(
+                payload.get("broadcast_after_actor_update", False),
+                context="train.broadcast_after_actor_update",
+            ),
+            actor_publish_every=actor_publish_every,
         )
 
 

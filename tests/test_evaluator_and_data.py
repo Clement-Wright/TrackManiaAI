@@ -225,6 +225,40 @@ def test_run_policy_episodes_writes_scalar_artifacts(tmp_path, monkeypatch) -> N
         assert result["summary"]["completion_rate"] == 1.0
 
 
+def test_run_policy_episodes_records_eval_mode_and_action_trace(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "config.yaml"
+    artifacts_root = tmp_path / "artifacts"
+    trajectory_path = tmp_path / "trajectory_0p5m.npz"
+    write_test_config(config_path, artifacts_root)
+    write_test_trajectory(trajectory_path)
+
+    monkeypatch.setattr("tm20ai.train.evaluator.runtime_trajectory_path_for_map", lambda *args, **kwargs: trajectory_path)
+    env_factory = lambda _path, _benchmark=False: FakeEnv()
+
+    result = run_policy_episodes(
+        config_path=config_path,
+        mode="eval",
+        policy=FixedActionPolicy(action=np.asarray([1.0, 0.5], dtype=np.float32)),
+        episodes=1,
+        seed_base=123,
+        record_video=False,
+        env_factory=env_factory,
+        eval_mode="stochastic",
+        deterministic=False,
+        trace_seconds=0.1,
+    )
+
+    assert result["summary"]["eval_mode"] == "stochastic"
+    assert result["summary"]["deterministic_policy"] is False
+    metadata_path = next((Path(result["run_dir"]) / "episodes").glob("*.json"))
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["eval_mode"] == "stochastic"
+    assert metadata["deterministic_policy"] is False
+    assert len(metadata["action_trace"]) == 2
+    assert metadata["action_trace"][0]["throttle"] == 1.0
+    assert metadata["action_trace"][0]["steer"] == 0.5
+
+
 def test_demo_runs_write_sidecars_and_dataset_split(tmp_path, monkeypatch) -> None:
     config_path = tmp_path / "config.yaml"
     artifacts_root = tmp_path / "artifacts"

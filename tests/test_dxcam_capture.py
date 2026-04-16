@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
+import tm20ai.capture.dxcam_capture as dxcam_capture
 from tm20ai.capture.dxcam_capture import CaptureBinding, CaptureState, DXCamCapture
 from tm20ai.capture.window import WindowGeometry
 from tm20ai.config import CaptureConfig
@@ -200,3 +201,42 @@ def test_dxcam_capture_rejects_unexpected_client_size() -> None:
 
     with np.testing.assert_raises_regex(RuntimeError, "expected 256x128"):
         capture.ensure_started()
+
+
+def test_default_camera_factory_retries_without_device_idx(monkeypatch) -> None:
+    config = CaptureConfig(max_buffer_len=16)
+    attempts: list[dict[str, object]] = []
+    sentinel = object()
+
+    class FakeDXCam:
+        def create(self, **kwargs):  # noqa: ANN003
+            attempts.append(dict(kwargs))
+            if "device_idx" in kwargs:
+                raise RuntimeError("device_idx path failed")
+            return sentinel
+
+    monkeypatch.setattr(dxcam_capture, "_load_dxcam_module", lambda: FakeDXCam())
+
+    camera = dxcam_capture._default_camera_factory(
+        config,
+        device_idx=0,
+        output_idx=0,
+        backend="dxgi",
+    )
+
+    assert camera is sentinel
+    assert attempts == [
+        {
+            "device_idx": 0,
+            "output_idx": 0,
+            "max_buffer_len": 16,
+            "output_color": "RGB",
+            "backend": "dxgi",
+        },
+        {
+            "output_idx": 0,
+            "max_buffer_len": 16,
+            "output_color": "RGB",
+            "backend": "dxgi",
+        },
+    ]

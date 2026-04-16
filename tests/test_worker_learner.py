@@ -242,7 +242,16 @@ def test_worker_emits_transition_batches_and_eval_results(tmp_path, monkeypatch)
         bootstrap_log_path=str(bootstrap_log_path),
         env_factory=lambda _path, _benchmark=False: FakeTrainingEnv(),
     )
-    command_queue.put({"type": "run_eval", "episodes": 1, "seed_base": 7, "run_name": "worker_eval"})
+    command_queue.put(
+        {
+            "type": "run_eval",
+            "episodes": 1,
+            "seed_base": 7,
+            "run_name": "worker_eval",
+            "modes": ["deterministic", "stochastic"],
+            "trace_seconds": 0.1,
+        }
+    )
 
     thread = threading.Thread(target=worker.run, kwargs={"max_env_steps": 4}, daemon=True)
     thread.start()
@@ -263,6 +272,8 @@ def test_worker_emits_transition_batches_and_eval_results(tmp_path, monkeypatch)
     assert eval_results
     assert eval_results[-1].summary["eval_actor_version"] == 2
     assert eval_results[-1].summary["eval_actor_source_learner_step"] == 11
+    assert "deterministic" in eval_results[-1].summary["eval_mode_summaries"]
+    assert "stochastic" in eval_results[-1].summary["eval_mode_summaries"]
     assert worker_done_event.is_set()
     worker_events = [json.loads(line) for line in bootstrap_log_path.with_name("worker_events.log").read_text(encoding="utf-8").splitlines()]
     events = [entry["event"] for entry in worker_events]
@@ -284,6 +295,32 @@ def test_worker_emits_transition_batches_and_eval_results(tmp_path, monkeypatch)
     assert status_payload["actor_ready_for_control"] is True
     assert status_payload["applied_source_learner_step"] == 11
     learner.close()
+
+
+def test_worker_preserves_pending_eval_when_shutdown_is_requested(tmp_path) -> None:
+    config_path = tmp_path / "config.yaml"
+    artifacts_root = tmp_path / "artifacts"
+    trajectory_path = tmp_path / "reward" / "trajectory_0p5m.npz"
+    write_train_config(config_path, artifacts_root, trajectory_path)
+
+    worker = SACWorker(
+        config_path=str(config_path),
+        command_queue=queue.Queue(),
+        output_queue=queue.Queue(),
+        eval_result_queue=queue.Queue(),
+        shutdown_event=threading.Event(),
+        worker_done_event=threading.Event(),
+        bootstrap_log_path=str(artifacts_root / "worker_bootstrap.log"),
+        env_factory=lambda _path, _benchmark=False: FakeTrainingEnv(),
+    )
+    worker.command_queue.put({"type": "run_eval", "episodes": 1, "run_name": "pending_eval"})
+    worker.command_queue.put({"type": "shutdown"})
+
+    pending = worker._drain_commands()
+
+    assert pending is not None
+    assert pending["run_name"] == "pending_eval"
+    assert worker._shutdown_requested is True
 
 
 def test_learner_checkpoint_roundtrip_and_command_scheduling(tmp_path) -> None:

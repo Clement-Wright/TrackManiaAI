@@ -74,6 +74,8 @@ eval:
   sector_count: 10
   record_video: false
   video_fps: 20
+  modes: ["deterministic", "stochastic"]
+  trace_seconds: 3.0
 
 train:
   algorithm: redq
@@ -81,9 +83,9 @@ train:
   memory_size: 1000000
   batch_size: 256
   environment_steps_before_training: 1000
-  max_training_steps_per_environment_step: 20.0
-  update_model_interval: 200
-  update_buffer_interval: 200
+  max_training_steps_per_environment_step: 8.0
+  update_model_interval: 8
+  update_buffer_interval: 8
   eval_interval_steps: 5000
   checkpoint_interval_steps: 5000
   queue_capacity: 8192
@@ -91,6 +93,8 @@ train:
   cuda_training: true
   cuda_inference: false
   single_live_env: true
+  broadcast_after_actor_update: true
+  actor_publish_every: 1
 
 sac:
   gamma: 0.995
@@ -105,8 +109,8 @@ sac:
 redq:
   n_critics: 10
   m_subset: 2
-  q_updates_per_policy_update: 20
-  share_encoders: false
+  q_updates_per_policy_update: 5
+  share_encoders: true
 
 bc:
   epochs: 20

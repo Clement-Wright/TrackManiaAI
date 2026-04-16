@@ -95,21 +95,51 @@ def _default_camera_factory(
     backend: str = "dxgi",
 ):
     dxcam = _load_dxcam_module()
-    try:
-        return dxcam.create(
-            device_idx=device_idx,
-            output_idx=output_idx,
-            max_buffer_len=config.max_buffer_len,
-            output_color="RGB",
-            backend=backend,
-        )
-    except TypeError:
-        return dxcam.create(
-            device_idx=device_idx,
-            output_idx=output_idx,
-            max_buffer_len=config.max_buffer_len,
-            output_color="RGB",
-        )
+    create_attempts: list[dict[str, Any]] = [
+        {
+            "device_idx": device_idx,
+            "output_idx": output_idx,
+            "max_buffer_len": config.max_buffer_len,
+            "output_color": "RGB",
+            "backend": backend,
+        },
+        {
+            "output_idx": output_idx,
+            "max_buffer_len": config.max_buffer_len,
+            "output_color": "RGB",
+            "backend": backend,
+        },
+        {
+            "device_idx": device_idx,
+            "output_idx": output_idx,
+            "max_buffer_len": config.max_buffer_len,
+            "output_color": "RGB",
+        },
+        {
+            "output_idx": output_idx,
+            "max_buffer_len": config.max_buffer_len,
+            "output_color": "RGB",
+        },
+    ]
+    if output_idx is None:
+        create_attempts = [
+            attempt
+            for attempt in create_attempts
+            if "output_idx" not in attempt or attempt["output_idx"] is not None
+        ]
+
+    last_exception: Exception | None = None
+    for kwargs in create_attempts:
+        try:
+            return dxcam.create(**kwargs)
+        except TypeError as exc:
+            last_exception = exc
+            continue
+        except Exception as exc:  # noqa: BLE001
+            last_exception = exc
+            continue
+    assert last_exception is not None
+    raise last_exception
 
 
 def _region_delta(old: WindowGeometry, new: WindowGeometry) -> int:
@@ -139,6 +169,10 @@ def _foreground_window() -> int | None:
 def _backend_candidates(config: CaptureConfig) -> list[str]:
     if config.backend == "auto":
         return ["dxgi", "winrt"]
+    if config.backend == "dxgi":
+        return ["dxgi", "winrt"]
+    if config.backend == "winrt":
+        return ["winrt", "dxgi"]
     return [config.backend]
 
 
@@ -336,11 +370,13 @@ class DXCamCapture:
         )
 
     def describe_bootstrap_context(self) -> dict[str, Any]:
-        dxcam_module = _load_dxcam_module()
-        hwnd, geometry = self._wait_for_stable_window()
-        binding = self._resolve_capture_binding(dxcam_module, hwnd, geometry)
+        if self._window_handle is not None and self._geometry is not None:
+            hwnd = self._window_handle
+            geometry = self._geometry
+        else:
+            hwnd, geometry = self._wait_for_stable_window()
         monitor = get_window_monitor_geometry(hwnd)
-        return {
+        context = {
             "pid": os.getpid(),
             "thread_id": threading.get_native_id(),
             "start_method": mp.get_start_method(allow_none=True),
@@ -358,10 +394,10 @@ class DXCamCapture:
             "foreground_window": _foreground_window(),
             "is_foreground": _foreground_window() == hwnd,
             "monitor": asdict(monitor),
-            "binding": asdict(binding),
-            "device_info": dxcam_module.device_info().strip(),
-            "output_info": dxcam_module.output_info().strip(),
         }
+        if self._binding is not None:
+            context["binding"] = asdict(self._binding)
+        return context
 
     def _start_camera(self) -> None:
         assert self._camera is not None

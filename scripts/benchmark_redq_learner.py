@@ -48,7 +48,7 @@ def main() -> int:
     parser.add_argument("--measured-updates", type=int, default=6)
     parser.add_argument("--n-critics", default="2,4,10")
     parser.add_argument("--m-subset", default="2")
-    parser.add_argument("--share-encoders", default="false,true")
+    parser.add_argument("--share-encoders", default="true,false")
     parser.add_argument("--artifact-dir", default=None)
     args = parser.parse_args()
 

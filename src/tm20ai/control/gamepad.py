@@ -7,10 +7,15 @@ import numpy as np
 
 from ..action_space import neutral_action
 
-try:
-    import vgamepad as vg
-except ImportError:  # pragma: no cover - exercised on machines without vgamepad installed
-    vg = None
+
+def _load_vgamepad_module():
+    try:
+        import vgamepad as vg
+    except ImportError as exc:  # pragma: no cover - exercised on machines without vgamepad installed
+        raise RuntimeError(
+            "vgamepad is not installed. Install the runtime dependencies before using the env control path."
+        ) from exc
+    return vg
 
 
 class XboxPadLike(Protocol):
@@ -55,11 +60,7 @@ class GamepadController:
 
     def __init__(self, backend: XboxPadLike | None = None):
         if backend is None:
-            if vg is None:
-                raise RuntimeError(
-                    "vgamepad is not installed. Install the runtime dependencies before using the env control path."
-                )
-            backend = vg.VX360Gamepad()
+            backend = _load_vgamepad_module().VX360Gamepad()
         self._backend = backend
 
     @staticmethod

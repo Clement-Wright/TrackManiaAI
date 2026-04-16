@@ -240,6 +240,8 @@ def test_write_training_report_includes_diagnostics_sections_and_event_logs(tmp_
     summary.update(
         {
             "primary_metric": "mean_final_progress_index",
+            "achieved_utd_1k": 1.75,
+            "current_actor_staleness": 12,
             "runtime_profile": {
                 "bottleneck_verdict": {
                     "label": "worker_env",
@@ -254,6 +256,7 @@ def test_write_training_report_includes_diagnostics_sections_and_event_logs(tmp_
             "queue_profile": {"learner": {"command_put": {"attempts": 2}}, "worker": {"output_put": {"attempts": 3}}},
             "actor_sync_profile": {
                 "policy_control_fraction": 0.75,
+                "current_versions_behind": 2,
                 "time_to_first_ready_actor_seconds": 12.0,
                 "time_to_first_applied_ready_actor_seconds": 13.0,
                 "time_to_first_policy_control_window_seconds": 15.0,
@@ -290,9 +293,82 @@ def test_write_training_report_includes_diagnostics_sections_and_event_logs(tmp_
     report = json.loads(report_paths.json_path.read_text(encoding="utf-8"))
 
     assert report["primary_metric"] == "mean_final_progress_index"
+    assert report["achieved_utd_1k"] == 1.75
+    assert report["current_actor_staleness"] == 12
     assert report["runtime_profile"]["bottleneck_verdict"]["label"] == "worker_env"
     assert report["actor_sync_profile"]["policy_control_fraction"] == 0.75
     assert report["event_logs"]["learner"]["event_count"] == 1
     markdown = report_paths.markdown_path.read_text(encoding="utf-8")
     assert "## Diagnostics" in markdown
     assert "Bottleneck verdict: worker_env" in markdown
+    assert "achieved_utd_1k=1.75 current_actor_staleness=12" in markdown
+
+
+def test_write_training_report_preserves_per_mode_eval_rows(tmp_path) -> None:
+    run_dir = tmp_path / "artifacts" / "train" / "full_redq_modes"
+    eval_rows = [
+        {
+            "checkpoint_step": 5000,
+            "env_step": 5000,
+            "learner_step": 9000,
+            "summary_path": str(run_dir.parent.parent / "eval" / "full_redq_modes_step_00005000_deterministic" / "summary.json"),
+            "summary": {
+                "env_step": 5000,
+                "mean_final_progress_index": 80.0,
+                "median_final_progress_index": 75.0,
+                "completion_rate": 0.0,
+            },
+            "mode_summaries": {
+                "deterministic": {
+                    "env_step": 5000,
+                    "mean_final_progress_index": 80.0,
+                    "completion_rate": 0.0,
+                },
+                "stochastic": {
+                    "env_step": 5000,
+                    "mean_final_progress_index": 120.0,
+                    "completion_rate": 0.2,
+                },
+            },
+            "mode_summary_paths": {
+                "deterministic": "C:/eval/deterministic.json",
+                "stochastic": "C:/eval/stochastic.json",
+            },
+            "deterministic_collapse": {
+                "meaningfully_outperformed": True,
+                "progress_delta": 40.0,
+                "completion_rate_delta": 0.2,
+            },
+            "timestamp": 1_700_000_000.0,
+        }
+    ]
+    checkpoint_rows = [
+        {
+            "path": str(run_dir / "checkpoints" / "checkpoint_00005000.pt"),
+            "env_step": 5000,
+            "learner_step": 9000,
+            "replay_size": 5000,
+            "timestamp": "2026-04-11T00:05:00+00:00",
+            "final": False,
+        }
+    ]
+    _write_summary(
+        run_dir,
+        run_name="full_redq_modes",
+        init_mode="scratch",
+        env_step=5000,
+        learner_step=9000,
+        replay_size=5000,
+        eval_rows=eval_rows,
+        checkpoint_rows=checkpoint_rows,
+    )
+
+    report_paths = write_training_report(run_dir)
+    report = json.loads(report_paths.json_path.read_text(encoding="utf-8"))
+    row = report["eval_history_table"][0]
+
+    assert row["mode_summaries"]["stochastic"]["mean_final_progress_index"] == 120.0
+    assert row["deterministic_collapse"]["meaningfully_outperformed"] is True
+    markdown = report_paths.markdown_path.read_text(encoding="utf-8")
+    assert "stochastic: mean_progress=120.0" in markdown
+    assert "deterministic_collapse: meaningfully_outperformed=True" in markdown

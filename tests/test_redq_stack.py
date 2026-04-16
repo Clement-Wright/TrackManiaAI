@@ -93,7 +93,15 @@ def _write_bc_actor_checkpoint(
 def test_tm20ai_config_parses_redq_block_and_normalizes_algorithm() -> None:
     config = TM20AIConfig.from_mapping(
         {
-            "train": {"algorithm": "REDQ"},
+            "train": {
+                "algorithm": "REDQ",
+                "broadcast_after_actor_update": True,
+                "actor_publish_every": 1,
+            },
+            "eval": {
+                "modes": ["deterministic", "stochastic"],
+                "trace_seconds": 3.0,
+            },
             "redq": {
                 "n_critics": 12,
                 "m_subset": 3,
@@ -104,6 +112,10 @@ def test_tm20ai_config_parses_redq_block_and_normalizes_algorithm() -> None:
     )
 
     assert config.train.algorithm == "redq"
+    assert config.train.broadcast_after_actor_update is True
+    assert config.train.actor_publish_every == 1
+    assert config.eval.modes == ("deterministic", "stochastic")
+    assert config.eval.trace_seconds == 3.0
     assert config.redq.n_critics == 12
     assert config.redq.m_subset == 3
     assert config.redq.q_updates_per_policy_update == 5
@@ -118,6 +130,10 @@ def test_tm20ai_config_parses_redq_block_and_normalizes_algorithm() -> None:
         ({"redq": {"n_critics": 4, "m_subset": 0}}, "redq.m_subset"),
         ({"redq": {"n_critics": 4, "m_subset": 5}}, "redq.m_subset"),
         ({"redq": {"q_updates_per_policy_update": 0}}, "redq.q_updates_per_policy_update"),
+        ({"train": {"actor_publish_every": 0}}, "train.actor_publish_every"),
+        ({"eval": {"modes": []}}, "eval.modes"),
+        ({"eval": {"modes": ["deterministic", "greedy"]}}, "eval.modes"),
+        ({"eval": {"trace_seconds": 0.0}}, "eval.trace_seconds"),
     ],
 )
 def test_tm20ai_config_rejects_invalid_redq_settings(payload, match: str) -> None:
