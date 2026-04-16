@@ -24,6 +24,7 @@ from .diagnostics import (
     JsonlEventLogger,
     MovementDiagnosticsTracker,
     QueueAccumulator,
+    RollingRatioTracker,
     TimingAccumulator,
     build_agent_resource_profile,
     build_bottleneck_verdict,
@@ -49,6 +50,21 @@ def _git_commit(cwd: Path) -> str | None:
     except Exception:  # noqa: BLE001
         return None
     return completed.stdout.strip() or None
+
+
+def _replace_with_retries(source: Path, target: Path, *, retries: int = 20, sleep_seconds: float = 0.05) -> None:
+    last_error: OSError | None = None
+    for attempt in range(max(1, int(retries))):
+        try:
+            source.replace(target)
+            return
+        except PermissionError as exc:
+            last_error = exc
+            if attempt + 1 >= max(1, int(retries)):
+                break
+            time.sleep(max(0.0, float(sleep_seconds)))
+    if last_error is not None:
+        raise last_error
 
 
 @dataclass(slots=True)
@@ -164,6 +180,9 @@ class SACLearner:
         self.episode_count = 0
         self.latest_eval_summary: dict[str, Any] | None = None
         self.latest_eval_summary_path: str | None = None
+        self.latest_eval_mode_summaries: dict[str, dict[str, Any]] | None = None
+        self.latest_eval_mode_summary_paths: dict[str, str] | None = None
+        self.latest_eval_mode_run_dirs: dict[str, str] | None = None
         self.latest_checkpoint_path: Path | None = None
         self.last_worker_heartbeat: dict[str, Any] | None = None
         self.desired_actor_version: int | None = None
@@ -201,6 +220,7 @@ class SACLearner:
         self.next_checkpoint_step = max(1, self.config.train.checkpoint_interval_steps)
         self._reschedule_from_counters()
         self._initialize_diagnostics_state()
+        self._record_progress_diagnostics()
         self._write_run_summary()
 
     def attach_worker(
@@ -243,10 +263,25 @@ class SACLearner:
         self.episode_diagnostics_tracker = EpisodeDiagnosticsTracker()
         self.movement_diagnostics_tracker = MovementDiagnosticsTracker()
         self.actor_sync_tracker = ActorSyncTracker(run_start_monotonic=self._run_start_monotonic)
+        self.achieved_utd_tracker = RollingRatioTracker(window_env_steps=1_000)
+        self.achieved_utd_1k: float | None = None
+        self.current_actor_staleness: int | None = None
         self.resource_profile = build_agent_resource_profile(self.agent, self.device)
         if self.detailed_cuda_timing and self.device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats(self.device)
             self._refresh_resource_profile()
+
+    def _record_progress_diagnostics(self) -> None:
+        self.achieved_utd_1k = self.achieved_utd_tracker.record(env_step=self.env_step, learner_step=self.learner_step)
+        self.current_actor_staleness = self.actor_sync_tracker.current_actor_staleness
+        if self.achieved_utd_1k is not None:
+            self.writer.add_scalar("train/achieved_utd_1k", self.achieved_utd_1k, step=self.learner_step)
+        if self.current_actor_staleness is not None:
+            self.writer.add_scalar(
+                "train/current_actor_staleness",
+                float(self.current_actor_staleness),
+                step=self.learner_step,
+            )
 
     def _sync_timing_device(self) -> None:
         if self.detailed_cuda_timing and self.device.type == "cuda" and torch.cuda.is_available():
@@ -328,6 +363,9 @@ class SACLearner:
             "latest_checkpoint_path": None if self.latest_checkpoint_path is None else str(self.latest_checkpoint_path),
             "latest_eval_summary": self.latest_eval_summary,
             "latest_eval_summary_path": self.latest_eval_summary_path,
+            "latest_eval_mode_summaries": self.latest_eval_mode_summaries,
+            "latest_eval_mode_summary_paths": self.latest_eval_mode_summary_paths,
+            "latest_eval_mode_run_dirs": self.latest_eval_mode_run_dirs,
             "eval_in_flight": self.eval_in_flight,
             "pending_eval": self.pending_eval,
             "started_eval": self.started_eval,
@@ -353,6 +391,8 @@ class SACLearner:
             "timestamp": now_timestamp,
             "observation_mode": self.config.observation.mode,
             "primary_metric": self.primary_metric,
+            "achieved_utd_1k": self.achieved_utd_1k,
+            "current_actor_staleness": self.current_actor_staleness,
             "runtime_profile": self._runtime_profile_snapshot(),
             "queue_profile": self._queue_profile_snapshot(),
             "actor_sync_profile": self.actor_sync_tracker.snapshot(),
@@ -371,6 +411,7 @@ class SACLearner:
         self.learner_step = int(payload.get("learner_step", 0))
         self.env_step = int(payload.get("env_step", 0))
         self._reschedule_from_counters()
+        self._record_progress_diagnostics()
 
     def save_checkpoint(self, *, final: bool = False) -> Path:
         step_tag = f"{self.env_step:08d}"
@@ -514,6 +555,7 @@ class SACLearner:
                 if actor_update_seconds > 0.0:
                     self._learner_runtime["actor_update"].record(actor_update_seconds)
                 self.learner_step += 1
+                self._record_progress_diagnostics()
                 self._log_update(update)
             updates += updates_per_block
             self.next_update_step += self.config.train.update_model_interval
@@ -533,6 +575,8 @@ class SACLearner:
                 "episodes": self.eval_episodes,
                 "seed_base": self.config.eval.seed_base,
                 "record_video": self.config.eval.record_video,
+                "modes": list(self.config.eval.modes),
+                "trace_seconds": self.config.eval.trace_seconds,
                 "run_name": f"{self.run_name}_step_{scheduled_step:08d}",
                 "learner_step": self.learner_step,
                 "env_step": scheduled_step,
@@ -547,6 +591,7 @@ class SACLearner:
             "env_step": scheduled_step,
             "learner_step": self.learner_step,
             "episodes": self.eval_episodes,
+            "modes": list(self.config.eval.modes),
             "eval_actor_version": self.applied_actor_version,
             "eval_actor_source_learner_step": self.applied_source_learner_step,
             "scheduled_at": _utc_now(),
@@ -630,10 +675,12 @@ class SACLearner:
             for transition in message.get("transitions", []):
                 self.replay.add(transition)
             self.env_step = max(self.env_step, int(message.get("env_step", self.env_step)))
+            self._record_progress_diagnostics()
             return len(message.get("transitions", []))
         if message_type == "transition":
             self.replay.add(message["transition"])
             self.env_step = max(self.env_step, int(message.get("env_step", self.env_step + 1)))
+            self._record_progress_diagnostics()
             return 1
         if message_type == "episode_summary":
             self.episode_count += 1
@@ -662,6 +709,7 @@ class SACLearner:
             if message.get("control_ready_reason") is not None:
                 self.desired_actor_control_ready_reason = str(message["control_ready_reason"])
             self.actor_sync_tracker.record_desired_seen(message, received_monotonic=time.monotonic())
+            self._record_progress_diagnostics()
             self._write_run_summary()
             return 0
         if message_type == "actor_sync_applied":
@@ -701,6 +749,7 @@ class SACLearner:
                 current_learner_step=self.learner_step,
                 current_env_step=self.env_step,
             )
+            self._record_progress_diagnostics()
             self._write_run_summary()
             return 0
         if message_type == "action_stats":
@@ -732,6 +781,7 @@ class SACLearner:
                 current_learner_step=self.learner_step,
                 current_env_step=self.env_step,
             )
+            self._record_progress_diagnostics()
             self._write_run_summary()
             return 0
         if message_type == "eval_started":
@@ -789,6 +839,7 @@ class SACLearner:
                     current_learner_step=self.learner_step,
                     current_env_step=self.env_step,
                 )
+            self._record_progress_diagnostics()
             self._write_run_summary()
             return 0
         if message_type == "fatal_error":
@@ -838,7 +889,7 @@ class SACLearner:
         control_ready_reason = "trained_updates_available" if ready_for_control else "startup_untrained"
         broadcast_start = time.perf_counter()
         torch.save(self.agent.actor_state_dict_cpu(), temp_path)
-        temp_path.replace(actor_state_path)
+        _replace_with_retries(temp_path, actor_state_path)
         actor_step = self._current_actor_step()
         write_json(
             temp_manifest_path,
@@ -853,7 +904,7 @@ class SACLearner:
                 "control_ready_reason": control_ready_reason,
             },
         )
-        temp_manifest_path.replace(desired_actor_path)
+        _replace_with_retries(temp_manifest_path, desired_actor_path)
         broadcast_duration = time.perf_counter() - broadcast_start
         self._learner_runtime["actor_broadcast"].record(broadcast_duration)
         self.desired_actor_version = self._actor_sync_version
@@ -891,15 +942,51 @@ class SACLearner:
         if payload.env_step < self.latest_eval_step:
             self._learner_runtime["eval_result_handling"].record(time.perf_counter() - handling_start)
             return
+        raw_summary = dict(payload.summary)
+        mode_summaries = {
+            str(mode): dict(summary)
+            for mode, summary in dict(raw_summary.get("eval_mode_summaries", {})).items()
+            if isinstance(summary, Mapping)
+        }
+        primary_summary = (
+            dict(mode_summaries["deterministic"])
+            if "deterministic" in mode_summaries
+            else dict(next(iter(mode_summaries.values())))
+            if mode_summaries
+            else raw_summary
+        )
         self.latest_eval_step = payload.env_step
-        self.latest_eval_summary = dict(payload.summary)
-        self.latest_eval_summary_path = payload.summary_path
+        self.latest_eval_summary = primary_summary
+        self.latest_eval_summary_path = str(
+            dict(raw_summary.get("eval_mode_summary_paths") or {}).get("deterministic", payload.summary_path)
+            if mode_summaries
+            else payload.summary_path
+        )
+        self.latest_eval_mode_summaries = mode_summaries or None
+        self.latest_eval_mode_summary_paths = (
+            {
+                str(mode): str(path)
+                for mode, path in dict(raw_summary.get("eval_mode_summary_paths") or {}).items()
+                if path is not None
+            }
+            or None
+        )
+        self.latest_eval_mode_run_dirs = (
+            {
+                str(mode): str(path)
+                for mode, path in dict(raw_summary.get("eval_mode_run_dirs") or {}).items()
+                if path is not None
+            }
+            or None
+        )
         self.eval_actor_version = (
-            int(payload.summary["eval_actor_version"]) if payload.summary.get("eval_actor_version") is not None else None
+            int(self.latest_eval_summary["eval_actor_version"])
+            if self.latest_eval_summary.get("eval_actor_version") is not None
+            else None
         )
         self.eval_actor_source_learner_step = (
-            int(payload.summary["eval_actor_source_learner_step"])
-            if payload.summary.get("eval_actor_source_learner_step") is not None
+            int(self.latest_eval_summary["eval_actor_source_learner_step"])
+            if self.latest_eval_summary.get("eval_actor_source_learner_step") is not None
             else None
         )
         self.eval_in_flight = False
@@ -909,8 +996,12 @@ class SACLearner:
             "checkpoint_step": payload.checkpoint_step,
             "env_step": payload.env_step,
             "learner_step": payload.learner_step,
-            "summary_path": payload.summary_path,
-            "summary": dict(payload.summary),
+            "summary_path": self.latest_eval_summary_path,
+            "summary": dict(self.latest_eval_summary),
+            "mode_summaries": self.latest_eval_mode_summaries,
+            "mode_summary_paths": self.latest_eval_mode_summary_paths,
+            "mode_run_dirs": self.latest_eval_mode_run_dirs,
+            "deterministic_collapse": raw_summary.get("deterministic_collapse"),
             "eval_actor_version": self.eval_actor_version,
             "eval_actor_source_learner_step": self.eval_actor_source_learner_step,
             "timestamp": payload.timestamp,
@@ -948,7 +1039,7 @@ class SACLearner:
             self.drain_messages(timeout=0.25)
             self.drain_eval_results(timeout=0.0)
             done_event_set = self.worker_done_event.is_set() if self.worker_done_event is not None else False
-            if done_event_set:
+            if done_event_set and not self.eval_in_flight and self.pending_eval is None:
                 break
             if self.worker_process is not None and not self.worker_process.is_alive():
                 break
@@ -1099,6 +1190,9 @@ class REDQLearner(SACLearner):
         self.episode_count = 0
         self.latest_eval_summary: dict[str, Any] | None = None
         self.latest_eval_summary_path: str | None = None
+        self.latest_eval_mode_summaries: dict[str, dict[str, Any]] | None = None
+        self.latest_eval_mode_summary_paths: dict[str, str] | None = None
+        self.latest_eval_mode_run_dirs: dict[str, str] | None = None
         self.latest_checkpoint_path: Path | None = None
         self.last_worker_heartbeat: dict[str, Any] | None = None
         self.desired_actor_version: int | None = None
@@ -1124,6 +1218,9 @@ class REDQLearner(SACLearner):
         self.termination_reason: str | None = None
         self.clean_shutdown: bool | None = None
         self._actor_sync_version = 0
+        self.broadcast_after_actor_update = bool(self.config.train.broadcast_after_actor_update)
+        self.actor_publish_every = int(self.config.train.actor_publish_every)
+        self._last_published_actor_step = 0
         self.worker_exit: dict[str, Any] = {
             "done_event_set": False,
             "exitcode": None,
@@ -1136,6 +1233,7 @@ class REDQLearner(SACLearner):
         self.next_checkpoint_step = max(1, self.config.train.checkpoint_interval_steps)
         self._reschedule_from_counters()
         self._initialize_diagnostics_state()
+        self._record_progress_diagnostics()
         self._write_run_summary()
 
     def load_checkpoint(self, checkpoint_path: str | Path) -> None:
@@ -1145,12 +1243,29 @@ class REDQLearner(SACLearner):
         self.actor_step = int(payload.get("actor_step", 0))
         self.env_step = int(payload.get("env_step", 0))
         self._reschedule_from_counters()
+        self._record_progress_diagnostics()
 
     def _ready_for_control(self) -> bool:
         return self.actor_step > 0
 
     def _current_actor_step(self) -> int | None:
         return self.actor_step
+
+    def broadcast_actor(self, *, force: bool = False) -> None:
+        super().broadcast_actor(force=force)
+        self._last_published_actor_step = self.actor_step
+
+    def _eligible_env_steps(self) -> int:
+        warmup = max(0, int(self.config.train.environment_steps_before_training))
+        return max(0, int(self.env_step - warmup))
+
+    def _target_critic_steps(self) -> int:
+        return int(self._eligible_env_steps() * float(self.config.train.max_training_steps_per_environment_step))
+
+    def _has_training_debt(self) -> bool:
+        if self.replay.size < self.config.train.environment_steps_before_training:
+            return False
+        return self.learner_step < self._target_critic_steps()
 
     def save_checkpoint(self, *, final: bool = False) -> Path:
         step_tag = f"{self.env_step:08d}"
@@ -1218,35 +1333,37 @@ class REDQLearner(SACLearner):
         if self.replay.size < self.config.train.environment_steps_before_training:
             return 0
         actor_updates = 0
-        updates_per_block = max(
-            1,
-            int(round(self.config.train.update_model_interval * self.config.train.max_training_steps_per_environment_step)),
-        )
-        while self.env_step >= self.next_update_step:
-            for _ in range(updates_per_block):
-                self._sync_timing_device()
-                sample_start = time.perf_counter()
-                batch = self.replay.sample(self.config.train.batch_size, device=self.device)
-                self._sync_timing_device()
-                self._learner_runtime["replay_sample"].record(time.perf_counter() - sample_start)
-                self._sync_timing_device()
-                critic_start = time.perf_counter()
-                critic_update = self.agent.update_critics(batch)
-                self._sync_timing_device()
-                self._learner_runtime["critic_update"].record(time.perf_counter() - critic_start)
-                self.learner_step += 1
-                self._log_critic_update(critic_update)
-                self._sync_timing_device()
-                actor_start = time.perf_counter()
-                actor_update = self.agent.maybe_update_actor_and_alpha(batch)
-                self._sync_timing_device()
-                if actor_update is not None:
-                    self._learner_runtime["actor_update"].record(time.perf_counter() - actor_start)
-                if actor_update is not None:
-                    self.actor_step += 1
-                    actor_updates += 1
-                    self._log_actor_update(actor_update)
-            self.next_update_step += self.config.train.update_model_interval
+        max_updates_per_call = max(1, int(self.config.train.update_model_interval))
+        target_critic_steps = self._target_critic_steps()
+        critic_updates = 0
+        while critic_updates < max_updates_per_call and self.learner_step < target_critic_steps:
+            self._sync_timing_device()
+            sample_start = time.perf_counter()
+            batch = self.replay.sample(self.config.train.batch_size, device=self.device)
+            self._sync_timing_device()
+            self._learner_runtime["replay_sample"].record(time.perf_counter() - sample_start)
+            self._sync_timing_device()
+            critic_start = time.perf_counter()
+            critic_update = self.agent.update_critics(batch)
+            self._sync_timing_device()
+            self._learner_runtime["critic_update"].record(time.perf_counter() - critic_start)
+            self.learner_step += 1
+            critic_updates += 1
+            self._record_progress_diagnostics()
+            self._log_critic_update(critic_update)
+            self._sync_timing_device()
+            actor_start = time.perf_counter()
+            actor_update = self.agent.maybe_update_actor_and_alpha(batch)
+            self._sync_timing_device()
+            if actor_update is not None:
+                self._learner_runtime["actor_update"].record(time.perf_counter() - actor_start)
+                self.actor_step += 1
+                actor_updates += 1
+                self._log_actor_update(actor_update)
+                if self.broadcast_after_actor_update and self.actor_step % self.actor_publish_every == 0:
+                    self.broadcast_actor(force=True)
+        if self.broadcast_after_actor_update and actor_updates > 0 and self._last_published_actor_step != self.actor_step:
+            self.broadcast_actor(force=True)
         return actor_updates
 
     def run(self) -> None:
@@ -1262,10 +1379,10 @@ class REDQLearner(SACLearner):
         self.broadcast_actor(force=True)
         try:
             while not self.should_stop():
-                self.drain_messages(timeout=0.25)
+                self.drain_messages(timeout=0.0 if self._has_training_debt() else 0.25)
                 self.drain_eval_results(timeout=0.0)
                 actor_updates = self.maybe_train()
-                if actor_updates > 0:
+                if actor_updates > 0 and not self.broadcast_after_actor_update:
                     self.broadcast_actor(force=True)
                 self.maybe_schedule_eval()
                 self.maybe_checkpoint()

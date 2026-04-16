@@ -4,16 +4,15 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import numpy as np
-import torch
 
-from ..algos.redq import REDQSACAgent
-from ..config import LidarObservationConfig, REDQConfig, SACConfig
 from ..capture import lidar_feature_dim
 from ..train.features import ACTION_DIM, TELEMETRY_DIM
-from .replay import ReplayBuffer
+
+if TYPE_CHECKING:
+    import torch
 
 
 @dataclass(slots=True)
@@ -80,6 +79,39 @@ class QueueAccumulator:
         }
 
 
+@dataclass(slots=True)
+class RollingRatioTracker:
+    window_env_steps: int = 1_000
+    _points: list[tuple[int, int]] = field(default_factory=list)
+
+    def record(self, *, env_step: int, learner_step: int) -> float | None:
+        env = int(env_step)
+        learner = int(learner_step)
+        if self._points and self._points[-1] == (env, learner):
+            return self.current_ratio()
+        self._points.append((env, learner))
+        cutoff = env - max(1, int(self.window_env_steps))
+        while len(self._points) > 1 and self._points[1][0] <= cutoff:
+            self._points.pop(0)
+        return self.current_ratio()
+
+    def current_ratio(self) -> float | None:
+        if len(self._points) < 2:
+            return None
+        start_env, start_learner = self._points[0]
+        end_env, end_learner = self._points[-1]
+        delta_env = end_env - start_env
+        if delta_env <= 0:
+            return None
+        return float((end_learner - start_learner) / delta_env)
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "window_env_steps": int(self.window_env_steps),
+            "current": self.current_ratio(),
+        }
+
+
 class JsonlEventLogger:
     def __init__(self, path: Path | None) -> None:
         self.path = path
@@ -135,6 +167,8 @@ def _count_unique_parameters(modules: Sequence[torch.nn.Module]) -> int:
 
 
 def build_agent_resource_profile(agent: Any, device: torch.device | str) -> dict[str, Any]:
+    import torch
+
     resolved_device = torch.device(device)
     actor = agent.actor
     if hasattr(agent, "critic1"):
@@ -285,6 +319,8 @@ class ActorSyncTracker:
     first_applied_ready_actor_seconds: float | None = None
     first_policy_control_window_seconds: float | None = None
     policy_control_fraction: float | None = None
+    current_actor_staleness: int | None = None
+    current_versions_behind: int | None = None
 
     def record_broadcast(
         self,
@@ -332,7 +368,9 @@ class ActorSyncTracker:
             self.apply_duration_seconds.append(float(payload["apply_duration_seconds"]))
         applied_source_learner_step = payload.get("applied_source_learner_step")
         if applied_source_learner_step is not None:
-            self.learner_step_lag.append(max(0, int(current_learner_step - int(applied_source_learner_step))))
+            staleness = max(0, int(current_learner_step - int(applied_source_learner_step)))
+            self.learner_step_lag.append(staleness)
+            self.current_actor_staleness = staleness
         requested_env_step = payload.get("requested_env_step")
         if requested_env_step is not None:
             self.env_step_lag.append(max(0, int(current_env_step - int(requested_env_step))))
@@ -350,10 +388,14 @@ class ActorSyncTracker:
         desired_version = payload.get("desired_actor_version")
         applied_version = payload.get("applied_actor_version")
         if desired_version is not None and applied_version is not None:
-            self.version_lag.append(max(0, int(desired_version) - int(applied_version)))
+            versions_behind = max(0, int(desired_version) - int(applied_version))
+            self.version_lag.append(versions_behind)
+            self.current_versions_behind = versions_behind
         applied_source_learner_step = payload.get("applied_source_learner_step")
         if applied_source_learner_step is not None:
-            self.learner_step_lag.append(max(0, int(current_learner_step - int(applied_source_learner_step))))
+            staleness = max(0, int(current_learner_step - int(applied_source_learner_step)))
+            self.learner_step_lag.append(staleness)
+            self.current_actor_staleness = staleness
         last_actor_apply_env_step = payload.get("last_actor_apply_env_step")
         if last_actor_apply_env_step is not None:
             self.env_step_lag.append(max(0, int(current_env_step - int(last_actor_apply_env_step))))
@@ -375,6 +417,8 @@ class ActorSyncTracker:
             "time_to_first_applied_ready_actor_seconds": self.first_applied_ready_actor_seconds,
             "time_to_first_policy_control_window_seconds": self.first_policy_control_window_seconds,
             "policy_control_fraction": self.policy_control_fraction,
+            "current_actor_staleness": self.current_actor_staleness,
+            "current_versions_behind": self.current_versions_behind,
         }
 
 
@@ -399,6 +443,8 @@ def build_bottleneck_verdict(
 
 
 def _build_full_replay(*, rng_seed: int, capacity: int, observation_shape: tuple[int, int, int]) -> ReplayBuffer:
+    from .replay import ReplayBuffer
+
     replay = ReplayBuffer(
         mode="full",
         capacity=capacity,
@@ -424,6 +470,8 @@ def _build_full_replay(*, rng_seed: int, capacity: int, observation_shape: tuple
 
 
 def _sync_cuda(device: torch.device) -> None:
+    import torch
+
     if device.type == "cuda" and torch.cuda.is_available():
         torch.cuda.synchronize(device)
 
@@ -438,14 +486,19 @@ def benchmark_redq_sweep(
     rng_seed: int = 12345,
     sweep: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    import torch
+
+    from ..algos.redq import REDQSACAgent
+    from ..config import REDQConfig, SACConfig
+
     resolved_device = torch.device(device)
     replay = _build_full_replay(rng_seed=rng_seed, capacity=max(batch_size * 4, 64), observation_shape=observation_shape)
     batch = replay.sample(batch_size, device=resolved_device)
     sweep_rows = list(sweep) if sweep is not None else [
+        {"n_critics": 10, "m_subset": 2, "share_encoders": True},
+        {"n_critics": 10, "m_subset": 2, "share_encoders": False},
         {"n_critics": 2, "m_subset": 2, "share_encoders": False},
         {"n_critics": 4, "m_subset": 2, "share_encoders": False},
-        {"n_critics": 10, "m_subset": 2, "share_encoders": False},
-        {"n_critics": 10, "m_subset": 2, "share_encoders": True},
     ]
 
     results: list[dict[str, Any]] = []
@@ -519,4 +572,6 @@ def default_benchmark_observation_shape() -> tuple[int, int, int]:
 
 
 def default_lidar_benchmark_dim() -> int:
+    from ..config import LidarObservationConfig
+
     return int(lidar_feature_dim(LidarObservationConfig()))

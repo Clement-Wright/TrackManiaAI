@@ -71,10 +71,9 @@ class TM20AIRtInterface(RealTimeGymInterface):
                 self.config.lidar_observation.window_height,
             )
 
-        self._bridge = BridgeClient(self.config.bridge)
-        self._bridge.start()
-        self._gamepad = GamepadController()
         self._capture = DXCamCapture(self.config.capture, expected_client_size=expected_window_shape)
+        self._bridge = BridgeClient(self.config.bridge)
+        self._gamepad: GamepadController | None = None
         self._preprocessor: FrameStackPreprocessor | None = None
         self._lidar_builder: LidarObservationBuilder | None = None
         if self.observation_mode == "full":
@@ -85,17 +84,26 @@ class TM20AIRtInterface(RealTimeGymInterface):
             prime_frame_count = self.config.lidar_observation.lidar_hist_len
         else:
             raise NotImplementedError(f"Unsupported observation mode: {self.observation_mode!r}")
-        self._reset_manager = ResetManager(
-            client=self._bridge,
-            gamepad=self._gamepad,
-            capture=self._capture,
-            prime_frame_count=prime_frame_count,
-            runtime=self.config.runtime,
-            bridge_config=self.config.bridge,
-        )
+        self._prime_frame_count = prime_frame_count
+        self._reset_manager: ResetManager | None = None
         self._reward_model: TrajectoryProgressReward | None = None
         self._last_frame = None
         self._timing_metrics = InterfaceTimingMetrics()
+
+    def _ensure_runtime_clients(self) -> None:
+        if self._gamepad is None:
+            self._bridge.start()
+            self._gamepad = GamepadController()
+        if self._reset_manager is None:
+            assert self._gamepad is not None
+            self._reset_manager = ResetManager(
+                client=self._bridge,
+                gamepad=self._gamepad,
+                capture=self._capture,
+                prime_frame_count=self._prime_frame_count,
+                runtime=self.config.runtime,
+                bridge_config=self.config.bridge,
+            )
 
     def get_observation_space(self):
         if self.observation_mode == "full":
@@ -126,11 +134,13 @@ class TM20AIRtInterface(RealTimeGymInterface):
         )
 
     def get_default_action(self):
-        return self._gamepad.neutral_action()
+        return GamepadController.neutral_action()
 
     def send_control(self, control):
         if control is None:
             return
+        self._ensure_runtime_clients()
+        assert self._gamepad is not None
         applied = self._gamepad.apply(control)
         if self._lidar_builder is not None:
             self._lidar_builder.observe_action(applied)
@@ -150,6 +160,8 @@ class TM20AIRtInterface(RealTimeGymInterface):
     def reset(self, seed=None, options=None):
         del seed, options
         self._capture.ensure_started()
+        self._ensure_runtime_clients()
+        assert self._reset_manager is not None
         reset_result = self._reset_manager.reset_to_start()
         self._last_frame = reset_result.frame
         reward_model = self._ensure_reward_model(reset_result.frame.map_uid)
@@ -219,6 +231,8 @@ class TM20AIRtInterface(RealTimeGymInterface):
         return self._lidar_builder.append_frame(latest_frame, speed_norm=speed_norm)
 
     def wait(self):
+        self._ensure_runtime_clients()
+        assert self._gamepad is not None
         self._gamepad.apply(self._gamepad.neutral_action())
         time.sleep(self.config.runtime.time_step_duration)
 
@@ -246,6 +260,7 @@ class TM20AIRtInterface(RealTimeGymInterface):
         return context
 
     def close(self) -> None:
-        self._gamepad.close()
+        if self._gamepad is not None:
+            self._gamepad.close()
         self._capture.close()
         self._bridge.close()

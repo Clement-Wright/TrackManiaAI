@@ -175,6 +175,7 @@ class DemoRecorder:
         terminated: bool,
         truncated: bool,
         final_info: Mapping[str, Any],
+        metadata_extra: Mapping[str, Any] | None = None,
     ) -> EpisodeWriteResult:
         if self._current_episode_id is None or self._current_episode_paths is None or self._current_metadata is None:
             raise RuntimeError("start_episode() must be called before finish_episode().")
@@ -205,6 +206,8 @@ class DemoRecorder:
             "nonzero_action_fraction": float(self._current_nonzero_action_steps / max(1, len(self._current_rows))),
             "has_nonzero_actions": bool(self._current_nonzero_action_steps > 0),
         }
+        if metadata_extra is not None:
+            metadata.update(dict(metadata_extra))
         summary = summarize_episode_trace(
             episode_id=self._current_episode_id,
             metadata=metadata,

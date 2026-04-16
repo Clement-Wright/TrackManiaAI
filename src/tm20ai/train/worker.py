@@ -115,6 +115,7 @@ class SACWorker:
         self._last_heartbeat = monotonic()
         self._pending_transitions: list[dict[str, Any]] = []
         self._shutdown_requested = False
+        self._max_env_steps_reached = False
         self._action_stats_interval_steps = 100
         self._desired_actor_version: int | None = None
         self._desired_actor_ready_for_control = False
@@ -350,11 +351,11 @@ class SACWorker:
             observation, info, aux = self._start_training_episode(env)
             if self._should_shutdown():
                 return
-            while not self._should_shutdown():
+            while True:
                 command_drain_start = time.perf_counter()
-                pending_eval = self._drain_commands()
+                pending_eval = self._drain_commands(wait_timeout=0.25 if self._max_env_steps_reached else 0.0)
                 self._worker_runtime["command_drain"].record(time.perf_counter() - command_drain_start)
-                if self._should_shutdown() and pending_eval is None:
+                if (self._should_shutdown() or self._max_env_steps_reached) and pending_eval is None:
                     break
                 if pending_eval is not None:
                     self._flush_pending_transitions(force=True)
@@ -413,18 +414,18 @@ class SACWorker:
                             "summary_path": eval_result.summary_path,
                         },
                     )
-                    if self._should_shutdown():
+                    if self._should_shutdown() or self._max_env_steps_reached:
                         break
                     self._status_mode = "train"
                     self._eval_actor_version = None
                     self._eval_actor_source_learner_step = None
                     self._write_actor_status()
                     observation, info, aux = self._start_training_episode(env)
-                    if self._should_shutdown():
+                    if self._should_shutdown() or self._max_env_steps_reached:
                         break
                     continue
 
-                if self._should_shutdown():
+                if self._should_shutdown() or self._max_env_steps_reached:
                     break
                 raw_action = self._select_action(observation, aux)
                 action = self._execute_training_action(raw_action)
@@ -506,6 +507,10 @@ class SACWorker:
                         }
                     )
                     self._finalize_movement_episode(next_info)
+                    if max_env_steps is not None and self._env_step >= max_env_steps:
+                        self._max_env_steps_reached = True
+                        observation, info, aux = next_observation, next_info, next_aux
+                        continue
                     if self._should_shutdown():
                         observation, info, aux = next_observation, next_info, next_aux
                         break
@@ -516,8 +521,8 @@ class SACWorker:
                     observation, info, aux = next_observation, next_info, next_aux
 
                 if max_env_steps is not None and self._env_step >= max_env_steps:
-                    self._shutdown_requested = True
-                    break
+                    self._max_env_steps_reached = True
+                    continue
         except Exception:  # noqa: BLE001
             self._put_message({"type": "fatal_error", "error": traceback.format_exc()})
             raise
@@ -783,8 +788,44 @@ class SACWorker:
             )
         return payload
 
-    def _drain_commands(self) -> Mapping[str, Any] | None:
+    def _drain_commands(self, *, wait_timeout: float = 0.0) -> Mapping[str, Any] | None:
         pending_eval: Mapping[str, Any] | None = None
+        if wait_timeout > 0.0:
+            try:
+                command = self.command_queue.get(timeout=wait_timeout)
+            except queue.Empty:
+                command = None
+            if command is not None:
+                command_type = str(command.get("type", ""))
+                if command_type == "run_eval":
+                    self._write_worker_event(
+                        "command_received",
+                        {
+                            "command_type": "run_eval",
+                            "run_name": command.get("run_name"),
+                            "learner_step": int(command.get("learner_step", 0)),
+                            "requested_env_step": int(command.get("env_step", self._env_step)),
+                            "episodes": int(command.get("episodes", self.config.eval.episodes)),
+                        },
+                    )
+                    pending_eval = dict(command)
+                elif command_type == "set_actor":
+                    self._write_worker_event(
+                        "command_received",
+                        {
+                            "command_type": "set_actor",
+                            "ignored": True,
+                        },
+                    )
+                elif command_type == "shutdown":
+                    self._write_worker_event(
+                        "command_received",
+                        {
+                            "command_type": "shutdown",
+                            "requested_env_step": self._env_step,
+                        },
+                    )
+                    self._shutdown_requested = True
         while True:
             try:
                 command = self.command_queue.get_nowait()
@@ -820,7 +861,7 @@ class SACWorker:
                     },
                 )
                 self._shutdown_requested = True
-        if self._shutdown_requested:
+        if self._shutdown_requested and pending_eval is None:
             return None
         return pending_eval
 
@@ -1003,26 +1044,94 @@ class SACWorker:
             raise RuntimeError("Worker actor is not initialized for evaluation.")
         from .evaluator import ActorPolicyAdapter, run_policy_episodes_on_env
 
-        policy = ActorPolicyAdapter(self.actor, observation_mode=self.observation_mode, name="checkpoint")
-        return run_policy_episodes_on_env(
-            env=env,
-            config_path=self.config_path,
-            mode="eval",
-            policy=policy,
-            episodes=int(command.get("episodes", self.config.eval.episodes)),
-            seed_base=int(command.get("seed_base", self.config.eval.seed_base)),
-            record_video=bool(command.get("record_video", self.config.eval.record_video)),
-            checkpoint_path=command.get("checkpoint_path"),
-            run_name=None if command.get("run_name") is None else str(command.get("run_name")),
-            summary_extra={
-                "learner_step": int(command.get("learner_step", 0)),
-                "env_step": int(command.get("env_step", self._env_step)),
-                "observation_mode": self.observation_mode,
-                "eval_actor_version": self._eval_actor_version,
-                "eval_actor_source_learner_step": self._eval_actor_source_learner_step,
-            },
-            close_env=False,
-        )
+        raw_modes = command.get("modes", self.config.eval.modes)
+        if isinstance(raw_modes, str):
+            modes = [str(raw_modes)]
+        else:
+            modes = [str(mode) for mode in raw_modes]
+        if not modes:
+            modes = ["deterministic"]
+        episodes = int(command.get("episodes", self.config.eval.episodes))
+        seed_base = int(command.get("seed_base", self.config.eval.seed_base))
+        record_video = bool(command.get("record_video", self.config.eval.record_video))
+        checkpoint_path = command.get("checkpoint_path")
+        base_run_name = None if command.get("run_name") is None else str(command.get("run_name"))
+        trace_seconds = float(command.get("trace_seconds", self.config.eval.trace_seconds))
+
+        mode_results: dict[str, dict[str, Any]] = {}
+        for mode_name in modes:
+            deterministic = mode_name == "deterministic"
+            policy = ActorPolicyAdapter(
+                self.actor,
+                observation_mode=self.observation_mode,
+                name="checkpoint",
+                deterministic=deterministic,
+            )
+            mode_run_name = None if base_run_name is None else f"{base_run_name}_{mode_name}"
+            mode_results[mode_name] = run_policy_episodes_on_env(
+                env=env,
+                config_path=self.config_path,
+                mode="eval",
+                policy=policy,
+                episodes=episodes,
+                seed_base=seed_base,
+                record_video=record_video,
+                checkpoint_path=checkpoint_path,
+                run_name=mode_run_name,
+                eval_mode=mode_name,
+                deterministic=deterministic,
+                trace_seconds=trace_seconds,
+                summary_extra={
+                    "learner_step": int(command.get("learner_step", 0)),
+                    "env_step": int(command.get("env_step", self._env_step)),
+                    "observation_mode": self.observation_mode,
+                    "eval_actor_version": self._eval_actor_version,
+                    "eval_actor_source_learner_step": self._eval_actor_source_learner_step,
+                },
+                close_env=False,
+            )
+
+        primary_mode = "deterministic" if "deterministic" in mode_results else next(iter(mode_results))
+        primary_result = dict(mode_results[primary_mode])
+        mode_summaries = {mode: dict(result["summary"]) for mode, result in mode_results.items()}
+        mode_summary_paths = {mode: str(result["summary_path"]) for mode, result in mode_results.items()}
+        mode_run_dirs = {mode: str(result["run_dir"]) for mode, result in mode_results.items()}
+        deterministic_collapse = None
+        deterministic_summary = mode_summaries.get("deterministic")
+        stochastic_summary = mode_summaries.get("stochastic")
+        if deterministic_summary is not None and stochastic_summary is not None:
+            progress_delta = float(
+                (stochastic_summary.get("mean_final_progress_index") or 0.0)
+                - (deterministic_summary.get("mean_final_progress_index") or 0.0)
+            )
+            completion_delta = float(
+                (stochastic_summary.get("completion_rate") or 0.0)
+                - (deterministic_summary.get("completion_rate") or 0.0)
+            )
+            reward_delta = float(
+                (stochastic_summary.get("mean_episode_reward") or 0.0)
+                - (deterministic_summary.get("mean_episode_reward") or 0.0)
+            )
+            deterministic_collapse = {
+                "deterministic_mode": "deterministic",
+                "stochastic_mode": "stochastic",
+                "progress_delta": progress_delta,
+                "completion_rate_delta": completion_delta,
+                "mean_episode_reward_delta": reward_delta,
+                "meaningfully_outperformed": bool(
+                    progress_delta >= 5.0 or completion_delta >= 0.1 or reward_delta >= 1.0
+                ),
+            }
+        primary_summary = dict(primary_result["summary"])
+        primary_summary["eval_mode_summaries"] = mode_summaries
+        primary_summary["eval_mode_summary_paths"] = mode_summary_paths
+        primary_summary["eval_mode_run_dirs"] = mode_run_dirs
+        if deterministic_collapse is not None:
+            primary_summary["deterministic_collapse"] = deterministic_collapse
+        primary_result["summary"] = primary_summary
+        primary_result["summary_path"] = mode_summary_paths[primary_mode]
+        primary_result["run_dir"] = mode_run_dirs[primary_mode]
+        return primary_result
 
     def _flush_pending_transitions(self, *, force: bool = False) -> None:
         if not self._pending_transitions:

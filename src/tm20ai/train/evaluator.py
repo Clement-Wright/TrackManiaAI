@@ -115,10 +115,18 @@ class ScriptedPolicyAdapter:
 
 
 class ActorPolicyAdapter:
-    def __init__(self, actor: "torch.nn.Module", *, observation_mode: str, name: str = "checkpoint") -> None:
+    def __init__(
+        self,
+        actor: "torch.nn.Module",
+        *,
+        observation_mode: str,
+        name: str = "checkpoint",
+        deterministic: bool = True,
+    ) -> None:
         self.name = name
         self._actor = actor.eval()
         self._observation_mode = observation_mode
+        self._deterministic = bool(deterministic)
         self._features = TelemetryFeatureBuilder() if self._observation_mode == "full" else None
 
     def act(self, observation: np.ndarray, info: Mapping[str, Any]) -> np.ndarray:
@@ -130,22 +138,23 @@ class ActorPolicyAdapter:
             observation_tensor = torch.as_tensor(observation, dtype=torch.float32).unsqueeze(0) / 255.0
             telemetry_tensor = torch.as_tensor(telemetry, dtype=torch.float32).unsqueeze(0)
             with torch.no_grad():
-                action = self._actor.act(observation_tensor, telemetry_tensor, deterministic=True)
+                action = self._actor.act(observation_tensor, telemetry_tensor, deterministic=self._deterministic)
             action_np = clamp_action(action.squeeze(0).cpu().numpy().astype(np.float32))
             self._features.observe_action(action_np, run_id=None if info.get("run_id") is None else str(info.get("run_id")))
             return action_np
         observation_tensor = torch.as_tensor(observation, dtype=torch.float32).unsqueeze(0)
         with torch.no_grad():
-            action = self._actor.act(observation_tensor, deterministic=True)
+            action = self._actor.act(observation_tensor, deterministic=self._deterministic)
         return clamp_action(action.squeeze(0).cpu().numpy().astype(np.float32))
 
 
 class TorchCheckpointPolicyAdapter:
-    def __init__(self, checkpoint_path: str | Path):
+    def __init__(self, checkpoint_path: str | Path, *, deterministic: bool = True):
         import torch
 
         self.name = "checkpoint"
         self.checkpoint_path = Path(checkpoint_path).resolve()
+        self._deterministic = bool(deterministic)
         payload = torch.load(self.checkpoint_path, map_location="cpu")
         self._policy = self._resolve_policy(payload)
 
@@ -171,7 +180,12 @@ class TorchCheckpointPolicyAdapter:
             observation_shape = tuple(payload.get("observation_shape", (81,)))
             actor = LidarActor(observation_dim=int(observation_shape[0]), action_dim=action_dim)
         actor.load_state_dict(actor_state)
-        return ActorPolicyAdapter(actor, observation_mode=observation_mode, name=self.name)
+        return ActorPolicyAdapter(
+            actor,
+            observation_mode=observation_mode,
+            name=self.name,
+            deterministic=self._deterministic,
+        )
 
     def _resolve_policy(self, payload: Any) -> PolicyAdapter | Callable[[np.ndarray, Mapping[str, Any]], Any]:
         if isinstance(payload, Mapping):
@@ -233,6 +247,7 @@ def resolve_policy_adapter(
     fixed_action: np.ndarray | None = None,
     script: str | None = None,
     checkpoint: str | Path | None = None,
+    deterministic: bool = True,
 ) -> PolicyAdapter:
     if policy == "human":
         return KeyboardTeleopPolicy()
@@ -249,8 +264,30 @@ def resolve_policy_adapter(
     if policy == "checkpoint":
         if checkpoint is None:
             raise ValueError("checkpoint policy requires --checkpoint.")
-        return TorchCheckpointPolicyAdapter(checkpoint)
+        return TorchCheckpointPolicyAdapter(checkpoint, deterministic=deterministic)
     raise ValueError(f"Unsupported policy: {policy}")
+
+
+def _build_eval_trace_row(
+    *,
+    step_index: int,
+    action: np.ndarray,
+    info: Mapping[str, Any],
+    reward: float,
+    terminated: bool,
+    truncated: bool,
+) -> dict[str, Any]:
+    return {
+        "step_index": int(step_index),
+        "race_time_ms": int(info.get("race_time_ms", 0) or 0),
+        "throttle": float(action[0]) if action.size > 0 else 0.0,
+        "steer": float(action[1]) if action.size > 1 else 0.0,
+        "speed_kmh": float(info.get("speed_kmh", 0.0) or 0.0),
+        "progress_index": float(info.get("progress_index", 0.0) or 0.0),
+        "reward": float(reward),
+        "terminated": bool(terminated),
+        "truncated": bool(truncated),
+    }
 
 
 def run_policy_episodes_on_env(
@@ -264,6 +301,9 @@ def run_policy_episodes_on_env(
     record_video: bool,
     checkpoint_path: str | Path | None = None,
     run_name: str | None = None,
+    eval_mode: str = "deterministic",
+    deterministic: bool = True,
+    trace_seconds: float = 3.0,
     summary_extra: Mapping[str, Any] | None = None,
     close_env: bool = False,
 ) -> dict[str, Any]:
@@ -273,6 +313,7 @@ def run_policy_episodes_on_env(
     effective_run_name = run_name or f"{mode}_{policy.name}_{timestamp_tag()}"
     run_paths = build_run_artifact_paths(config, mode=mode, run_name=effective_run_name)
     writer = TensorBoardScalarLogger(run_paths.tensorboard_dir)
+    max_trace_steps = max(1, int(round(float(trace_seconds) / max(1.0e-9, float(config.runtime.time_step_duration)))))
 
     try:
         observation, info = env.reset(seed=seed_schedule[0])
@@ -300,6 +341,7 @@ def run_policy_episodes_on_env(
                 run_id=str(info["run_id"]),
                 episode_seed=seed,
             )
+            episode_trace: list[dict[str, Any]] = []
 
             terminated = False
             truncated = False
@@ -307,6 +349,17 @@ def run_policy_episodes_on_env(
                 demo_telemetry = demo_feature_builder.encode(info) if demo_feature_builder is not None else None
                 action = np.asarray(policy.act(observation, info), dtype=np.float32)
                 next_observation, reward, terminated, truncated, next_info = env.step(action)
+                if len(episode_trace) < max_trace_steps:
+                    episode_trace.append(
+                        _build_eval_trace_row(
+                            step_index=len(episode_trace),
+                            action=action,
+                            info=next_info,
+                            reward=reward,
+                            terminated=terminated,
+                            truncated=truncated,
+                        )
+                    )
                 recorder.record_step(
                     observation=next_observation,
                     action=action,
@@ -321,7 +374,17 @@ def run_policy_episodes_on_env(
                         run_id=None if next_info.get("run_id") is None else str(next_info.get("run_id")),
                     )
                 observation, info = next_observation, next_info
-            recorder.finish_episode(terminated=terminated, truncated=truncated, final_info=info)
+            recorder.finish_episode(
+                terminated=terminated,
+                truncated=truncated,
+                final_info=info,
+                metadata_extra={
+                    "eval_mode": eval_mode,
+                    "deterministic_policy": bool(deterministic),
+                    "trace_seconds": float(trace_seconds),
+                    "action_trace": episode_trace,
+                },
+            )
 
         recorder.write_episode_index()
         aggregate = aggregate_episode_summaries(recorder.episode_index_rows, sector_count=config.eval.sector_count)
@@ -335,10 +398,15 @@ def run_policy_episodes_on_env(
             "policy_descriptor": {
                 "name": policy.name,
                 "checkpoint_path": str(Path(checkpoint_path).resolve()) if checkpoint_path is not None else None,
+                "eval_mode": eval_mode,
+                "deterministic": bool(deterministic),
             },
             "seed_schedule": seed_schedule,
             "map_uid": str(info["map_uid"]),
             "observation_mode": config.observation.mode,
+            "eval_mode": eval_mode,
+            "deterministic_policy": bool(deterministic),
+            "trace_seconds": float(trace_seconds),
             **aggregate,
             **action_metrics,
         }
@@ -381,6 +449,9 @@ def run_policy_episodes(
     record_video: bool,
     env_factory: Callable[[str | Path, bool], TM20AIGymEnv] | None = None,
     checkpoint_path: str | Path | None = None,
+    eval_mode: str = "deterministic",
+    deterministic: bool = True,
+    trace_seconds: float = 3.0,
 ) -> dict[str, Any]:
     env_builder = env_factory or (lambda path, benchmark=False: make_env(path, benchmark=benchmark))
     env = env_builder(config_path, False)
@@ -393,5 +464,8 @@ def run_policy_episodes(
         seed_base=seed_base,
         record_video=record_video,
         checkpoint_path=checkpoint_path,
+        eval_mode=eval_mode,
+        deterministic=deterministic,
+        trace_seconds=trace_seconds,
         close_env=True,
     )

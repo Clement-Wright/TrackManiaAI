@@ -48,6 +48,11 @@ def _build_eval_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for entry in summary.get("eval_history", []):
         eval_summary = dict(entry.get("summary", {}))
+        mode_summaries = {
+            str(mode): dict(payload)
+            for mode, payload in dict(entry.get("mode_summaries") or {}).items()
+            if isinstance(payload, dict)
+        }
         rows.append(
             {
                 "env_step": int(entry.get("env_step", eval_summary.get("env_step", 0))),
@@ -57,6 +62,9 @@ def _build_eval_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
                 "completion_rate": float(eval_summary.get("completion_rate", 0.0) or 0.0),
                 "best_reward": eval_summary.get("best_reward"),
                 "summary_path": entry.get("summary_path"),
+                "mode_summaries": mode_summaries,
+                "mode_summary_paths": dict(entry.get("mode_summary_paths") or {}),
+                "deterministic_collapse": entry.get("deterministic_collapse"),
             }
         )
     return rows
@@ -149,10 +157,14 @@ def build_training_report(
         "training_duration_seconds": summary.get("wall_clock_elapsed_seconds"),
         "env_step": int(summary.get("env_step", 0)),
         "learner_step": int(summary.get("learner_step", 0)),
+        "achieved_utd_1k": summary.get("achieved_utd_1k"),
+        "current_actor_staleness": summary.get("current_actor_staleness"),
         "episode_count": int(summary.get("episode_count", 0)),
         "replay_size": int(summary.get("replay_size", 0)),
         "latest_checkpoint_path": summary.get("latest_checkpoint_path"),
         "latest_eval_summary_path": summary.get("latest_eval_summary_path"),
+        "latest_eval_mode_summaries": dict(summary.get("latest_eval_mode_summaries") or {}),
+        "latest_eval_mode_summary_paths": dict(summary.get("latest_eval_mode_summary_paths") or {}),
         "checkpoint_list": checkpoint_rows,
         "replay_growth": replay_growth,
         "eval_history_table": eval_rows,
@@ -309,6 +321,8 @@ def _render_run_report_markdown(report: dict[str, Any]) -> str:
         f"- Primary metric: {report.get('primary_metric')}",
         f"- Env steps: {report['env_step']}",
         f"- Learner steps: {report['learner_step']}",
+        f"- Achieved UTD (1k window): {report.get('achieved_utd_1k')}",
+        f"- Current actor staleness: {report.get('current_actor_staleness')}",
         f"- Replay size: {report['replay_size']}",
         f"- Training duration (s): {report.get('training_duration_seconds')}",
         "",
@@ -324,6 +338,21 @@ def _render_run_report_markdown(report: dict[str, Any]) -> str:
             f"- env_step={row['env_step']} mean_progress={row['mean_final_progress_index']} "
             f"median_progress={row['median_final_progress_index']} completion_rate={row['completion_rate']}"
         )
+        for mode_name, mode_summary in sorted(dict(row.get("mode_summaries", {})).items()):
+            if mode_name == "deterministic":
+                continue
+            lines.append(
+                f"-   {mode_name}: mean_progress={mode_summary.get('mean_final_progress_index')} "
+                f"completion_rate={mode_summary.get('completion_rate')} "
+                f"summary_path={dict(row.get('mode_summary_paths', {})).get(mode_name)}"
+            )
+        collapse = row.get("deterministic_collapse")
+        if isinstance(collapse, dict):
+            lines.append(
+                f"-   deterministic_collapse: meaningfully_outperformed={collapse.get('meaningfully_outperformed')} "
+                f"progress_delta={collapse.get('progress_delta')} "
+                f"completion_rate_delta={collapse.get('completion_rate_delta')}"
+            )
     lines.extend(["", "## Diagnostics"])
     if bottleneck:
         lines.append(f"- Bottleneck verdict: {bottleneck.get('label')}")
@@ -331,12 +360,17 @@ def _render_run_report_markdown(report: dict[str, Any]) -> str:
             lines.append(f"- {key}_seconds={value}")
     if actor_sync_profile:
         lines.append(
+            f"- achieved_utd_1k={report.get('achieved_utd_1k')} "
+            f"current_actor_staleness={report.get('current_actor_staleness')}"
+        )
+        lines.append(
             f"- time_to_first_ready_actor_seconds={actor_sync_profile.get('time_to_first_ready_actor_seconds')} "
             f"time_to_first_applied_ready_actor_seconds={actor_sync_profile.get('time_to_first_applied_ready_actor_seconds')} "
             f"time_to_first_policy_control_window_seconds={actor_sync_profile.get('time_to_first_policy_control_window_seconds')}"
         )
         lines.append(
             f"- policy_control_fraction={actor_sync_profile.get('policy_control_fraction')} "
+            f"current_versions_behind={actor_sync_profile.get('current_versions_behind')} "
             f"applied_lag_p50={dict(actor_sync_profile.get('time_to_applied_seconds', {})).get('p50')} "
             f"applied_lag_p95={dict(actor_sync_profile.get('time_to_applied_seconds', {})).get('p95')}"
         )
