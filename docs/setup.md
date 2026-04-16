@@ -1,47 +1,54 @@
-# Phase 1 Setup
+# Setup
 
-This repo assumes the local machine is the worker machine and the goal is a stable single-process smoke loop, not training.
+This repo assumes:
 
-## One-time manual prep
+- Windows
+- local Trackmania 2020
+- Openplanet
+- one live environment on the same machine as the learner/worker process
 
-1. Install Openplanet for Trackmania 2020.
-2. If needed, install the Microsoft Visual C++ x64 runtime.
-3. Launch Trackmania once after installing Openplanet so `%USERPROFILE%\OpenplanetNext` is created.
-4. Run the repo bootstrap:
+The setup goal is not just "the game launches." The goal is a stable local loop with:
+
+- `TM20AIBridge` loaded in Openplanet
+- `TMRL_GrabData.op` installed for the older smoke harness
+- the Trackmania window sized correctly for the chosen observation mode
+- reward recording and live resets working reliably
+
+## 1. Install prerequisites
+
+1. Install Trackmania 2020.
+2. Install Openplanet.
+3. Launch Trackmania once so `%USERPROFILE%\OpenplanetNext` and `%USERPROFILE%\Documents\Trackmania` exist.
+4. Install any required Microsoft Visual C++ runtime if Openplanet or Python dependencies complain.
+
+## 2. Bootstrap the repo environment
+
+Run:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\bootstrap_phase1.ps1
 ```
 
-5. Copy `%USERPROFILE%\TmrlData\resources\tmrl-test.Map.Gbx` into `%USERPROFILE%\Documents\Trackmania\Maps\My Maps`.
-   The `%USERPROFILE%\Documents\Trackmania` tree is created by the game, so launch Trackmania at least once before this step.
+This script:
 
-## Manual game prep before each smoke run
+- creates the local `.venv`
+- installs Python dependencies
+- installs CUDA-enabled PyTorch
+- runs `python -m tmrl --install`
+- copies `TMRL_GrabData.op` into `%USERPROFILE%\OpenplanetNext\Plugins` when needed
 
-1. Launch the `tmrl-test` map in Trackmania.
-2. Set the game to windowed mode.
-3. Hide the ghost with `g`.
-4. For `TM20LIDAR`, press `3` until the car is hidden and the cockpit view is active.
-5. For `TM20FULL`, press `1` so the default camera is active and the car is visible.
+After bootstrap, copy the TMRL smoke-test map if you want to use the optional smoke harness:
 
-## Smoke commands
-
-Run both smoke passes in order:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\run_phase1_smoke.ps1 -Mode Both
+```text
+%USERPROFILE%\TmrlData\resources\tmrl-test.Map.Gbx
+-> %USERPROFILE%\Documents\Trackmania\Maps\My Maps\
 ```
 
-Run only one variant:
+## 3. Install the custom Openplanet bridge
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\run_phase1_smoke.ps1 -Mode Lidar
-powershell -ExecutionPolicy Bypass -File scripts\run_phase1_smoke.ps1 -Mode Full
-```
+The repo-owned bridge source lives at `openplanet/TM20AIBridge`.
 
-## Phase 2 bridge install
-
-The custom bridge source lives in [openplanet/TM20AIBridge](/C:/Users/clewr/TrackManiaAI/openplanet/TM20AIBridge). The developer install shape is a plugin-root folder under `%USERPROFILE%\OpenplanetNext\Plugins` with `info.toml` and the `.as` files directly under that folder:
+The expected developer install shape is:
 
 ```text
 %USERPROFILE%\OpenplanetNext\Plugins\TM20AIBridge\
@@ -59,48 +66,150 @@ Copy it with:
 if (Test-Path "$env:USERPROFILE\OpenplanetNext\Plugins\TM20AIBridge") {
     Remove-Item "$env:USERPROFILE\OpenplanetNext\Plugins\TM20AIBridge" -Recurse -Force
 }
+New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\OpenplanetNext\Plugins\TM20AIBridge" | Out-Null
 Copy-Item -Path (Join-Path (Resolve-Path openplanet\TM20AIBridge) '*') `
     -Destination "$env:USERPROFILE\OpenplanetNext\Plugins\TM20AIBridge" `
     -Recurse
 ```
 
-After copying:
+Then:
 
-1. Launch Trackmania once so Openplanet scans the source plugin and updates `Openplanet.log`.
-2. If `Openplanet.log` shows `Plugin is not suitable for the current signature mode`, open the Openplanet overlay with `F3` and use `Developer > Reload plugin` against `%USERPROFILE%\OpenplanetNext\Plugins\TM20AIBridge`.
-3. Confirm the bridge log lines show the listeners on `127.0.0.1:9100` and `127.0.0.1:9101`.
-4. Load `tmrl-test` or another road-only test map.
-5. Run the bridge checks:
+1. Launch Trackmania.
+2. Open the Openplanet overlay with `F3`.
+3. If needed, use `Developer > Reload plugin` on `%USERPROFILE%\OpenplanetNext\Plugins\TM20AIBridge`.
+4. Check `Openplanet.log` for bridge startup and compile errors.
+
+The custom bridge should expose:
+
+- telemetry on `127.0.0.1:9100`
+- command RPC on `127.0.0.1:9101`
+
+## 4. Prepare Trackmania for live use
+
+General expectations:
+
+- Use windowed mode.
+- Keep the target map already loaded before running reward recording, demos, eval, or training.
+- Make sure the Trackmania window title matches the configured capture target, which is `"Trackmania"` in the shipped configs.
+
+Full-observation mode:
+
+- expected client rect: `256x128`
+- camera: default visible-car gameplay camera
+- use config: `configs/full_redq.yaml`, `configs/full_redq_diagnostic.yaml`, `configs/full_sac.yaml`, or `configs/full_bc.yaml`
+
+LIDAR mode:
+
+- expected client rect: `958x488`
+- camera: cockpit-style view with the car hidden
+- use config: `configs/lidar_sac.yaml`
+
+Use the helper whenever the client rect drifts:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\force_window_size.py --config configs\full_redq.yaml
+```
+
+## 5. Verify the environment and bridge
+
+Basic environment gate:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\check_environment.py
+```
+
+If you already recorded reward for the current map, also verify that the runtime trajectory exists:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\check_environment.py --require-reward
+```
+
+Bridge diagnostics:
+
+```powershell
 .\.venv\Scripts\python.exe scripts\check_bridge.py --duration 10 --reset-count 3
 ```
 
-For the full Phase 2 acceptance target, use:
+Longer bridge soak:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\check_bridge.py --duration 600 --reset-count 100
 ```
 
-## Troubleshooting
+Optional smoke harness:
 
-- If `OpenplanetNext` does not exist, Openplanet is not installed correctly or Trackmania has not been launched since installation.
-- If `TMRL_GrabData.op` is missing, rerun the bootstrap script. It copies the plugin from `%USERPROFILE%\TmrlData\resources\Plugins` when needed.
-- If `env.reset()` fails with connection errors, open the Openplanet menu with `F3`, reload `TMRL Grab Data`, then retry.
-- If the smoke test reports repeated focus failure, click the Trackmania window once, then rerun the test.
-- If `TM20FULL` is unstable, double-check the default camera and the small `256x128` window size.
-- If `TM20LIDAR` is unstable, double-check cockpit camera and the `958x488` window size.
-- If `scripts/check_environment.py` reports that `TM20AIBridge` is missing from `%USERPROFILE%\OpenplanetNext\Plugins`, recopy the folder so `info.toml` is at `%USERPROFILE%\OpenplanetNext\Plugins\TM20AIBridge\info.toml`.
-- If Openplanet rejects the source plugin at startup with `Plugin is not suitable for the current signature mode`, use `Developer > Reload plugin` from the Openplanet overlay before running the Python checks.
-- If the bridge ports never come up after reload, open `Openplanet.log` and look for `TM20AIBridge` compile or socket errors.
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\run_phase1_smoke.ps1 -Mode Both
+```
 
-## Acceptance bar
+Treat the smoke harness as a prerequisite check, not as the main training interface.
 
-Phase 1 is done only when both `TM20LIDAR` and `TM20FULL`:
+## 6. Reward recording prerequisites
 
-- complete the first reset
-- step for a few seconds at the TMRL default 20 Hz cadence
-- produce observations, reward, and `terminated` or `truncated`
-- complete a second reset without restarting Python
-- pass twice in a row, once on a fresh game launch and once by reusing the running session
+Before running `scripts/record_reward.py`:
+
+- the bridge must already be healthy
+- the car must be on the start line
+- the intended map must remain loaded for the whole lap
+- the Trackmania window must already match the observation mode you will use later
+
+Typical sequence:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\force_window_size.py --config configs\full_redq.yaml
+.\.venv\Scripts\python.exe scripts\check_environment.py
+.\.venv\Scripts\python.exe scripts\record_reward.py --config configs\base.yaml
+```
+
+Reward artifacts are stored under `data/reward/<map_uid>/`.
+
+## 7. Training and eval expectations
+
+For the current full-observation REDQ path:
+
+- use `configs/full_redq.yaml`
+- keep the Trackmania client rect at `256x128`
+- expect scheduled dual-mode evals during training
+- expect training outputs under `artifacts/train/<run-name>/`
+- expect eval outputs under `artifacts/eval/<eval-run-name>/`
+
+For the diagnostic REDQ config:
+
+- use `configs/full_redq_diagnostic.yaml`
+- the artifact root is `.tmp/artifacts/`
+- benchmark and diagnostic scratch output intentionally stays out of the main `artifacts/` tree
+
+## 8. Troubleshooting
+
+- `OpenplanetNext` is missing:
+  Launch Trackmania once after installing Openplanet.
+
+- `TM20AIBridge` is missing or incomplete:
+  Recopy `openplanet/TM20AIBridge` so `info.toml` is at `%USERPROFILE%\OpenplanetNext\Plugins\TM20AIBridge\info.toml`.
+
+- Openplanet says `Plugin is not suitable for the current signature mode`:
+  Open `F3`, then use `Developer > Reload plugin` on the installed `TM20AIBridge` folder.
+
+- Bridge ports never come up:
+  Open `Openplanet.log` and look for `TM20AIBridge` compile, permission, or socket errors.
+
+- `check_environment.py` fails the window-size gate:
+  Run `scripts/force_window_size.py` with the same config you intend to use for demos, eval, or training.
+
+- Reward recording fails immediately:
+  Make sure the car is at the start line and the bridge reports a live `map_uid`.
+
+- Resets are flaky or training stalls after a map change:
+  Reload the target map manually, confirm the bridge is healthy again with `scripts/check_bridge.py`, then restart the Python side.
+
+- Full observation is unstable:
+  Reconfirm the `256x128` client rect, visible-car camera, and that no window is covering the Trackmania client area.
+
+- LIDAR observation is unstable:
+  Reconfirm the `958x488` client rect, cockpit-style view, and hidden car view.
+
+- Video export or ffmpeg-dependent workflows fail:
+  Re-run `scripts/check_environment.py --check-ffmpeg` and put `ffmpeg` on `PATH`.
+
+- The bridge is healthy but training output goes somewhere unexpected:
+  Check `artifacts.root` in the config you launched. The diagnostic REDQ config intentionally uses `.tmp/artifacts`.
