@@ -9,12 +9,15 @@ import torch
 from tm20ai.action_space import ACTION_DIM
 from tm20ai.algos.redq import REDQSACAgent
 from tm20ai.capture import lidar_feature_dim
-from tm20ai.config import ConfigError, LidarObservationConfig, REDQConfig, SACConfig, TM20AIConfig
+from tm20ai.config import ConfigError, LidarObservationConfig, REDQConfig, SACConfig, TM20AIConfig, load_tm20ai_config
 from tm20ai.models.full_actor_critic import FullObservationActor
 from tm20ai.train.diagnostics import benchmark_redq_sweep
 from tm20ai.train.evaluator import resolve_policy_adapter
 from tm20ai.train.features import TELEMETRY_DIM
 from tm20ai.train.replay import ReplayBuffer
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _build_full_replay(*, rng_seed: int) -> ReplayBuffer:
@@ -139,6 +142,22 @@ def test_tm20ai_config_parses_redq_block_and_normalizes_algorithm() -> None:
 def test_tm20ai_config_rejects_invalid_redq_settings(payload, match: str) -> None:
     with pytest.raises(ConfigError, match=match):
         TM20AIConfig.from_mapping(payload)
+
+
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "full_redq.yaml",
+        "full_redq_diagnostic.yaml",
+    ],
+)
+def test_shipped_redq_configs_use_4_critic_shared_encoder_baseline(config_name: str) -> None:
+    config = load_tm20ai_config(ROOT / "configs" / config_name)
+
+    assert config.train.algorithm == "redq"
+    assert config.redq.n_critics == 4
+    assert config.redq.m_subset == 2
+    assert config.redq.share_encoders is True
 
 
 def test_redq_agent_update_smoke_for_full() -> None:
@@ -322,3 +341,21 @@ def test_benchmark_redq_sweep_reports_resource_and_timing_sections() -> None:
     assert row["resource_profile"]["n_critics"] == 4
     assert row["resource_profile"]["unique_critic_encoder_parameter_count"] > 0
     assert row["critic_updates_per_second"] > 0.0
+
+
+def test_benchmark_redq_sweep_defaults_prioritize_4_critic_shared_encoder_baseline() -> None:
+    result = benchmark_redq_sweep(
+        device=torch.device("cpu"),
+        batch_size=4,
+        warmup_updates=0,
+        measured_updates=1,
+    )
+
+    assert result["results"]
+    assert result["results"][0]["n_critics"] == 4
+    assert result["results"][0]["m_subset"] == 2
+    assert result["results"][0]["share_encoders"] is True
+    assert any(
+        row["n_critics"] == 10 and row["m_subset"] == 2 and row["share_encoders"] is True
+        for row in result["results"]
+    )

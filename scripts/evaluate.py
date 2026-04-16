@@ -13,6 +13,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from tm20ai.action_space import ACTION_DIM, LEGACY_ACTION_DIM, clamp_action
 from tm20ai.config import load_tm20ai_config
 from tm20ai.train.evaluator import resolve_policy_adapter, run_policy_episodes
 
@@ -23,18 +24,24 @@ def log(message: str) -> None:
 
 def parse_action(value: str) -> np.ndarray:
     parts = [part.strip() for part in value.split(",")]
-    if len(parts) != 3:
-        raise ValueError("Fixed action must have exactly 3 comma-separated values.")
-    return np.asarray([float(part) for part in parts], dtype=np.float32)
+    if len(parts) not in {ACTION_DIM, LEGACY_ACTION_DIM}:
+        raise ValueError(
+            "Fixed action must have either 2 values (throttle,steer) or 3 legacy values (gas,brake,steer)."
+        )
+    return clamp_action(np.asarray([float(part) for part in parts], dtype=np.float32))
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run deterministic evaluation episodes against the custom env.")
-    parser.add_argument("--config", default=str(ROOT / "configs" / "full_sac.yaml"))
+    parser = argparse.ArgumentParser(description="Run evaluation episodes against the custom env or a checkpoint policy.")
+    parser.add_argument("--config", default=str(ROOT / "configs" / "full_redq.yaml"))
     parser.add_argument("--episodes", type=int, default=None)
     parser.add_argument("--seed-base", type=int, default=None)
     parser.add_argument("--policy", choices=("zero", "fixed", "scripted", "checkpoint"), default="zero")
-    parser.add_argument("--fixed-action", default="0.0,0.0,0.0")
+    parser.add_argument(
+        "--fixed-action",
+        default="0.0,0.0",
+        help="Fixed action as throttle,steer. Legacy gas,brake,steer input is also accepted.",
+    )
     parser.add_argument("--script", default=None, help="Scripted policy in 'module:attr' or 'path.py:attr' form.")
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--record-video", action="store_true")

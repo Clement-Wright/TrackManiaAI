@@ -495,10 +495,10 @@ def benchmark_redq_sweep(
     replay = _build_full_replay(rng_seed=rng_seed, capacity=max(batch_size * 4, 64), observation_shape=observation_shape)
     batch = replay.sample(batch_size, device=resolved_device)
     sweep_rows = list(sweep) if sweep is not None else [
+        {"n_critics": 4, "m_subset": 2, "share_encoders": True},
         {"n_critics": 10, "m_subset": 2, "share_encoders": True},
-        {"n_critics": 10, "m_subset": 2, "share_encoders": False},
-        {"n_critics": 2, "m_subset": 2, "share_encoders": False},
         {"n_critics": 4, "m_subset": 2, "share_encoders": False},
+        {"n_critics": 10, "m_subset": 2, "share_encoders": False},
     ]
 
     results: list[dict[str, Any]] = []

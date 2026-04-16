@@ -40,13 +40,18 @@ def _parse_bool_list(value: str) -> list[bool]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Benchmark REDQ learner-side critic ensembles and shared encoders.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Benchmark REDQ learner-side critic ensembles and shared encoders. "
+            "The default sweep starts with the 4-critic shared-encoder baseline and keeps a 10-critic comparison row."
+        )
+    )
     parser.add_argument("--config", default=str(ROOT / "configs" / "full_redq_diagnostic.yaml"))
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--warmup-updates", type=int, default=2)
     parser.add_argument("--measured-updates", type=int, default=6)
-    parser.add_argument("--n-critics", default="2,4,10")
+    parser.add_argument("--n-critics", default="4,10")
     parser.add_argument("--m-subset", default="2")
     parser.add_argument("--share-encoders", default="true,false")
     parser.add_argument("--artifact-dir", default=None)

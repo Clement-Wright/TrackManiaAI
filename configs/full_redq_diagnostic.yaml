@@ -107,7 +107,7 @@ sac:
   target_entropy: -2.0
 
 redq:
-  n_critics: 10
+  n_critics: 4
   m_subset: 2
   q_updates_per_policy_update: 5
   share_encoders: true

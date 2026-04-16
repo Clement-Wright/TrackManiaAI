@@ -72,7 +72,7 @@ def force_client_rect(hwnd: int, *, width: int, height: int, retries: int = 10) 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Force the Trackmania window client rect to the configured size.")
-    parser.add_argument("--config", default=str(ROOT / "configs" / "full_sac.yaml"))
+    parser.add_argument("--config", default=str(ROOT / "configs" / "full_redq.yaml"))
     parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--height", type=int, default=None)
     parser.add_argument("--retries", type=int, default=10)
