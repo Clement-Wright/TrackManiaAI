@@ -6,7 +6,7 @@ import torch
 from tm20ai.capture import lidar_feature_dim
 from tm20ai.config import LidarObservationConfig
 from tm20ai.train.features import ACTION_DIM, TELEMETRY_DIM
-from tm20ai.train.replay import ReplayBuffer
+from tm20ai.train.replay import BalancedReplayBuffer, ReplayBuffer
 
 
 def make_full_transition(step: int) -> dict[str, object]:
@@ -92,3 +92,40 @@ def test_lidar_replay_buffer_preserves_vector_observations() -> None:
     assert sample.done.shape == (2, 1)
     assert sample.obs.dtype == torch.float32
     assert float(sample.obs.max().item()) <= 0.3
+
+
+def test_balanced_replay_buffer_samples_offline_and_online_sources() -> None:
+    online = ReplayBuffer(
+        mode="full",
+        capacity=8,
+        observation_shape=(4, 64, 64),
+        telemetry_dim=TELEMETRY_DIM,
+        rng_seed=1,
+    )
+    offline = ReplayBuffer(
+        mode="full",
+        capacity=8,
+        observation_shape=(4, 64, 64),
+        telemetry_dim=TELEMETRY_DIM,
+        rng_seed=2,
+    )
+    balanced = BalancedReplayBuffer(
+        online=online,
+        offline=offline,
+        offline_initial_fraction=0.75,
+        offline_final_fraction=0.25,
+        decay_env_steps=100,
+        rng_seed=3,
+    )
+    for step in range(4):
+        balanced.add(make_full_transition(step))
+        balanced.add_offline(make_full_transition(step + 10))
+
+    balanced.set_progress(env_step=0)
+    sample = balanced.sample(4, device=torch.device("cpu"))
+
+    assert sample.source is not None
+    assert int((sample.source == 1).sum().item()) == 3
+    assert int((sample.source == 0).sum().item()) == 1
+    assert balanced.last_sample_profile["offline_batch_size"] == 3
+    assert balanced.last_sample_profile["online_batch_size"] == 1

@@ -16,7 +16,7 @@ from ..data.parquet_writer import build_run_artifact_paths, sha256_file, timesta
 from ..env import TM20AIGymEnv, make_env
 from ..env.trajectory import load_runtime_trajectory, runtime_trajectory_path_for_map
 from .features import TELEMETRY_DIM, TelemetryFeatureBuilder
-from .metrics import TensorBoardScalarLogger, aggregate_episode_summaries
+from .metrics import TensorBoardScalarLogger, aggregate_episode_summaries, time_to_progress_thresholds
 
 if TYPE_CHECKING:
     import torch
@@ -122,12 +122,56 @@ class ActorPolicyAdapter:
         observation_mode: str,
         name: str = "checkpoint",
         deterministic: bool = True,
+        extraction_mode: str | None = None,
+        temperature: float = 1.0,
+        best_of_k: int = 1,
     ) -> None:
         self.name = name
         self._actor = actor.eval()
         self._observation_mode = observation_mode
         self._deterministic = bool(deterministic)
+        self._extraction_mode = extraction_mode or ("deterministic_mean" if deterministic else "stochastic")
+        self._temperature = max(1.0e-6, float(temperature))
+        self._best_of_k = max(1, int(best_of_k))
         self._features = TelemetryFeatureBuilder() if self._observation_mode == "full" else None
+
+    def _act_tensor(self, observation_tensor: "torch.Tensor", telemetry_tensor: "torch.Tensor | None") -> "torch.Tensor":
+        import torch
+        from torch.distributions import Normal
+
+        if self._extraction_mode in {"deterministic", "deterministic_mean"}:
+            if self._observation_mode == "full":
+                assert telemetry_tensor is not None
+                return self._actor.act(observation_tensor, telemetry_tensor, deterministic=True)
+            return self._actor.act(observation_tensor, deterministic=True)
+        if self._extraction_mode == "clipped_mean":
+            if self._observation_mode == "full":
+                assert telemetry_tensor is not None
+                mean, _log_std = self._actor.forward(observation_tensor, telemetry_tensor)
+            else:
+                mean, _log_std = self._actor.forward(observation_tensor)
+            return torch.tanh(torch.clamp(mean, min=-2.0, max=2.0))
+
+        if self._observation_mode == "full":
+            assert telemetry_tensor is not None
+            mean, log_std = self._actor.forward(observation_tensor, telemetry_tensor)
+        else:
+            mean, log_std = self._actor.forward(observation_tensor)
+        std = log_std.exp() * self._temperature
+        distribution = Normal(mean, std)
+        sample_count = self._best_of_k if self._extraction_mode == "sample_best_of_k" else 1
+        samples = []
+        for _ in range(sample_count):
+            samples.append(torch.tanh(distribution.rsample()))
+        stacked = torch.stack(samples, dim=0)
+        if sample_count == 1:
+            return stacked[0]
+        throttle = stacked[..., 0]
+        steer_penalty = torch.abs(stacked[..., 1]) if stacked.shape[-1] > 1 else torch.zeros_like(throttle)
+        score = throttle - 0.2 * steer_penalty
+        best_indices = score.argmax(dim=0)
+        batch_indices = torch.arange(stacked.shape[1], device=stacked.device)
+        return stacked[best_indices, batch_indices]
 
     def act(self, observation: np.ndarray, info: Mapping[str, Any]) -> np.ndarray:
         import torch
@@ -138,23 +182,34 @@ class ActorPolicyAdapter:
             observation_tensor = torch.as_tensor(observation, dtype=torch.float32).unsqueeze(0) / 255.0
             telemetry_tensor = torch.as_tensor(telemetry, dtype=torch.float32).unsqueeze(0)
             with torch.no_grad():
-                action = self._actor.act(observation_tensor, telemetry_tensor, deterministic=self._deterministic)
+                action = self._act_tensor(observation_tensor, telemetry_tensor)
             action_np = clamp_action(action.squeeze(0).cpu().numpy().astype(np.float32))
             self._features.observe_action(action_np, run_id=None if info.get("run_id") is None else str(info.get("run_id")))
             return action_np
         observation_tensor = torch.as_tensor(observation, dtype=torch.float32).unsqueeze(0)
         with torch.no_grad():
-            action = self._actor.act(observation_tensor, deterministic=self._deterministic)
+            action = self._act_tensor(observation_tensor, None)
         return clamp_action(action.squeeze(0).cpu().numpy().astype(np.float32))
 
 
 class TorchCheckpointPolicyAdapter:
-    def __init__(self, checkpoint_path: str | Path, *, deterministic: bool = True):
+    def __init__(
+        self,
+        checkpoint_path: str | Path,
+        *,
+        deterministic: bool = True,
+        extraction_mode: str | None = None,
+        temperature: float = 1.0,
+        best_of_k: int = 1,
+    ):
         import torch
 
         self.name = "checkpoint"
         self.checkpoint_path = Path(checkpoint_path).resolve()
         self._deterministic = bool(deterministic)
+        self._extraction_mode = extraction_mode or ("deterministic_mean" if deterministic else "stochastic")
+        self._temperature = float(temperature)
+        self._best_of_k = int(best_of_k)
         payload = torch.load(self.checkpoint_path, map_location="cpu")
         self._policy = self._resolve_policy(payload)
 
@@ -185,6 +240,9 @@ class TorchCheckpointPolicyAdapter:
             observation_mode=observation_mode,
             name=self.name,
             deterministic=self._deterministic,
+            extraction_mode=self._extraction_mode,
+            temperature=self._temperature,
+            best_of_k=self._best_of_k,
         )
 
     def _resolve_policy(self, payload: Any) -> PolicyAdapter | Callable[[np.ndarray, Mapping[str, Any]], Any]:
@@ -248,6 +306,9 @@ def resolve_policy_adapter(
     script: str | None = None,
     checkpoint: str | Path | None = None,
     deterministic: bool = True,
+    extraction_mode: str | None = None,
+    temperature: float = 1.0,
+    best_of_k: int = 1,
 ) -> PolicyAdapter:
     if policy == "human":
         return KeyboardTeleopPolicy()
@@ -264,7 +325,13 @@ def resolve_policy_adapter(
     if policy == "checkpoint":
         if checkpoint is None:
             raise ValueError("checkpoint policy requires --checkpoint.")
-        return TorchCheckpointPolicyAdapter(checkpoint, deterministic=deterministic)
+        return TorchCheckpointPolicyAdapter(
+            checkpoint,
+            deterministic=deterministic,
+            extraction_mode=extraction_mode,
+            temperature=temperature,
+            best_of_k=best_of_k,
+        )
     raise ValueError(f"Unsupported policy: {policy}")
 
 
@@ -304,6 +371,9 @@ def run_policy_episodes_on_env(
     eval_mode: str = "deterministic",
     deterministic: bool = True,
     trace_seconds: float = 3.0,
+    extraction_mode: str | None = None,
+    temperature: float = 1.0,
+    best_of_k: int = 1,
     summary_extra: Mapping[str, Any] | None = None,
     close_env: bool = False,
 ) -> dict[str, Any]:
@@ -316,6 +386,9 @@ def run_policy_episodes_on_env(
     max_trace_steps = max(1, int(round(float(trace_seconds) / max(1.0e-9, float(config.runtime.time_step_duration)))))
 
     try:
+        interface = getattr(env, "interface", None)
+        if interface is not None and hasattr(interface, "bootstrap_capture"):
+            interface.bootstrap_capture()
         observation, info = env.reset(seed=seed_schedule[0])
         trajectory_path = runtime_trajectory_path_for_map(str(info["map_uid"]), config.reward.spacing_meters)
         trajectory = load_runtime_trajectory(trajectory_path)
@@ -379,15 +452,22 @@ def run_policy_episodes_on_env(
                 truncated=truncated,
                 final_info=info,
                 metadata_extra={
-                    "eval_mode": eval_mode,
-                    "deterministic_policy": bool(deterministic),
-                    "trace_seconds": float(trace_seconds),
-                    "action_trace": episode_trace,
-                },
+                "eval_mode": eval_mode,
+                "deterministic_policy": bool(deterministic),
+                "extraction_mode": extraction_mode or ("deterministic_mean" if deterministic else "stochastic"),
+                "temperature": float(temperature),
+                "best_of_k": int(best_of_k),
+                "trace_seconds": float(trace_seconds),
+                "action_trace": episode_trace,
+            },
             )
 
         recorder.write_episode_index()
         aggregate = aggregate_episode_summaries(recorder.episode_index_rows, sector_count=config.eval.sector_count)
+        aggregate["time_to_progress_thresholds"] = time_to_progress_thresholds(
+            recorder.episode_index_rows,
+            thresholds=config.metrics.progress_thresholds,
+        )
         action_metrics = recorder.run_action_metrics()
         summary = {
             "mode": mode,
@@ -400,6 +480,9 @@ def run_policy_episodes_on_env(
                 "checkpoint_path": str(Path(checkpoint_path).resolve()) if checkpoint_path is not None else None,
                 "eval_mode": eval_mode,
                 "deterministic": bool(deterministic),
+                "extraction_mode": extraction_mode or ("deterministic_mean" if deterministic else "stochastic"),
+                "temperature": float(temperature),
+                "best_of_k": int(best_of_k),
             },
             "seed_schedule": seed_schedule,
             "map_uid": str(info["map_uid"]),
@@ -407,6 +490,7 @@ def run_policy_episodes_on_env(
             "eval_mode": eval_mode,
             "deterministic_policy": bool(deterministic),
             "trace_seconds": float(trace_seconds),
+            "metric_version": config.metrics.metric_version,
             **aggregate,
             **action_metrics,
         }
@@ -449,9 +533,14 @@ def run_policy_episodes(
     record_video: bool,
     env_factory: Callable[[str | Path, bool], TM20AIGymEnv] | None = None,
     checkpoint_path: str | Path | None = None,
+    run_name: str | None = None,
     eval_mode: str = "deterministic",
     deterministic: bool = True,
     trace_seconds: float = 3.0,
+    extraction_mode: str | None = None,
+    temperature: float = 1.0,
+    best_of_k: int = 1,
+    summary_extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     env_builder = env_factory or (lambda path, benchmark=False: make_env(path, benchmark=benchmark))
     env = env_builder(config_path, False)
@@ -464,8 +553,13 @@ def run_policy_episodes(
         seed_base=seed_base,
         record_video=record_video,
         checkpoint_path=checkpoint_path,
+        run_name=run_name,
         eval_mode=eval_mode,
         deterministic=deterministic,
         trace_seconds=trace_seconds,
+        extraction_mode=extraction_mode,
+        temperature=temperature,
+        best_of_k=best_of_k,
+        summary_extra=summary_extra,
         close_env=True,
     )

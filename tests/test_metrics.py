@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from tm20ai.train.metrics import ActiveStepBenchmark
+from tm20ai.train.metrics import ActiveStepBenchmark, mode_comparison_metrics
 
 
 def test_active_step_benchmark_excludes_reset_time_from_drift() -> None:
@@ -54,3 +54,24 @@ def test_active_step_benchmark_report_has_frozen_keys() -> None:
         "rtgym_benchmarks",
     }
     assert expected.issubset(report.keys())
+
+
+def test_mode_comparison_metrics_compute_determinism_conversion_score() -> None:
+    metrics = mode_comparison_metrics(
+        {
+            "deterministic": {
+                "mean_final_progress_index": 50.0,
+                "completion_rate": 0.25,
+                "median_final_progress_index": 40.0,
+            },
+            "stochastic": {
+                "mean_final_progress_index": 100.0,
+                "completion_rate": 0.5,
+                "median_final_progress_index": 90.0,
+            },
+        }
+    )
+
+    assert metrics["determinism_conversion_score"] == 0.5
+    assert metrics["deterministic_stochastic_progress_gap"] == -50.0
+    assert metrics["deterministic_stochastic_completion_gap"] == -0.25

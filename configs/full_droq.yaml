@@ -69,20 +69,16 @@ reward:
   max_stray: 100.0
 
 eval:
-  episodes: 5
+  episodes: 20
   seed_base: 12345
   sector_count: 10
   record_video: false
   video_fps: 20
   modes: ["deterministic", "stochastic"]
   trace_seconds: 3.0
-  final_checkpoint_eval: true
-  extraction_modes: ["deterministic_mean", "stochastic", "clipped_mean", "sample_best_of_k"]
-  temperature_sweep: [0.5, 1.0, 1.5]
-  best_of_k: 8
 
 train:
-  algorithm: redq
+  algorithm: droq
   seed: 12345
   memory_size: 1000000
   batch_size: 256
@@ -90,8 +86,8 @@ train:
   max_training_steps_per_environment_step: 8.0
   update_model_interval: 8
   update_buffer_interval: 8
-  eval_interval_steps: 2500
-  checkpoint_interval_steps: 2500
+  eval_interval_steps: 5000
+  checkpoint_interval_steps: 5000
   queue_capacity: 8192
   max_env_steps: null
   cuda_training: true
@@ -116,53 +112,21 @@ redq:
   q_updates_per_policy_update: 5
   share_encoders: true
 
+droq:
+  n_critics: 2
+  m_subset: 2
+  q_updates_per_policy_update: 5
+  share_encoders: true
+  dropout_probability: 0.01
+
+crossq:
+  share_encoders: false
+
 bc:
   epochs: 20
   learning_rate: 3.0e-4
   weight_decay: 0.0
   validation_fraction: 0.2
 
-ghosts:
-  enabled: false
-  root: "data/ghosts"
-  bundle_manifest: null
-  leaderboard_length: 100
-  group_uid: "Personal_Best"
-  only_world: true
-  default_bands: ["1-10", "11-30", "31-60", "61-100"]
-  max_representatives_per_band: 5
-  line_switch_hysteresis: 5
-
-offline_pretrain:
-  enabled: false
-  strategy: "bc_redq_awac"
-  epochs: 5
-  gradient_steps: 10000
-  batch_size: 256
-  bc_weight: 1.0
-  awac_lambda: 1.0
-  cql_alpha: 0.0
-  require_actions: true
-  seed_replay_buffer: true
-
-balanced_replay:
-  enabled: false
-  offline_initial_fraction: 0.75
-  offline_final_fraction: 0.10
-  decay_env_steps: 50000
-
-elite_archive:
-  enabled: false
-  root: "data/elite_archive"
-  max_entries: 500
-  novelty_bonus: 0.0
-  min_progress_improvement: 25.0
-
-metrics:
-  metric_version: "progress_v1"
-  enable_plts: false
-  ghost_bundle_root: null
-  progress_thresholds: [50, 100, 200, 400, 800, 1200, 1600, 2000]
-
 artifacts:
-  root: ".tmp/artifacts"
+  root: "artifacts"

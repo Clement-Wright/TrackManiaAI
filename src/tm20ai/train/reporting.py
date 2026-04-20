@@ -60,11 +60,36 @@ def _build_eval_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
                 "mean_final_progress_index": float(eval_summary.get("mean_final_progress_index", 0.0) or 0.0),
                 "median_final_progress_index": eval_summary.get("median_final_progress_index"),
                 "completion_rate": float(eval_summary.get("completion_rate", 0.0) or 0.0),
+                "determinism_conversion_score": eval_summary.get("determinism_conversion_score"),
+                "deterministic_stochastic_progress_gap": eval_summary.get("deterministic_stochastic_progress_gap"),
+                "deterministic_stochastic_completion_gap": eval_summary.get("deterministic_stochastic_completion_gap"),
                 "best_reward": eval_summary.get("best_reward"),
                 "summary_path": entry.get("summary_path"),
                 "mode_summaries": mode_summaries,
                 "mode_summary_paths": dict(entry.get("mode_summary_paths") or {}),
                 "deterministic_collapse": entry.get("deterministic_collapse"),
+                "eval_provenance_mode": entry.get("eval_provenance_mode", eval_summary.get("eval_provenance_mode")),
+                "eval_checkpoint_path": entry.get("eval_checkpoint_path", eval_summary.get("eval_checkpoint_path")),
+                "eval_checkpoint_sha256": entry.get("eval_checkpoint_sha256", eval_summary.get("eval_checkpoint_sha256")),
+                "eval_checkpoint_env_step": entry.get("eval_checkpoint_env_step", eval_summary.get("eval_checkpoint_env_step")),
+                "eval_checkpoint_learner_step": entry.get(
+                    "eval_checkpoint_learner_step",
+                    eval_summary.get("eval_checkpoint_learner_step"),
+                ),
+                "eval_checkpoint_actor_step": entry.get(
+                    "eval_checkpoint_actor_step",
+                    eval_summary.get("eval_checkpoint_actor_step"),
+                ),
+                "scheduled_actor_version": entry.get("scheduled_actor_version", eval_summary.get("scheduled_actor_version")),
+                "applied_actor_version": entry.get("applied_actor_version", eval_summary.get("applied_actor_version")),
+                "applied_actor_source_learner_step": entry.get(
+                    "applied_actor_source_learner_step",
+                    eval_summary.get("applied_actor_source_learner_step"),
+                ),
+                "worker_env_step_at_eval_start": entry.get(
+                    "worker_env_step_at_eval_start",
+                    eval_summary.get("worker_env_step_at_eval_start"),
+                ),
             }
         )
     return rows
@@ -129,6 +154,11 @@ def build_training_report(
                 "final": True,
             }
         )
+    best_deterministic_eval = max(
+        eval_rows,
+        key=lambda row: float(row.get("mean_final_progress_index", 0.0) or 0.0),
+        default=None,
+    )
 
     failure_notes: list[str] = []
     termination_reason = summary.get("termination_reason")
@@ -146,7 +176,9 @@ def build_training_report(
         "config_path": summary.get("config_path"),
         "config_sha256": None if config_path is None or not config_path.exists() else sha256_file(config_path),
         "observation_mode": summary.get("observation_mode"),
+        "algorithm": summary.get("algorithm"),
         "primary_metric": summary.get("primary_metric", "mean_final_progress_index"),
+        "metric_version": summary.get("metric_version"),
         "init_mode": summary.get("init_mode", "scratch"),
         "bc_checkpoint_path": summary.get("bc_checkpoint_path"),
         "demo_root": summary.get("demo_root"),
@@ -158,6 +190,7 @@ def build_training_report(
         "env_step": int(summary.get("env_step", 0)),
         "learner_step": int(summary.get("learner_step", 0)),
         "achieved_utd_1k": summary.get("achieved_utd_1k"),
+        "cumulative_utd": summary.get("cumulative_utd"),
         "current_actor_staleness": summary.get("current_actor_staleness"),
         "episode_count": int(summary.get("episode_count", 0)),
         "replay_size": int(summary.get("replay_size", 0)),
@@ -168,6 +201,7 @@ def build_training_report(
         "checkpoint_list": checkpoint_rows,
         "replay_growth": replay_growth,
         "eval_history_table": eval_rows,
+        "best_deterministic_eval": best_deterministic_eval,
         "best_progress_over_time": [
             {"env_step": row["env_step"], "mean_final_progress_index": row["mean_final_progress_index"]}
             for row in eval_rows
@@ -317,11 +351,13 @@ def _render_run_report_markdown(report: dict[str, Any]) -> str:
         "",
         "## Summary",
         f"- Observation mode: {report['observation_mode']}",
+        f"- Algorithm: {report.get('algorithm')}",
         f"- Init mode: {report['init_mode']}",
         f"- Primary metric: {report.get('primary_metric')}",
         f"- Env steps: {report['env_step']}",
         f"- Learner steps: {report['learner_step']}",
         f"- Achieved UTD (1k window): {report.get('achieved_utd_1k')}",
+        f"- Cumulative UTD: {report.get('cumulative_utd')}",
         f"- Current actor staleness: {report.get('current_actor_staleness')}",
         f"- Replay size: {report['replay_size']}",
         f"- Training duration (s): {report.get('training_duration_seconds')}",
@@ -336,8 +372,16 @@ def _render_run_report_markdown(report: dict[str, Any]) -> str:
     for row in report.get("eval_history_table", []):
         lines.append(
             f"- env_step={row['env_step']} mean_progress={row['mean_final_progress_index']} "
-            f"median_progress={row['median_final_progress_index']} completion_rate={row['completion_rate']}"
+            f"median_progress={row['median_final_progress_index']} completion_rate={row['completion_rate']} "
+            f"dcs={row.get('determinism_conversion_score')}"
         )
+        if row.get("eval_checkpoint_path") is not None:
+            lines.append(
+                f"-   provenance: mode={row.get('eval_provenance_mode')} "
+                f"checkpoint={row.get('eval_checkpoint_path')} "
+                f"checkpoint_env_step={row.get('eval_checkpoint_env_step')} "
+                f"checkpoint_learner_step={row.get('eval_checkpoint_learner_step')}"
+            )
         for mode_name, mode_summary in sorted(dict(row.get("mode_summaries", {})).items()):
             if mode_name == "deterministic":
                 continue
@@ -351,7 +395,8 @@ def _render_run_report_markdown(report: dict[str, Any]) -> str:
             lines.append(
                 f"-   deterministic_collapse: meaningfully_outperformed={collapse.get('meaningfully_outperformed')} "
                 f"progress_delta={collapse.get('progress_delta')} "
-                f"completion_rate_delta={collapse.get('completion_rate_delta')}"
+                f"completion_rate_delta={collapse.get('completion_rate_delta')} "
+                f"dcs={row.get('determinism_conversion_score')}"
             )
     lines.extend(["", "## Diagnostics"])
     if bottleneck:
@@ -360,7 +405,7 @@ def _render_run_report_markdown(report: dict[str, Any]) -> str:
             lines.append(f"- {key}_seconds={value}")
     if actor_sync_profile:
         lines.append(
-            f"- achieved_utd_1k={report.get('achieved_utd_1k')} "
+            f"- achieved_utd_1k={report.get('achieved_utd_1k')} cumulative_utd={report.get('cumulative_utd')} "
             f"current_actor_staleness={report.get('current_actor_staleness')}"
         )
         lines.append(

@@ -130,6 +130,7 @@ def main() -> int:
     parser.add_argument("--eval-episodes", type=int, default=None)
     parser.add_argument("--progress-log-interval", type=int, default=1000)
     parser.add_argument("--max-env-steps", type=int, default=None)
+    parser.add_argument("--max-wall-clock-minutes", type=float, default=None)
     args = parser.parse_args()
     if args.resume is not None and (
         args.init_actor is not None
@@ -153,6 +154,7 @@ def main() -> int:
         demo_root=args.demo_root,
         seed_demos=args.seed_demos,
         eval_episodes_override=args.eval_episodes,
+        max_wall_clock_minutes=args.max_wall_clock_minutes,
     )
     if args.resume is not None:
         learner.load_checkpoint(args.resume)

@@ -104,6 +104,10 @@ def test_tm20ai_config_parses_redq_block_and_normalizes_algorithm() -> None:
             "eval": {
                 "modes": ["deterministic", "stochastic"],
                 "trace_seconds": 3.0,
+                "final_checkpoint_eval": True,
+                "extraction_modes": ["deterministic_mean", "stochastic", "clipped_mean"],
+                "temperature_sweep": [0.5, 1.0],
+                "best_of_k": 4,
             },
             "redq": {
                 "n_critics": 12,
@@ -111,6 +115,25 @@ def test_tm20ai_config_parses_redq_block_and_normalizes_algorithm() -> None:
                 "q_updates_per_policy_update": 5,
                 "share_encoders": True,
             },
+            "ghosts": {
+                "enabled": True,
+                "bundle_manifest": "data/ghosts/test/ghost_bundle_manifest.json",
+                "default_bands": ["1-10", "11-30"],
+            },
+            "offline_pretrain": {
+                "enabled": True,
+                "strategy": "bc_redq_awac",
+                "gradient_steps": 10,
+                "batch_size": 4,
+            },
+            "balanced_replay": {
+                "enabled": True,
+                "offline_initial_fraction": 0.8,
+                "offline_final_fraction": 0.2,
+                "decay_env_steps": 100,
+            },
+            "elite_archive": {"enabled": True, "max_entries": 10},
+            "metrics": {"metric_version": "progress_v2", "progress_thresholds": [100, 200]},
         }
     )
 
@@ -119,10 +142,20 @@ def test_tm20ai_config_parses_redq_block_and_normalizes_algorithm() -> None:
     assert config.train.actor_publish_every == 1
     assert config.eval.modes == ("deterministic", "stochastic")
     assert config.eval.trace_seconds == 3.0
+    assert config.eval.final_checkpoint_eval is True
+    assert config.eval.extraction_modes == ("deterministic_mean", "stochastic", "clipped_mean")
+    assert config.eval.temperature_sweep == (0.5, 1.0)
+    assert config.eval.best_of_k == 4
     assert config.redq.n_critics == 12
     assert config.redq.m_subset == 3
     assert config.redq.q_updates_per_policy_update == 5
     assert config.redq.share_encoders is True
+    assert config.ghosts.enabled is True
+    assert config.ghosts.default_bands == ("1-10", "11-30")
+    assert config.offline_pretrain.enabled is True
+    assert config.balanced_replay.enabled is True
+    assert config.elite_archive.enabled is True
+    assert config.metrics.metric_version == "progress_v2"
 
 
 @pytest.mark.parametrize(
@@ -137,6 +170,12 @@ def test_tm20ai_config_parses_redq_block_and_normalizes_algorithm() -> None:
         ({"eval": {"modes": []}}, "eval.modes"),
         ({"eval": {"modes": ["deterministic", "greedy"]}}, "eval.modes"),
         ({"eval": {"trace_seconds": 0.0}}, "eval.trace_seconds"),
+        ({"eval": {"extraction_modes": ["mystery"]}}, "eval.extraction_modes"),
+        ({"eval": {"temperature_sweep": [0.0]}}, "eval.temperature_sweep"),
+        ({"eval": {"best_of_k": 0}}, "eval.best_of_k"),
+        ({"reward": {"mode": "ghost_magic"}}, "reward.mode"),
+        ({"ghosts": {"leaderboard_length": 101}}, "ghosts.leaderboard_length"),
+        ({"balanced_replay": {"offline_initial_fraction": 1.5}}, "balanced_replay"),
     ],
 )
 def test_tm20ai_config_rejects_invalid_redq_settings(payload, match: str) -> None:

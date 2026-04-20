@@ -14,6 +14,7 @@ from ..bridge import BridgeClient
 from ..capture import DXCamCapture, FrameStackPreprocessor, LidarObservationBuilder, lidar_feature_dim
 from ..config import TM20AIConfig, load_tm20ai_config
 from ..control import GamepadController
+from ..ghosts.reward import GhostBundleReward
 from .reset_manager import ResetManager
 from .reward import TrajectoryProgressReward
 from .trajectory import load_runtime_trajectory, runtime_trajectory_path_for_map
@@ -49,6 +50,10 @@ FROZEN_STEP_INFO_KEYS = (
     "no_progress_steps",
     "stray_distance",
     "trajectory_arc_length_m",
+    "ghost_bundle_manifest_path",
+    "ghost_line_id",
+    "ghost_line_rank",
+    "ghost_line_switch_count",
     "reward_reason",
     "tm20ai_done_type",
 )
@@ -58,7 +63,9 @@ class TM20AIRtInterface(RealTimeGymInterface):
     """Real-time interface that binds the custom bridge, capture, control, and reward stack."""
 
     def __init__(self, *, config_path: str | Path):
+        self.config_path = Path(config_path).resolve()
         self.config: TM20AIConfig = load_tm20ai_config(config_path)
+        self.repo_root = self.config_path.parents[1]
         self.observation_mode = self.config.observation.mode
         if self.observation_mode == "full":
             expected_window_shape = (
@@ -86,7 +93,8 @@ class TM20AIRtInterface(RealTimeGymInterface):
             raise NotImplementedError(f"Unsupported observation mode: {self.observation_mode!r}")
         self._prime_frame_count = prime_frame_count
         self._reset_manager: ResetManager | None = None
-        self._reward_model: TrajectoryProgressReward | None = None
+        self._reward_model: TrajectoryProgressReward | GhostBundleReward | None = None
+        self._reward_model_map_uid: str | None = None
         self._last_frame = None
         self._timing_metrics = InterfaceTimingMetrics()
 
@@ -145,16 +153,41 @@ class TM20AIRtInterface(RealTimeGymInterface):
         if self._lidar_builder is not None:
             self._lidar_builder.observe_action(applied)
 
-    def _ensure_reward_model(self, map_uid: str) -> TrajectoryProgressReward:
-        path = runtime_trajectory_path_for_map(map_uid, self.config.reward.spacing_meters)
-        if self._reward_model is not None and self._reward_model.trajectory.map_uid == map_uid:
+    def _ghost_bundle_manifest_for_map(self, map_uid: str) -> Path:
+        if self.config.ghosts.bundle_manifest is not None:
+            path = Path(self.config.ghosts.bundle_manifest)
+        else:
+            path = Path(self.config.ghosts.root) / map_uid / "ghost_bundle_manifest.json"
+        if not path.is_absolute():
+            path = self.repo_root / path
+        return path.resolve()
+
+    def _ensure_reward_model(self, map_uid: str) -> TrajectoryProgressReward | GhostBundleReward:
+        if self._reward_model is not None and self._reward_model_map_uid == map_uid:
             return self._reward_model
+        if self.config.reward.mode == "ghost_bundle_progress":
+            manifest_path = self._ghost_bundle_manifest_for_map(map_uid)
+            if not manifest_path.exists():
+                raise FileNotFoundError(
+                    f"Ghost bundle reward manifest is missing for map_uid {map_uid!r}: {manifest_path}. "
+                    "Run scripts\\fetch_top100_ghosts.py, scripts\\extract_ghost_trajectories.py, "
+                    "and scripts\\build_ghost_dataset.py first, or set ghosts.bundle_manifest."
+                )
+            self._reward_model = GhostBundleReward(
+                manifest_path=manifest_path,
+                reward_config=self.config.reward,
+                ghost_config=self.config.ghosts,
+            )
+            self._reward_model_map_uid = map_uid
+            return self._reward_model
+        path = runtime_trajectory_path_for_map(map_uid, self.config.reward.spacing_meters)
         if not path.exists():
             raise FileNotFoundError(
                 f"Reward trajectory artifact is missing for map_uid {map_uid!r}: {path}. "
                 "Run scripts\\record_reward.py first."
             )
         self._reward_model = TrajectoryProgressReward(load_runtime_trajectory(path), self.config.reward)
+        self._reward_model_map_uid = map_uid
         return self._reward_model
 
     def reset(self, seed=None, options=None):

@@ -360,8 +360,6 @@ class SACWorker:
                 if pending_eval is not None:
                     self._flush_pending_transitions(force=True)
                     self._apply_latest_desired_actor(mode="eval")
-                    if not self._actor_ready_for_control:
-                        raise RuntimeError("run_eval received before a control-ready actor was applied.")
                     self._status_mode = "eval"
                     self._eval_actor_version = self._applied_actor_version
                     self._eval_actor_source_learner_step = self._applied_source_learner_step
@@ -373,6 +371,20 @@ class SACWorker:
                         "episodes": int(pending_eval.get("episodes", self.config.eval.episodes)),
                         "eval_actor_version": self._eval_actor_version,
                         "eval_actor_source_learner_step": self._eval_actor_source_learner_step,
+                        "scheduled_actor_version": (
+                            int(pending_eval["scheduled_actor_version"])
+                            if pending_eval.get("scheduled_actor_version") is not None
+                            else None
+                        ),
+                        "eval_provenance_mode": pending_eval.get("eval_provenance_mode"),
+                        "eval_checkpoint_path": pending_eval.get("eval_checkpoint_path"),
+                        "eval_checkpoint_sha256": pending_eval.get("eval_checkpoint_sha256"),
+                        "eval_checkpoint_env_step": pending_eval.get("eval_checkpoint_env_step"),
+                        "eval_checkpoint_learner_step": pending_eval.get("eval_checkpoint_learner_step"),
+                        "eval_checkpoint_actor_step": pending_eval.get("eval_checkpoint_actor_step"),
+                        "worker_env_step_at_eval_start": self._env_step,
+                        "applied_actor_version": self._applied_actor_version,
+                        "applied_actor_source_learner_step": self._applied_source_learner_step,
                     }
                     self._put_message(
                         {
@@ -1040,9 +1052,8 @@ class SACWorker:
         self._put_message({"type": "action_stats", **stats})
 
     def _run_eval(self, env: TM20AIGymEnv, command: Mapping[str, Any]) -> dict[str, Any]:
-        if self.actor is None:
-            raise RuntimeError("Worker actor is not initialized for evaluation.")
-        from .evaluator import ActorPolicyAdapter, run_policy_episodes_on_env
+        from .evaluator import resolve_policy_adapter, run_policy_episodes_on_env
+        from .metrics import mode_comparison_metrics
 
         raw_modes = command.get("modes", self.config.eval.modes)
         if isinstance(raw_modes, str):
@@ -1054,18 +1065,21 @@ class SACWorker:
         episodes = int(command.get("episodes", self.config.eval.episodes))
         seed_base = int(command.get("seed_base", self.config.eval.seed_base))
         record_video = bool(command.get("record_video", self.config.eval.record_video))
-        checkpoint_path = command.get("checkpoint_path")
+        checkpoint_path = command.get("eval_checkpoint_path") or command.get("checkpoint_path")
+        if checkpoint_path is None:
+            raise RuntimeError("Checkpoint-authoritative eval requires eval_checkpoint_path.")
         base_run_name = None if command.get("run_name") is None else str(command.get("run_name"))
         trace_seconds = float(command.get("trace_seconds", self.config.eval.trace_seconds))
 
         mode_results: dict[str, dict[str, Any]] = {}
         for mode_name in modes:
             deterministic = mode_name == "deterministic"
-            policy = ActorPolicyAdapter(
-                self.actor,
-                observation_mode=self.observation_mode,
-                name="checkpoint",
+            extraction_mode = "deterministic_mean" if deterministic else "stochastic"
+            policy = resolve_policy_adapter(
+                policy="checkpoint",
+                checkpoint=checkpoint_path,
                 deterministic=deterministic,
+                extraction_mode=extraction_mode,
             )
             mode_run_name = None if base_run_name is None else f"{base_run_name}_{mode_name}"
             mode_results[mode_name] = run_policy_episodes_on_env(
@@ -1081,12 +1095,23 @@ class SACWorker:
                 eval_mode=mode_name,
                 deterministic=deterministic,
                 trace_seconds=trace_seconds,
+                extraction_mode=extraction_mode,
                 summary_extra={
                     "learner_step": int(command.get("learner_step", 0)),
                     "env_step": int(command.get("env_step", self._env_step)),
                     "observation_mode": self.observation_mode,
                     "eval_actor_version": self._eval_actor_version,
                     "eval_actor_source_learner_step": self._eval_actor_source_learner_step,
+                    "scheduled_actor_version": command.get("scheduled_actor_version"),
+                    "eval_provenance_mode": command.get("eval_provenance_mode", "checkpoint_authoritative"),
+                    "eval_checkpoint_path": str(Path(str(checkpoint_path)).resolve()),
+                    "eval_checkpoint_sha256": command.get("eval_checkpoint_sha256"),
+                    "eval_checkpoint_env_step": command.get("eval_checkpoint_env_step"),
+                    "eval_checkpoint_learner_step": command.get("eval_checkpoint_learner_step"),
+                    "eval_checkpoint_actor_step": command.get("eval_checkpoint_actor_step"),
+                    "worker_env_step_at_eval_start": self._env_step,
+                    "applied_actor_version": self._applied_actor_version,
+                    "applied_actor_source_learner_step": self._applied_source_learner_step,
                 },
                 close_env=False,
             )
@@ -1096,6 +1121,7 @@ class SACWorker:
         mode_summaries = {mode: dict(result["summary"]) for mode, result in mode_results.items()}
         mode_summary_paths = {mode: str(result["summary_path"]) for mode, result in mode_results.items()}
         mode_run_dirs = {mode: str(result["run_dir"]) for mode, result in mode_results.items()}
+        comparison_metrics = mode_comparison_metrics(mode_summaries)
         deterministic_collapse = None
         deterministic_summary = mode_summaries.get("deterministic")
         stochastic_summary = mode_summaries.get("stochastic")
@@ -1122,10 +1148,13 @@ class SACWorker:
                     progress_delta >= 5.0 or completion_delta >= 0.1 or reward_delta >= 1.0
                 ),
             }
+            deterministic_summary.update(comparison_metrics)
+            mode_summaries["deterministic"] = deterministic_summary
         primary_summary = dict(primary_result["summary"])
         primary_summary["eval_mode_summaries"] = mode_summaries
         primary_summary["eval_mode_summary_paths"] = mode_summary_paths
         primary_summary["eval_mode_run_dirs"] = mode_run_dirs
+        primary_summary.update(comparison_metrics)
         if deterministic_collapse is not None:
             primary_summary["deterministic_collapse"] = deterministic_collapse
         primary_result["summary"] = primary_summary

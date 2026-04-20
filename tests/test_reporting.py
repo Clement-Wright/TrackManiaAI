@@ -239,8 +239,10 @@ def test_write_training_report_includes_diagnostics_sections_and_event_logs(tmp_
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     summary.update(
         {
+            "algorithm": "redq",
             "primary_metric": "mean_final_progress_index",
             "achieved_utd_1k": 1.75,
+            "cumulative_utd": 2.0,
             "current_actor_staleness": 12,
             "runtime_profile": {
                 "bottleneck_verdict": {
@@ -294,6 +296,7 @@ def test_write_training_report_includes_diagnostics_sections_and_event_logs(tmp_
 
     assert report["primary_metric"] == "mean_final_progress_index"
     assert report["achieved_utd_1k"] == 1.75
+    assert report["cumulative_utd"] == 2.0
     assert report["current_actor_staleness"] == 12
     assert report["runtime_profile"]["bottleneck_verdict"]["label"] == "worker_env"
     assert report["actor_sync_profile"]["policy_control_fraction"] == 0.75
@@ -301,7 +304,7 @@ def test_write_training_report_includes_diagnostics_sections_and_event_logs(tmp_
     markdown = report_paths.markdown_path.read_text(encoding="utf-8")
     assert "## Diagnostics" in markdown
     assert "Bottleneck verdict: worker_env" in markdown
-    assert "achieved_utd_1k=1.75 current_actor_staleness=12" in markdown
+    assert "achieved_utd_1k=1.75 cumulative_utd=2.0 current_actor_staleness=12" in markdown
 
 
 def test_write_training_report_preserves_per_mode_eval_rows(tmp_path) -> None:

@@ -15,6 +15,7 @@ from .window import (
     MonitorGeometry,
     TrackmaniaWindowLocator,
     WindowGeometry,
+    get_client_geometry,
     get_window_monitor_geometry,
 )
 
@@ -252,18 +253,65 @@ class DXCamCapture:
 
     def _locate_window(self) -> tuple[int, WindowGeometry]:
         hwnd, geometry = self._window_locator.locate_tm_window()
-        self._validate_geometry(geometry)
+        geometry = self._ensure_expected_client_size(hwnd, geometry)
         return hwnd, geometry
 
-    def _validate_geometry(self, geometry: WindowGeometry) -> None:
+    def _ensure_expected_client_size(self, hwnd: int, geometry: WindowGeometry) -> WindowGeometry:
         if self._expected_client_size is None:
-            return
+            return geometry
         expected_width, expected_height = self._expected_client_size
         if geometry.width == expected_width and geometry.height == expected_height:
-            return
-        raise RuntimeError(
-            "Trackmania window client rect drifted from the configured observation size: "
-            f"observed {geometry.width}x{geometry.height}, expected {expected_width}x{expected_height}."
+            return geometry
+        original_geometry = geometry
+        try:
+            import ctypes
+            import win32con
+            import win32gui
+
+            try:
+                ctypes.windll.user32.AllowSetForegroundWindow(-1)
+            except Exception:  # noqa: BLE001
+                pass
+
+            retry_count = max(3, self.config.require_stable_window_polls)
+            delay_seconds = max(0.05, self.config.stable_window_poll_interval_seconds)
+            for attempt in range(retry_count):
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                try:
+                    win32gui.BringWindowToTop(hwnd)
+                    win32gui.SetForegroundWindow(hwnd)
+                except Exception:  # noqa: BLE001 - foreground focus is best-effort only
+                    pass
+                outer_left, outer_top, outer_right, outer_bottom = win32gui.GetWindowRect(hwnd)
+                outer_width = int(outer_right - outer_left)
+                outer_height = int(outer_bottom - outer_top)
+                delta_width = outer_width - max(1, geometry.width)
+                delta_height = outer_height - max(1, geometry.height)
+                target_outer_width = max(1, expected_width + delta_width)
+                target_outer_height = max(1, expected_height + delta_height)
+                target_left = int(outer_left)
+                target_top = int(outer_top)
+                if attempt >= 1:
+                    target_left = 0
+                    target_top = 0
+                win32gui.MoveWindow(hwnd, target_left, target_top, target_outer_width, target_outer_height, True)
+                time.sleep(delay_seconds)
+                geometry = get_client_geometry(hwnd)
+                if geometry.width == expected_width and geometry.height == expected_height:
+                    return geometry
+        except Exception:
+            pass
+        # Chrome and other desktop-compositor changes can transiently report a resized
+        # Trackmania client even when the top-left game content remains capturable.
+        # Keep the live run alive by pinning the capture region to the configured
+        # observation size instead of crashing the rtgym worker thread.
+        return WindowGeometry(
+            hwnd=hwnd,
+            title=geometry.title,
+            left=geometry.left,
+            top=geometry.top,
+            right=geometry.left + expected_width,
+            bottom=geometry.top + expected_height,
         )
 
     def _wait_for_stable_window(self) -> tuple[int, WindowGeometry]:

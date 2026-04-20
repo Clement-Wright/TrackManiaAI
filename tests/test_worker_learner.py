@@ -225,6 +225,7 @@ def test_worker_emits_transition_batches_and_eval_results(tmp_path, monkeypatch)
     learner.env_step = 9
     learner.learner_step = 11
     learner.broadcast_actor(force=True)
+    checkpoint_path = learner.save_checkpoint()
 
     command_queue: queue.Queue = queue.Queue()
     output_queue: queue.Queue = queue.Queue()
@@ -250,6 +251,13 @@ def test_worker_emits_transition_batches_and_eval_results(tmp_path, monkeypatch)
             "run_name": "worker_eval",
             "modes": ["deterministic", "stochastic"],
             "trace_seconds": 0.1,
+            "eval_provenance_mode": "checkpoint_authoritative",
+            "eval_checkpoint_path": str(checkpoint_path),
+            "eval_checkpoint_sha256": "unit-sha",
+            "eval_checkpoint_env_step": 9,
+            "eval_checkpoint_learner_step": 11,
+            "eval_checkpoint_actor_step": None,
+            "scheduled_actor_version": 2,
         }
     )
 
@@ -272,6 +280,8 @@ def test_worker_emits_transition_batches_and_eval_results(tmp_path, monkeypatch)
     assert eval_results
     assert eval_results[-1].summary["eval_actor_version"] == 2
     assert eval_results[-1].summary["eval_actor_source_learner_step"] == 11
+    assert eval_results[-1].summary["eval_checkpoint_path"] == str(checkpoint_path.resolve())
+    assert eval_results[-1].summary["eval_checkpoint_sha256"] == "unit-sha"
     assert "deterministic" in eval_results[-1].summary["eval_mode_summaries"]
     assert "stochastic" in eval_results[-1].summary["eval_mode_summaries"]
     assert worker_done_event.is_set()
@@ -456,22 +466,33 @@ def test_learner_checkpoint_roundtrip_and_command_scheduling(tmp_path) -> None:
     run_eval_command = next(command for command in commands if command["type"] == "run_eval")
     assert run_eval_command["eval_actor_version"] == desired_actor_payload["desired_actor_version"]
     assert run_eval_command["eval_actor_source_learner_step"] == learner.learner_step
+    assert run_eval_command["eval_provenance_mode"] == "checkpoint_authoritative"
+    assert Path(str(run_eval_command["eval_checkpoint_path"])).exists()
+    assert run_eval_command["eval_checkpoint_env_step"] == learner.env_step
+    assert run_eval_command["scheduled_actor_version"] == desired_actor_payload["desired_actor_version"]
 
     output_queue.put(
         {
             "type": "eval_started",
-            "run_name": "unit_train_step_00000002",
-            "env_step": 2,
+            "run_name": f"unit_train_step_{learner.env_step:08d}",
+            "env_step": learner.env_step,
             "learner_step": learner.learner_step,
             "episodes": 3,
             "timestamp": time.time(),
             "eval_actor_version": desired_actor_payload["desired_actor_version"],
             "eval_actor_source_learner_step": learner.learner_step,
+            "scheduled_actor_version": desired_actor_payload["desired_actor_version"],
+            "eval_provenance_mode": "checkpoint_authoritative",
+            "eval_checkpoint_path": run_eval_command["eval_checkpoint_path"],
+            "eval_checkpoint_sha256": run_eval_command["eval_checkpoint_sha256"],
+            "eval_checkpoint_env_step": run_eval_command["eval_checkpoint_env_step"],
+            "eval_checkpoint_learner_step": run_eval_command["eval_checkpoint_learner_step"],
+            "eval_checkpoint_actor_step": run_eval_command["eval_checkpoint_actor_step"],
         }
     )
     assert learner.drain_messages(timeout=0.01) == 0
     assert learner.started_eval is not None
-    assert learner.started_eval["run_name"] == "unit_train_step_00000002"
+    assert learner.started_eval["run_name"] == "unit_train_step_00000003"
     assert learner.desired_actor_ready_for_control is True
     assert learner.ready_for_control_seen is True
     assert learner.applied_actor_version == desired_actor_payload["desired_actor_version"]
@@ -485,15 +506,21 @@ def test_learner_checkpoint_roundtrip_and_command_scheduling(tmp_path) -> None:
 
     eval_result_queue.put(
         EvalResult(
-            checkpoint_step=2,
-            env_step=2,
+            checkpoint_step=learner.env_step,
+            env_step=learner.env_step,
             learner_step=learner.learner_step,
             summary_path=str(tmp_path / "eval_summary.json"),
             summary={
-                "env_step": 2,
+                "env_step": learner.env_step,
                 "mean_final_progress_index": 12.0,
                 "eval_actor_version": desired_actor_payload["desired_actor_version"],
                 "eval_actor_source_learner_step": learner.learner_step,
+                "eval_provenance_mode": "checkpoint_authoritative",
+                "eval_checkpoint_path": run_eval_command["eval_checkpoint_path"],
+                "eval_checkpoint_sha256": run_eval_command["eval_checkpoint_sha256"],
+                "eval_checkpoint_env_step": run_eval_command["eval_checkpoint_env_step"],
+                "eval_checkpoint_learner_step": run_eval_command["eval_checkpoint_learner_step"],
+                "eval_checkpoint_actor_step": run_eval_command["eval_checkpoint_actor_step"],
             },
             timestamp=time.time(),
         )

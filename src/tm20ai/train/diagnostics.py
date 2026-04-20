@@ -171,15 +171,18 @@ def build_agent_resource_profile(agent: Any, device: torch.device | str) -> dict
 
     resolved_device = torch.device(device)
     actor = agent.actor
+    algorithm = str(getattr(agent, "algorithm_name", getattr(agent, "algorithm", "sac")))
     if hasattr(agent, "critic1"):
         critics = [agent.critic1, agent.critic2]
-        target_critics = [agent.target_critic1, agent.target_critic2]
-        algorithm = "sac"
+        target_critics = [
+            critic
+            for critic in (getattr(agent, "target_critic1", None), getattr(agent, "target_critic2", None))
+            if critic is not None
+        ]
         share_encoders = False
     else:
         critics = list(agent.critics)
-        target_critics = list(agent.target_critics)
-        algorithm = "redq"
+        target_critics = list(getattr(agent, "target_critics", []))
         share_encoders = bool(getattr(agent, "share_encoders", False))
 
     critic_encoder_modules: list[torch.nn.Module] = []

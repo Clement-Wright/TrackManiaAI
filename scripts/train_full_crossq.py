@@ -15,7 +15,7 @@ if str(SRC) not in sys.path:
 
 
 def log(message: str) -> None:
-    print(f"[train-full-redq] {message}", flush=True)
+    print(f"[train-full-crossq] {message}", flush=True)
 
 
 class SummaryProgressMonitor:
@@ -30,7 +30,7 @@ class SummaryProgressMonitor:
         self.progress_log_interval = max(1, int(progress_log_interval))
         self.poll_interval_seconds = max(0.25, float(poll_interval_seconds))
         self._stop_event = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="tm20ai-full-redq-progress", daemon=True)
+        self._thread = threading.Thread(target=self._run, name="tm20ai-full-crossq-progress", daemon=True)
         self._last_logged_progress_step = -self.progress_log_interval
         self._last_checkpoint_count = 0
         self._last_eval_count = 0
@@ -63,13 +63,12 @@ class SummaryProgressMonitor:
 
         env_step = int(summary.get("env_step", 0))
         learner_step = int(summary.get("learner_step", 0))
-        actor_step = int(summary.get("actor_step", 0))
         replay_size = int(summary.get("replay_size", 0))
         episode_count = int(summary.get("episode_count", 0))
         if force_progress_log or env_step >= self._last_logged_progress_step + self.progress_log_interval:
             log(
                 f"{'progress_final' if force_progress_log else 'progress'} "
-                f"env_step={env_step} learner_step={learner_step} actor_step={actor_step} "
+                f"env_step={env_step} learner_step={learner_step} "
                 f"replay_size={replay_size} episodes={episode_count}"
             )
             self._last_logged_progress_step = env_step
@@ -111,12 +110,12 @@ class SummaryProgressMonitor:
 
 
 def main() -> int:
-    from tm20ai.train.learner import REDQLearner
+    from tm20ai.train.learner import CrossQLearner
     from tm20ai.train.reporting import write_training_report
     from tm20ai.train.worker import worker_entry
 
-    parser = argparse.ArgumentParser(description="Train the FULL-observation REDQ-SAC baseline with optional BC warm start.")
-    parser.add_argument("--config", default=str(ROOT / "configs" / "full_redq.yaml"))
+    parser = argparse.ArgumentParser(description="Train the FULL-observation CrossQ baseline with optional BC warm start.")
+    parser.add_argument("--config", default=str(ROOT / "configs" / "full_crossq.yaml"))
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--resume", default=None)
     parser.add_argument("--init-actor", default=None)
@@ -131,29 +130,21 @@ def main() -> int:
     parser.add_argument("--progress-log-interval", type=int, default=1000)
     parser.add_argument("--max-env-steps", type=int, default=None)
     parser.add_argument("--max-wall-clock-minutes", type=float, default=None)
-    parser.add_argument("--ghost-bundle", default=None, help="Ghost bundle manifest used for offline replay seeding.")
-    parser.add_argument(
-        "--offline-init-checkpoint",
-        default=None,
-        help="REDQ checkpoint produced by scripts/pretrain_ghost_redq.py; loads weights without resuming env counters.",
-    )
     args = parser.parse_args()
     if args.resume is not None and (
         args.init_actor is not None
         or args.init_mode != "scratch"
         or args.seed_demos is not None
         or args.demo_root is not None
-        or args.ghost_bundle is not None
-        or args.offline_init_checkpoint is not None
     ):
-        parser.error("--resume cannot be combined with BC warm-start, offline init, or demo-root/replay-seeding options.")
+        parser.error("--resume cannot be combined with BC warm-start or demo-root/replay-seeding options.")
 
     multiprocessing.freeze_support()
     run_name = args.run_name
     if run_name is None and args.resume is not None:
         run_name = Path(args.resume).resolve().parents[1].name
 
-    learner = REDQLearner(
+    learner = CrossQLearner(
         config_path=args.config,
         run_name=run_name,
         max_env_steps=args.max_env_steps,
@@ -163,8 +154,6 @@ def main() -> int:
         seed_demos=args.seed_demos,
         eval_episodes_override=args.eval_episodes,
         max_wall_clock_minutes=args.max_wall_clock_minutes,
-        ghost_bundle=args.ghost_bundle,
-        offline_init_checkpoint=args.offline_init_checkpoint,
     )
     if args.resume is not None:
         learner.load_checkpoint(args.resume)
@@ -191,7 +180,7 @@ def main() -> int:
             str(learner.paths.run_dir / "worker_bootstrap.log"),
             learner.max_env_steps,
         ),
-        name="tm20ai-redq-worker",
+        name="tm20ai-crossq-worker",
     )
     learner.attach_worker(
         command_queue=command_queue,
@@ -211,14 +200,14 @@ def main() -> int:
         learner.run()
     except KeyboardInterrupt:
         log("KeyboardInterrupt received, requesting graceful shutdown.")
-    except Exception as exc:  # noqa: BLE001 - entrypoint should log the fatal error
+    except Exception as exc:  # noqa: BLE001
         exit_code = 1
         log(f"ERROR: {exc}")
     finally:
         finalize_error = None
         try:
             final_checkpoint = learner.finalize_run(timeout_seconds=30.0)
-        except Exception as exc:  # noqa: BLE001 - finalization errors should still surface in logs
+        except Exception as exc:  # noqa: BLE001
             finalize_error = exc
             exit_code = 1 if exit_code == 0 else exit_code
             log(f"ERROR during finalization: {exc}")
@@ -231,7 +220,7 @@ def main() -> int:
         log(f"final_checkpoint={final_checkpoint}")
         try:
             report_paths = write_training_report(learner.paths.run_dir)
-        except Exception as exc:  # noqa: BLE001 - reporting should not hide train results
+        except Exception as exc:  # noqa: BLE001
             log(f"WARNING: failed to generate training report: {exc}")
         else:
             log(f"report_json={report_paths.json_path}")

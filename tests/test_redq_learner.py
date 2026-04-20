@@ -267,6 +267,11 @@ def test_redq_learner_marks_actor_ready_only_after_actor_update(tmp_path) -> Non
     assert run_eval_command["eval_actor_source_learner_step"] == learner.learner_step
     assert run_eval_command["modes"] == ["deterministic", "stochastic"]
     assert run_eval_command["trace_seconds"] == 3.0
+    assert run_eval_command["eval_provenance_mode"] == "checkpoint_authoritative"
+    assert Path(str(run_eval_command["eval_checkpoint_path"])).exists()
+    assert run_eval_command["eval_checkpoint_env_step"] == learner.env_step
+    assert run_eval_command["eval_checkpoint_learner_step"] == learner.learner_step
+    assert run_eval_command["scheduled_actor_version"] == desired_actor_payload["desired_actor_version"]
 
     checkpoint_path = learner.save_checkpoint()
     restored = REDQLearner(config_path=config_path, run_name="unit_redq_restored")

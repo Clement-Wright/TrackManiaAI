@@ -13,8 +13,10 @@ __all__ = [
     "KeyboardTeleopPolicy",
     "PolicyAdapter",
     "ReplayBuffer",
+    "DroQLearner",
     "REDQLearner",
     "SACLearner",
+    "CrossQLearner",
     "ScriptedPolicyAdapter",
     "TelemetryFeatureBuilder",
     "TorchCheckpointPolicyAdapter",
@@ -45,7 +47,7 @@ if TYPE_CHECKING:
     )
     from ..data.dataset import FullBehaviorCloningDataset, seed_replay_from_demo_sidecars, split_demo_dataset
     from .features import TelemetryFeatureBuilder
-    from .learner import REDQLearner, SACLearner
+    from .learner import CrossQLearner, DroQLearner, REDQLearner, SACLearner
     from .protocol import EvalResult
     from .replay import ReplayBuffer
     from .reporting import (
@@ -73,7 +75,7 @@ def __getattr__(name: str) -> Any:
         )
         from ..data.dataset import FullBehaviorCloningDataset, seed_replay_from_demo_sidecars, split_demo_dataset
         from .features import TelemetryFeatureBuilder
-        from .learner import REDQLearner, SACLearner
+        from .learner import CrossQLearner, DroQLearner, REDQLearner, SACLearner
         from .protocol import EvalResult
         from .replay import ReplayBuffer
         from .reporting import (
@@ -85,6 +87,8 @@ def __getattr__(name: str) -> Any:
         from .worker import worker_entry
 
         return {
+            "CrossQLearner": CrossQLearner,
+            "DroQLearner": DroQLearner,
             "ActorPolicyAdapter": ActorPolicyAdapter,
             "build_comparison_report": build_comparison_report,
             "build_training_report": build_training_report,

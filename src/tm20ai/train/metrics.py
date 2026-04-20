@@ -21,6 +21,67 @@ def _median(values: Sequence[float]) -> float | None:
     return float(median(values)) if values else None
 
 
+def determinism_conversion_score(
+    deterministic_progress: float | int | None,
+    stochastic_progress: float | int | None,
+    *,
+    epsilon: float = 1.0e-6,
+) -> float | None:
+    """Return how much stochastic progress survives deterministic extraction."""
+    if deterministic_progress is None or stochastic_progress is None:
+        return None
+    denominator = max(float(stochastic_progress), float(epsilon))
+    return float(deterministic_progress) / denominator
+
+
+def mode_comparison_metrics(mode_summaries: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    deterministic = mode_summaries.get("deterministic")
+    stochastic = mode_summaries.get("stochastic")
+    if deterministic is None or stochastic is None:
+        return {
+            "determinism_conversion_score": None,
+            "deterministic_stochastic_progress_gap": None,
+            "deterministic_stochastic_completion_gap": None,
+            "deterministic_stochastic_median_progress_gap": None,
+        }
+    deterministic_progress = float(deterministic.get("mean_final_progress_index", 0.0) or 0.0)
+    stochastic_progress = float(stochastic.get("mean_final_progress_index", 0.0) or 0.0)
+    deterministic_completion = float(deterministic.get("completion_rate", 0.0) or 0.0)
+    stochastic_completion = float(stochastic.get("completion_rate", 0.0) or 0.0)
+    deterministic_median = deterministic.get("median_final_progress_index")
+    stochastic_median = stochastic.get("median_final_progress_index")
+    median_gap = None
+    if deterministic_median is not None and stochastic_median is not None:
+        median_gap = float(deterministic_median) - float(stochastic_median)
+    return {
+        "determinism_conversion_score": determinism_conversion_score(
+            deterministic_progress,
+            stochastic_progress,
+        ),
+        "deterministic_stochastic_progress_gap": deterministic_progress - stochastic_progress,
+        "deterministic_stochastic_completion_gap": deterministic_completion - stochastic_completion,
+        "deterministic_stochastic_median_progress_gap": median_gap,
+    }
+
+
+def time_to_progress_thresholds(
+    episode_summaries: Sequence[Mapping[str, Any]],
+    *,
+    thresholds: Sequence[int | float],
+) -> dict[str, float | None]:
+    result: dict[str, float | None] = {}
+    for threshold in thresholds:
+        threshold_value = float(threshold)
+        crossing_times = [
+            float(episode.get("completion_time_ms"))
+            for episode in episode_summaries
+            if episode.get("completion_time_ms") is not None
+            and float(episode.get("final_progress_index", 0.0) or 0.0) >= threshold_value
+        ]
+        result[str(threshold_value)] = min(crossing_times) if crossing_times else None
+    return result
+
+
 @dataclass(slots=True)
 class ActiveStepBenchmark:
     step_dt_seconds: float
@@ -159,6 +220,7 @@ def aggregate_episode_summaries(episodes: Sequence[Mapping[str, Any]], *, sector
     rewards = [float(episode.get("episode_reward_total", 0.0)) for episode in episodes]
     completion_times = [float(episode["completion_time_ms"]) for episode in episodes if episode.get("completion_time_ms") is not None]
     timeout_flags = [episode.get("termination_reason") in {"no_progress", "ep_max_length"} for episode in episodes]
+    no_progress_flags = [episode.get("termination_reason") == "no_progress" for episode in episodes]
     stray_flags = [episode.get("termination_reason") == "stray" for episode in episodes]
 
     per_sector_best_entry_speed = [0.0 for _ in range(sector_count)]
@@ -178,6 +240,7 @@ def aggregate_episode_summaries(episodes: Sequence[Mapping[str, Any]], *, sector
         "mean_final_progress_index": _mean(final_progress),
         "median_final_progress_index": _median(final_progress),
         "timeout_rate": sum(timeout_flags) / max(1, len(episodes)),
+        "no_progress_termination_rate": sum(no_progress_flags) / max(1, len(episodes)),
         "stray_termination_rate": sum(stray_flags) / max(1, len(episodes)),
         "mean_episode_reward": _mean(rewards),
         "best_reward": max(rewards) if rewards else None,

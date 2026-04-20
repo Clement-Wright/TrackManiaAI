@@ -185,7 +185,7 @@ def test_dxcam_capture_recreates_camera_after_repeated_invalid_frames() -> None:
     assert capture.state == CaptureState.RUNNING
 
 
-def test_dxcam_capture_rejects_unexpected_client_size() -> None:
+def test_dxcam_capture_pins_unexpected_client_size_to_expected_region() -> None:
     config = CaptureConfig(frame_timeout=0.01, require_stable_window_polls=1)
     camera = FakeCamera([make_frame(10)])
 
@@ -199,8 +199,11 @@ def test_dxcam_capture_rejects_unexpected_client_size() -> None:
         expected_client_size=(256, 128),
     )
 
-    with np.testing.assert_raises_regex(RuntimeError, "expected 256x128"):
-        capture.ensure_started()
+    capture.ensure_started()
+
+    assert capture.geometry is not None
+    assert capture.geometry.width == 256
+    assert capture.geometry.height == 128
 
 
 def test_default_camera_factory_retries_without_device_idx(monkeypatch) -> None:

@@ -93,6 +93,7 @@ def main() -> int:
     parser.add_argument("--eval-episodes", type=int, default=None)
     parser.add_argument("--progress-log-interval", type=int, default=500)
     parser.add_argument("--max-env-steps", type=int, default=5000)
+    parser.add_argument("--max-wall-clock-minutes", type=float, default=None)
     args = parser.parse_args()
 
     if args.resume is not None and (
@@ -119,6 +120,7 @@ def main() -> int:
         eval_episodes_override=args.eval_episodes,
         diagnostics_enabled=True,
         detailed_cuda_timing=True,
+        max_wall_clock_minutes=args.max_wall_clock_minutes,
     )
     if args.resume is not None:
         learner.load_checkpoint(args.resume)
