@@ -1,0 +1,35 @@
+{
+  "schema_version": "elite_archive_v1",
+  "entries": [
+    {
+      "run_name": "redq_top100_20260420_120min",
+      "mode": "deterministic",
+      "run_dir": "C:\\Users\\clewr\\TrackManiaAI\\artifacts\\eval\\redq_top100_20260420_120min_step_00020004_deterministic",
+      "checkpoint_path": "C:\\Users\\clewr\\TrackManiaAI\\artifacts\\train\\redq_top100_20260420_120min\\checkpoints\\checkpoint_00020004.pt",
+      "mean_final_progress_index": 91.0,
+      "completion_rate": 0.0,
+      "cluster_key": "progress_000_completion_00_steer_00",
+      "promotion_reason": "progress_improvement"
+    },
+    {
+      "run_name": "redq_top100_20260420_120min",
+      "mode": "stochastic",
+      "run_dir": "C:\\Users\\clewr\\TrackManiaAI\\artifacts\\eval\\redq_top100_20260420_120min_step_00010004_stochastic",
+      "checkpoint_path": "C:\\Users\\clewr\\TrackManiaAI\\artifacts\\train\\redq_top100_20260420_120min\\checkpoints\\checkpoint_00010004.pt",
+      "mean_final_progress_index": 64.8,
+      "completion_rate": 0.0,
+      "cluster_key": "progress_000_completion_00_steer_00",
+      "promotion_reason": "progress_improvement"
+    },
+    {
+      "run_name": "redq_top100_20260420_120min",
+      "mode": "deterministic",
+      "run_dir": "C:\\Users\\clewr\\TrackManiaAI\\artifacts\\eval\\redq_top100_20260420_120min_step_00005003_deterministic",
+      "checkpoint_path": "C:\\Users\\clewr\\TrackManiaAI\\artifacts\\train\\redq_top100_20260420_120min\\checkpoints\\checkpoint_00005003.pt",
+      "mean_final_progress_index": 0.0,
+      "completion_rate": 0.0,
+      "cluster_key": "progress_000_completion_00_steer_00",
+      "promotion_reason": "novel_cluster"
+    }
+  ]
+}

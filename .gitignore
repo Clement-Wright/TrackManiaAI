@@ -10,3 +10,4 @@ dist/
 artifacts/
 data/reward/*/raw_lap.parquet
 data/reward/*/trajectory_0p5m.npz
+data/ghosts/

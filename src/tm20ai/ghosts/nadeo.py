@@ -15,7 +15,7 @@ from ..data.parquet_writer import sha256_file, write_json
 
 CORE_BASE_URL = "https://prod.trackmania.core.nadeo.online"
 LIVE_BASE_URL = "https://live-services.trackmania.nadeo.live"
-AUTH_BASE_URL = "https://prod.trackmania.core.nadeo.online/v2/authentication/token"
+AUTH_BASE_URL = "https://prod.trackmania.core.nadeo.online/v2/authentication/token/basic"
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,9 +28,9 @@ class NadeoCredentials:
 
     @classmethod
     def from_env(cls) -> "NadeoCredentials":
-        login = os.environ.get("TM20AI_NADEO_DEDI_LOGIN")
-        password = os.environ.get("TM20AI_NADEO_DEDI_PASSWORD")
-        user_agent = os.environ.get("TM20AI_NADEO_USER_AGENT")
+        login = _read_environment_value("TM20AI_NADEO_DEDI_LOGIN")
+        password = _read_environment_value("TM20AI_NADEO_DEDI_PASSWORD")
+        user_agent = _read_environment_value("TM20AI_NADEO_USER_AGENT")
         if not login or not password or not user_agent:
             raise RuntimeError(
                 "Nadeo ghost ingestion requires environment variables "
@@ -40,9 +40,47 @@ class NadeoCredentials:
             dedicated_login=login,
             dedicated_password=password,
             user_agent=user_agent,
-            core_token=os.environ.get("TM20AI_NADEO_CORE_TOKEN"),
-            live_token=os.environ.get("TM20AI_NADEO_LIVE_TOKEN"),
+            core_token=_read_environment_value("TM20AI_NADEO_CORE_TOKEN"),
+            live_token=_read_environment_value("TM20AI_NADEO_LIVE_TOKEN"),
         )
+
+
+def _read_environment_value(name: str) -> str | None:
+    value = os.environ.get(name)
+    if value:
+        return value
+    if os.name != "nt":
+        return None
+    try:
+        import winreg
+    except ImportError:  # pragma: no cover - non-Windows guard
+        return None
+    for hive, subkey in (
+        (winreg.HKEY_CURRENT_USER, "Environment"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+    ):
+        try:
+            with winreg.OpenKey(hive, subkey) as key:
+                registry_value, _value_type = winreg.QueryValueEx(key, name)
+        except OSError:
+            continue
+        if registry_value:
+            return str(registry_value)
+    try:
+        user_index = 0
+        while True:
+            sid = winreg.EnumKey(winreg.HKEY_USERS, user_index)
+            user_index += 1
+            try:
+                with winreg.OpenKey(winreg.HKEY_USERS, rf"{sid}\Environment") as key:
+                    registry_value, _value_type = winreg.QueryValueEx(key, name)
+            except OSError:
+                continue
+            if registry_value:
+                return str(registry_value)
+    except OSError:
+        pass
+    return None
 
 
 class NadeoServicesClient:
@@ -127,7 +165,7 @@ class NadeoServicesClient:
     def resolve_map_uid(self, map_uid: str) -> dict[str, Any]:
         query = urllib.parse.urlencode({"mapUidList": map_uid})
         payload = self._request_json(
-            f"{self.core_base_url}/maps/?{query}",
+            f"{self.core_base_url}/maps/by-uid/?{query}",
             token=self.core_token,
         )
         if isinstance(payload, list) and payload:
@@ -160,8 +198,10 @@ class NadeoServicesClient:
             token=self.live_token,
         )
         rows = payload.get("tops") or payload.get("top") or payload.get("scores") if isinstance(payload, Mapping) else payload
+        if isinstance(rows, list) and rows and isinstance(rows[0], Mapping) and isinstance(rows[0].get("top"), list):
+            rows = rows[0]["top"]
         if isinstance(rows, Mapping):
-            rows = rows.get("records") or rows.get("scores") or rows.get("tops")
+            rows = rows.get("records") or rows.get("scores") or rows.get("tops") or rows.get("top")
         if not isinstance(rows, list):
             raise RuntimeError(f"Unexpected leaderboard response shape for map UID {map_uid!r}.")
         return [dict(row) for row in rows[:length]]
@@ -171,7 +211,7 @@ class NadeoServicesClient:
             return []
         query = urllib.parse.urlencode({"accountIdList": ",".join(account_ids)})
         payload = self._request_json(
-            f"{self.core_base_url}/v2/mapRecords/?mapId={urllib.parse.quote(map_id)}&{query}",
+            f"{self.core_base_url}/v2/mapRecords/by-account/?mapId={urllib.parse.quote(map_id)}&{query}",
             token=self.core_token,
         )
         records = payload.get("mapRecordList") or payload.get("records") if isinstance(payload, Mapping) else payload

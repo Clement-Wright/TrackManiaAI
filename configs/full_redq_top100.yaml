@@ -1,0 +1,168 @@
+runtime:
+  time_step_duration: 0.05
+  start_obs_capture: 0.04
+  time_step_timeout_factor: 1.0
+  act_buf_len: 2
+  wait_on_done: true
+  ep_max_length: 1000
+  sleep_time_at_reset: 1.5
+
+bridge:
+  host: "127.0.0.1"
+  telemetry_port: 9100
+  command_port: 9101
+  connect_timeout: 5.0
+  command_timeout: 5.0
+  initial_frame_timeout: 10.0
+  reconnect_delay: 1.0
+  stale_timeout: 0.25
+  reset_timeout: 5.0
+
+observation:
+  mode: full
+
+capture:
+  window_title: "Trackmania"
+  target_fps: 60
+  max_buffer_len: 64
+  backend: dxgi
+  device_idx: null
+  output_idx: null
+  bootstrap_log: true
+  require_stable_window_polls: 5
+  stable_window_poll_interval_seconds: 0.1
+  latest_frame_only: true
+  frame_timeout: 1.0
+  post_reset_flush_seconds: 0.25
+  invalid_frame_limit: 3
+  region_change_tolerance_pixels: 4
+
+full_observation:
+  window_width: 256
+  window_height: 128
+  output_width: 64
+  output_height: 64
+  grayscale: true
+  frame_stack: 4
+
+lidar_observation:
+  window_width: 958
+  window_height: 488
+  ray_count: 19
+  lidar_hist_len: 4
+  prev_action_hist_len: 2
+  fixed_crop: [0.18, 0.34, 0.82, 0.96]
+  border_threshold: 48
+  ray_min_angle_degrees: -80.0
+  ray_max_angle_degrees: 80.0
+  max_ray_length_fraction: 1.0
+
+reward:
+  mode: ghost_bundle_progress
+  spacing_meters: 0.5
+  end_of_track: 100.0
+  constant_penalty: 0.0
+  check_forward: 500
+  check_backward: 10
+  failure_countdown: 10
+  min_steps: 70
+  max_stray: 100.0
+
+eval:
+  episodes: 20
+  seed_base: 12345
+  sector_count: 10
+  record_video: false
+  video_fps: 20
+  modes: ["deterministic", "stochastic"]
+  trace_seconds: 3.0
+  final_checkpoint_eval: true
+  extraction_modes: ["deterministic_mean", "stochastic", "clipped_mean", "sample_best_of_k"]
+  temperature_sweep: [0.5, 1.0, 1.5]
+  best_of_k: 8
+
+train:
+  algorithm: redq
+  seed: 12345
+  memory_size: 1000000
+  batch_size: 256
+  environment_steps_before_training: 1000
+  max_training_steps_per_environment_step: 8.0
+  update_model_interval: 8
+  update_buffer_interval: 8
+  eval_interval_steps: 5000
+  checkpoint_interval_steps: 5000
+  queue_capacity: 8192
+  max_env_steps: null
+  cuda_training: true
+  cuda_inference: false
+  single_live_env: true
+  broadcast_after_actor_update: true
+  actor_publish_every: 1
+
+sac:
+  gamma: 0.995
+  polyak: 0.995
+  actor_lr: 3.0e-4
+  critic_lr: 5.0e-5
+  alpha_lr: 3.0e-4
+  learn_entropy_coef: false
+  alpha: 0.37
+  target_entropy: -2.0
+
+redq:
+  n_critics: 4
+  m_subset: 2
+  q_updates_per_policy_update: 5
+  share_encoders: true
+
+bc:
+  epochs: 20
+  learning_rate: 3.0e-4
+  weight_decay: 0.0
+  validation_fraction: 0.2
+
+ghosts:
+  enabled: true
+  root: "data/ghosts"
+  bundle_manifest: null
+  leaderboard_length: 100
+  group_uid: "Personal_Best"
+  only_world: true
+  default_bands: ["1-10", "11-30", "31-60", "61-100"]
+  max_representatives_per_band: 5
+  line_switch_hysteresis: 5
+
+offline_pretrain:
+  enabled: false
+  strategy: "bc_redq_awac"
+  epochs: 5
+  gradient_steps: 10000
+  batch_size: 256
+  bc_weight: 1.0
+  awac_lambda: 1.0
+  cql_alpha: 0.0
+  require_actions: true
+  seed_replay_buffer: false
+
+balanced_replay:
+  enabled: false
+  offline_initial_fraction: 0.75
+  offline_final_fraction: 0.10
+  decay_env_steps: 50000
+
+elite_archive:
+  enabled: true
+  root: "data/elite_archive"
+  max_entries: 500
+  novelty_bonus: 0.0
+  min_progress_improvement: 25.0
+
+metrics:
+  metric_version: "ghost_bundle_progress_v1"
+  enable_plts: false
+  ghost_bundle_root: "data/ghosts"
+  progress_thresholds: [50, 100, 200, 400, 800, 1200, 1600, 2000]
+
+artifacts:
+  root: "artifacts"

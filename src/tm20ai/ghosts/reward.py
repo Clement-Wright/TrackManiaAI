@@ -9,8 +9,19 @@ import pyarrow.parquet as pq
 
 from ..bridge import TelemetryFrame
 from ..config import GhostConfig, RewardConfig
-from ..env.reward import RewardStepResult
 from .dataset import load_ghost_bundle_manifest
+
+
+@dataclass(slots=True)
+class RewardStepResult:
+    reward: float
+    done_type: str | None
+    done_reason: str | None
+    progress_index: int
+    progress_delta: int
+    stray_distance: float | None
+    no_progress_steps: int
+    info: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
