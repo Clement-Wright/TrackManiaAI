@@ -87,6 +87,21 @@ def build_algorithm_comparison_report(
                 "best_deterministic_mean_final_progress_index": float(
                     best_eval_summary.get("mean_final_progress_index", 0.0) or 0.0
                 ),
+                "best_deterministic_mean_final_progress_meters": best_eval_summary.get(
+                    "mean_final_progress_meters"
+                ),
+                "best_deterministic_mean_progress_fraction_of_reference": best_eval_summary.get(
+                    "mean_progress_fraction_of_reference"
+                ),
+                "best_deterministic_mean_ghost_relative_time_delta_ms": best_eval_summary.get(
+                    "mean_ghost_relative_time_delta_ms"
+                ),
+                "best_deterministic_progress_index_semantics": best_eval_summary.get(
+                    "progress_index_semantics"
+                ),
+                "best_deterministic_progress_spacing_meters": best_eval_summary.get(
+                    "progress_spacing_meters"
+                ),
                 "best_deterministic_eval_env_step": best_eval_summary.get("env_step"),
                 "best_deterministic_summary_path": best_eval.get("summary_path"),
                 "best_deterministic_checkpoint_path": best_eval_summary.get("eval_checkpoint_path"),
@@ -96,6 +111,13 @@ def build_algorithm_comparison_report(
                 "best_deterministic_checkpoint_actor_step": best_eval_summary.get("eval_checkpoint_actor_step"),
                 "best_stochastic_mean_final_progress_index": float(
                     stochastic_summary.get("mean_final_progress_index", 0.0) or 0.0
+                ),
+                "best_stochastic_mean_final_progress_meters": stochastic_summary.get("mean_final_progress_meters"),
+                "best_stochastic_mean_progress_fraction_of_reference": stochastic_summary.get(
+                    "mean_progress_fraction_of_reference"
+                ),
+                "best_stochastic_mean_ghost_relative_time_delta_ms": stochastic_summary.get(
+                    "mean_ghost_relative_time_delta_ms"
                 ),
                 "best_stochastic_completion_rate": float(stochastic_summary.get("completion_rate", 0.0) or 0.0),
                 "determinism_conversion_score": best_eval_summary.get("determinism_conversion_score"),
@@ -139,12 +161,19 @@ def _render_algorithm_comparison_markdown(report: Mapping[str, Any]) -> str:
     for row in report.get("scoreboard", []):
         lines.append(
             f"- {row.get('algorithm')}: best_deterministic_progress={row.get('best_deterministic_mean_final_progress_index')} "
+            f"best_deterministic_m={row.get('best_deterministic_mean_final_progress_meters')} "
+            f"best_deterministic_fraction={row.get('best_deterministic_mean_progress_fraction_of_reference')} "
             f"env_steps={row.get('env_steps_reached')} learner_steps={row.get('learner_steps_reached')} "
             f"best_checkpoint={row.get('best_deterministic_checkpoint_path')}"
         )
         lines.append(
             f"-   stochastic_progress={row.get('best_stochastic_mean_final_progress_index')} "
+            f"stochastic_m={row.get('best_stochastic_mean_final_progress_meters')} "
+            f"stochastic_fraction={row.get('best_stochastic_mean_progress_fraction_of_reference')} "
+            f"ghost_delta_ms={row.get('best_deterministic_mean_ghost_relative_time_delta_ms')} "
             f"dcs={row.get('determinism_conversion_score')} "
+            f"semantics={row.get('best_deterministic_progress_index_semantics')} "
+            f"spacing_m={row.get('best_deterministic_progress_spacing_meters')} "
             f"achieved_utd_1k={row.get('achieved_utd_1k')} cumulative_utd={row.get('cumulative_utd')} "
             f"current_actor_staleness={row.get('current_actor_staleness')}"
         )
@@ -156,6 +185,7 @@ def _render_algorithm_comparison_markdown(report: Mapping[str, Any]) -> str:
                 "## Winner",
                 f"- algorithm={winner.get('algorithm')}",
                 f"- best_deterministic_progress={winner.get('best_deterministic_mean_final_progress_index')}",
+                f"- best_deterministic_progress_meters={winner.get('best_deterministic_mean_final_progress_meters')}",
                 f"- checkpoint={winner.get('best_deterministic_checkpoint_path')}",
             ]
         )

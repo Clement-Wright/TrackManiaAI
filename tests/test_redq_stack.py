@@ -118,6 +118,27 @@ def test_tm20ai_config_parses_redq_block_and_normalizes_algorithm() -> None:
             "ghosts": {
                 "enabled": True,
                 "bundle_manifest": "data/ghosts/test/ghost_bundle_manifest.json",
+                "canonical_reference_mode": "author_medal",
+                "author_reference_manifest": "data/ghosts/test/author_reference.json",
+                "unavailable_intended_policy": "selected_ghost_then_author_then_error",
+                "selected_ghost_overrides": {
+                    "map-uid": {
+                        "ghost_name_contains": "chosen_ghost.Ghost",
+                        "rank": 11,
+                    }
+                },
+                "training_family": "intended_route",
+                "ambiguous_family_policy": "mixed_with_warning",
+                "anchor_count": 24,
+                "anchor_radius_m": 12.0,
+                "canonical_divergence_radius_m": 25.0,
+                "early_reverse_window_ms": 10_000,
+                "intended_anchor_fraction_min": 0.80,
+                "exploit_anchor_fraction_max": 0.50,
+                "exploit_reverse_progress_threshold_m": 15.0,
+                "intended_candidate_pool": 30,
+                "intended_bundle_size": 15,
+                "exploit_bundle_size": 10,
                 "default_bands": ["1-10", "11-30"],
             },
             "offline_pretrain": {
@@ -134,10 +155,34 @@ def test_tm20ai_config_parses_redq_block_and_normalizes_algorithm() -> None:
             },
             "elite_archive": {"enabled": True, "max_entries": 10},
             "metrics": {"metric_version": "progress_v2", "progress_thresholds": [100, 200]},
+            "reward": {
+                "mode": "ghost_bundle_progress",
+                "corridor_mode": "map_calibrated",
+                "corridor_soft_margin_m": 25.0,
+                "corridor_hard_margin_m": 90.0,
+                "corridor_patience_steps": 60,
+                "corridor_penalty_scale": 0.03,
+                "corridor_penalty_max": 8.0,
+                "corridor_recovery_bonus": 1.0,
+                "corridor_catastrophic_distance_m": 350.0,
+                "line_switch_max_distance_m": 140.0,
+                "corridor_min_recovery_progress_m": 0.5,
+                "corridor_min_recovery_speed_kmh": 8.0,
+                "corridor_recovery_distance_delta_m": 1.0,
+            },
         }
     )
 
     assert config.train.algorithm == "redq"
+    assert config.reward.mode == "ghost_bundle_progress"
+    assert config.reward.corridor_mode == "map_calibrated"
+    assert config.reward.corridor_soft_margin_m == 25.0
+    assert config.reward.corridor_hard_margin_m == 90.0
+    assert config.reward.corridor_patience_steps == 60
+    assert config.reward.line_switch_max_distance_m == 140.0
+    assert config.reward.corridor_min_recovery_progress_m == 0.5
+    assert config.reward.corridor_min_recovery_speed_kmh == 8.0
+    assert config.reward.corridor_recovery_distance_delta_m == 1.0
     assert config.train.broadcast_after_actor_update is True
     assert config.train.actor_publish_every == 1
     assert config.eval.modes == ("deterministic", "stochastic")
@@ -151,6 +196,23 @@ def test_tm20ai_config_parses_redq_block_and_normalizes_algorithm() -> None:
     assert config.redq.q_updates_per_policy_update == 5
     assert config.redq.share_encoders is True
     assert config.ghosts.enabled is True
+    assert config.ghosts.canonical_reference_mode == "author_medal"
+    assert config.ghosts.author_reference_manifest == "data/ghosts/test/author_reference.json"
+    assert config.ghosts.unavailable_intended_policy == "selected_ghost_then_author_then_error"
+    assert config.ghosts.selected_ghost_overrides["map-uid"].ghost_name_contains == "chosen_ghost.Ghost"
+    assert config.ghosts.selected_ghost_overrides["map-uid"].rank == 11
+    assert config.ghosts.training_family == "intended_route"
+    assert config.ghosts.ambiguous_family_policy == "mixed_with_warning"
+    assert config.ghosts.anchor_count == 24
+    assert config.ghosts.anchor_radius_m == 12.0
+    assert config.ghosts.canonical_divergence_radius_m == 25.0
+    assert config.ghosts.early_reverse_window_ms == 10_000
+    assert config.ghosts.intended_anchor_fraction_min == 0.80
+    assert config.ghosts.exploit_anchor_fraction_max == 0.50
+    assert config.ghosts.exploit_reverse_progress_threshold_m == 15.0
+    assert config.ghosts.intended_candidate_pool == 30
+    assert config.ghosts.intended_bundle_size == 15
+    assert config.ghosts.exploit_bundle_size == 10
     assert config.ghosts.default_bands == ("1-10", "11-30")
     assert config.offline_pretrain.enabled is True
     assert config.balanced_replay.enabled is True
@@ -174,7 +236,60 @@ def test_tm20ai_config_parses_redq_block_and_normalizes_algorithm() -> None:
         ({"eval": {"temperature_sweep": [0.0]}}, "eval.temperature_sweep"),
         ({"eval": {"best_of_k": 0}}, "eval.best_of_k"),
         ({"reward": {"mode": "ghost_magic"}}, "reward.mode"),
+        ({"reward": {"corridor_mode": "legacy"}}, "reward.corridor_mode"),
+        ({"reward": {"corridor_soft_margin_m": -1.0}}, "reward.corridor_soft_margin_m"),
+        ({"reward": {"corridor_soft_margin_m": 10.0, "corridor_hard_margin_m": 5.0}}, "reward.corridor_hard_margin_m"),
+        ({"reward": {"corridor_patience_steps": 0}}, "reward.corridor_patience_steps"),
+        ({"reward": {"corridor_penalty_scale": -0.1}}, "reward.corridor_penalty_scale"),
+        ({"reward": {"corridor_penalty_max": -0.1}}, "reward.corridor_penalty_max"),
+        ({"reward": {"corridor_recovery_bonus": -0.1}}, "reward.corridor_recovery_bonus"),
+        (
+            {"reward": {"corridor_hard_margin_m": 100.0, "corridor_catastrophic_distance_m": 100.0}},
+            "reward.corridor_catastrophic_distance_m",
+        ),
+        ({"reward": {"line_switch_max_distance_m": 0.0}}, "reward.line_switch_max_distance_m"),
+        ({"reward": {"corridor_min_recovery_progress_m": -0.1}}, "reward.corridor_min_recovery_progress_m"),
+        ({"reward": {"corridor_min_recovery_speed_kmh": -0.1}}, "reward.corridor_min_recovery_speed_kmh"),
+        ({"reward": {"corridor_recovery_distance_delta_m": -0.1}}, "reward.corridor_recovery_distance_delta_m"),
         ({"ghosts": {"leaderboard_length": 101}}, "ghosts.leaderboard_length"),
+        ({"ghosts": {"canonical_reference_mode": "reward"}}, "ghosts.canonical_reference_mode"),
+        ({"ghosts": {"unavailable_intended_policy": "mixed"}}, "ghosts.unavailable_intended_policy"),
+        ({"ghosts": {"training_family": "exploit"}}, "ghosts.training_family"),
+        ({"ghosts": {"ambiguous_family_policy": "block"}}, "ghosts.ambiguous_family_policy"),
+        ({"ghosts": {"selected_ghost_overrides": {"map": {}}}}, "ghosts.selected_ghost_overrides"),
+        (
+            {"ghosts": {"selected_ghost_overrides": {"map": {"ghost_name_contains": ""}}}},
+            "ghosts.selected_ghost_overrides",
+        ),
+        (
+            {"ghosts": {"selected_ghost_overrides": {"map": {"rank": 0}}}},
+            "ghosts.selected_ghost_overrides",
+        ),
+        ({"ghosts": {"anchor_count": 1}}, "ghosts.anchor_count"),
+        ({"ghosts": {"anchor_radius_m": 0.0}}, "ghosts.anchor_radius_m"),
+        ({"ghosts": {"canonical_divergence_radius_m": 0.0}}, "ghosts.canonical_divergence_radius_m"),
+        (
+            {"ghosts": {"anchor_radius_m": 12.0, "canonical_divergence_radius_m": 10.0}},
+            "ghosts.canonical_divergence_radius_m",
+        ),
+        ({"ghosts": {"early_reverse_window_ms": -1}}, "ghosts.early_reverse_window_ms"),
+        ({"ghosts": {"intended_anchor_fraction_min": 1.2}}, "ghosts.intended_anchor_fraction_min"),
+        ({"ghosts": {"exploit_anchor_fraction_max": -0.1}}, "ghosts.exploit_anchor_fraction_max"),
+        (
+            {"ghosts": {"intended_anchor_fraction_min": 0.4, "exploit_anchor_fraction_max": 0.5}},
+            "ghosts.intended_anchor_fraction_min",
+        ),
+        (
+            {"ghosts": {"exploit_reverse_progress_threshold_m": -1.0}},
+            "ghosts.exploit_reverse_progress_threshold_m",
+        ),
+        ({"ghosts": {"intended_candidate_pool": 0}}, "ghosts.intended_candidate_pool"),
+        ({"ghosts": {"intended_bundle_size": 0}}, "ghosts.intended_bundle_size"),
+        (
+            {"ghosts": {"intended_candidate_pool": 10, "intended_bundle_size": 11}},
+            "ghosts.intended_bundle_size",
+        ),
+        ({"ghosts": {"exploit_bundle_size": 0}}, "ghosts.exploit_bundle_size"),
         ({"balanced_replay": {"offline_initial_fraction": 1.5}}, "balanced_replay"),
     ],
 )
@@ -197,6 +312,36 @@ def test_shipped_redq_configs_use_4_critic_shared_encoder_baseline(config_name: 
     assert config.redq.n_critics == 4
     assert config.redq.m_subset == 2
     assert config.redq.share_encoders is True
+
+
+def test_top100_redq_config_uses_map_calibrated_corridor() -> None:
+    config = load_tm20ai_config(ROOT / "configs" / "full_redq_top100.yaml")
+
+    assert config.reward.mode == "ghost_bundle_progress"
+    assert config.reward.corridor_mode == "map_calibrated"
+    assert config.reward.corridor_soft_margin_m == 25.0
+    assert config.reward.corridor_hard_margin_m == 90.0
+    assert config.reward.corridor_patience_steps == 20
+    assert config.reward.corridor_penalty_scale == 0.03
+    assert config.reward.corridor_penalty_max == 8.0
+    assert config.reward.corridor_recovery_bonus == 1.0
+    assert config.reward.corridor_catastrophic_distance_m == 350.0
+    assert config.reward.line_switch_max_distance_m == 140.0
+    assert config.reward.corridor_min_recovery_progress_m == 0.5
+    assert config.reward.corridor_min_recovery_speed_kmh == 8.0
+    assert config.reward.corridor_recovery_distance_delta_m == 1.0
+    assert config.metrics.metric_version == "ghost_bundle_progress_v2_fixed_spacing"
+    assert config.ghosts.unavailable_intended_policy == "selected_ghost_then_author_then_error"
+
+
+def test_tmrl_test_top100_redq_config_uses_selected_ghost_override() -> None:
+    config = load_tm20ai_config(ROOT / "configs" / "full_redq_top100_tmrl_test.yaml")
+
+    selector = config.ghosts.selected_ghost_overrides["oqIJ5rQDRrNwLPTh9H2p_W4tLof"]
+    assert config.train.algorithm == "redq"
+    assert config.ghosts.unavailable_intended_policy == "selected_ghost_then_author_then_error"
+    assert selector.ghost_name_contains == "isfoo_(00_33_798)_tmrl-test.Ghost"
+    assert selector.rank == 11
 
 
 def test_redq_agent_update_smoke_for_full() -> None:

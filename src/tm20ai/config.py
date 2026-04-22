@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -225,6 +225,18 @@ class RewardConfig:
     failure_countdown: int = 10
     min_steps: int = 70
     max_stray: float = 100.0
+    corridor_mode: str = "static"
+    corridor_soft_margin_m: float = 25.0
+    corridor_hard_margin_m: float = 100.0
+    corridor_patience_steps: int = 60
+    corridor_penalty_scale: float = 0.03
+    corridor_penalty_max: float = 8.0
+    corridor_recovery_bonus: float = 1.0
+    corridor_catastrophic_distance_m: float = 350.0
+    line_switch_max_distance_m: float = 140.0
+    corridor_min_recovery_progress_m: float = 0.5
+    corridor_min_recovery_speed_kmh: float = 8.0
+    corridor_recovery_distance_delta_m: float = 1.0
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "RewardConfig":
@@ -234,6 +246,48 @@ class RewardConfig:
                 "reward.mode must be one of ['trajectory_progress', 'ghost_bundle_progress'], "
                 f"got {mode!r}."
             )
+        max_stray = float(payload.get("max_stray", 100.0))
+        corridor_mode = str(payload.get("corridor_mode", "static")).strip().lower()
+        if corridor_mode not in {"static", "map_calibrated"}:
+            raise ConfigError(
+                "reward.corridor_mode must be one of ['static', 'map_calibrated'], "
+                f"got {corridor_mode!r}."
+            )
+        corridor_soft_margin_m = float(payload.get("corridor_soft_margin_m", 25.0))
+        corridor_hard_margin_m = float(payload.get("corridor_hard_margin_m", max_stray))
+        corridor_patience_steps = int(payload.get("corridor_patience_steps", 60))
+        corridor_penalty_scale = float(payload.get("corridor_penalty_scale", 0.03))
+        corridor_penalty_max = float(payload.get("corridor_penalty_max", 8.0))
+        corridor_recovery_bonus = float(payload.get("corridor_recovery_bonus", 1.0))
+        corridor_catastrophic_distance_m = float(payload.get("corridor_catastrophic_distance_m", 350.0))
+        line_switch_max_distance_m = float(payload.get("line_switch_max_distance_m", 140.0))
+        corridor_min_recovery_progress_m = float(payload.get("corridor_min_recovery_progress_m", 0.5))
+        corridor_min_recovery_speed_kmh = float(payload.get("corridor_min_recovery_speed_kmh", 8.0))
+        corridor_recovery_distance_delta_m = float(payload.get("corridor_recovery_distance_delta_m", 1.0))
+        if corridor_soft_margin_m < 0.0:
+            raise ConfigError("reward.corridor_soft_margin_m must be >= 0.")
+        if corridor_hard_margin_m < corridor_soft_margin_m:
+            raise ConfigError("reward.corridor_hard_margin_m must be >= reward.corridor_soft_margin_m.")
+        if corridor_patience_steps < 1:
+            raise ConfigError("reward.corridor_patience_steps must be >= 1.")
+        if corridor_penalty_scale < 0.0:
+            raise ConfigError("reward.corridor_penalty_scale must be >= 0.")
+        if corridor_penalty_max < 0.0:
+            raise ConfigError("reward.corridor_penalty_max must be >= 0.")
+        if corridor_recovery_bonus < 0.0:
+            raise ConfigError("reward.corridor_recovery_bonus must be >= 0.")
+        if corridor_catastrophic_distance_m <= corridor_hard_margin_m:
+            raise ConfigError(
+                "reward.corridor_catastrophic_distance_m must be greater than reward.corridor_hard_margin_m."
+            )
+        if line_switch_max_distance_m <= 0.0:
+            raise ConfigError("reward.line_switch_max_distance_m must be > 0.")
+        if corridor_min_recovery_progress_m < 0.0:
+            raise ConfigError("reward.corridor_min_recovery_progress_m must be >= 0.")
+        if corridor_min_recovery_speed_kmh < 0.0:
+            raise ConfigError("reward.corridor_min_recovery_speed_kmh must be >= 0.")
+        if corridor_recovery_distance_delta_m < 0.0:
+            raise ConfigError("reward.corridor_recovery_distance_delta_m must be >= 0.")
         return cls(
             mode=mode,
             spacing_meters=float(payload.get("spacing_meters", 0.5)),
@@ -243,7 +297,19 @@ class RewardConfig:
             check_backward=int(payload.get("check_backward", 10)),
             failure_countdown=int(payload.get("failure_countdown", 10)),
             min_steps=int(payload.get("min_steps", 70)),
-            max_stray=float(payload.get("max_stray", 100.0)),
+            max_stray=max_stray,
+            corridor_mode=corridor_mode,
+            corridor_soft_margin_m=corridor_soft_margin_m,
+            corridor_hard_margin_m=corridor_hard_margin_m,
+            corridor_patience_steps=corridor_patience_steps,
+            corridor_penalty_scale=corridor_penalty_scale,
+            corridor_penalty_max=corridor_penalty_max,
+            corridor_recovery_bonus=corridor_recovery_bonus,
+            corridor_catastrophic_distance_m=corridor_catastrophic_distance_m,
+            line_switch_max_distance_m=line_switch_max_distance_m,
+            corridor_min_recovery_progress_m=corridor_min_recovery_progress_m,
+            corridor_min_recovery_speed_kmh=corridor_min_recovery_speed_kmh,
+            corridor_recovery_distance_delta_m=corridor_recovery_distance_delta_m,
         )
 
 
@@ -510,6 +576,46 @@ class BCConfig:
 
 
 @dataclass(slots=True)
+class GhostSelectionOverrideConfig:
+    ghost_name_contains: str | None = None
+    rank: int | None = None
+
+    @classmethod
+    def from_mapping(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        context: str,
+    ) -> "GhostSelectionOverrideConfig":
+        ghost_name_contains = payload.get("ghost_name_contains")
+        if ghost_name_contains is not None:
+            ghost_name_contains = str(ghost_name_contains).strip()
+            if not ghost_name_contains:
+                raise ConfigError(f"{context}.ghost_name_contains must be a non-empty string when provided.")
+        rank = payload.get("rank")
+        if rank in (None, "null"):
+            rank_value = None
+        else:
+            rank_value = int(rank)
+            if rank_value < 1:
+                raise ConfigError(f"{context}.rank must be >= 1, got {rank_value}.")
+        if ghost_name_contains is None and rank_value is None:
+            raise ConfigError(f"{context} must provide ghost_name_contains and/or rank.")
+        return cls(
+            ghost_name_contains=ghost_name_contains,
+            rank=rank_value,
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if self.ghost_name_contains is not None:
+            payload["ghost_name_contains"] = self.ghost_name_contains
+        if self.rank is not None:
+            payload["rank"] = self.rank
+        return payload
+
+
+@dataclass(slots=True)
 class GhostConfig:
     enabled: bool = False
     root: str = "data/ghosts"
@@ -517,6 +623,22 @@ class GhostConfig:
     leaderboard_length: int = 100
     group_uid: str = "Personal_Best"
     only_world: bool = True
+    canonical_reference_mode: str = "author_medal"
+    author_reference_manifest: str | None = None
+    unavailable_intended_policy: str = "selected_ghost_then_author_then_error"
+    selected_ghost_overrides: dict[str, "GhostSelectionOverrideConfig"] = field(default_factory=dict)
+    training_family: str = "intended_route"
+    ambiguous_family_policy: str = "mixed_with_warning"
+    anchor_count: int = 24
+    anchor_radius_m: float = 12.0
+    canonical_divergence_radius_m: float = 25.0
+    early_reverse_window_ms: int = 10_000
+    intended_anchor_fraction_min: float = 0.80
+    exploit_anchor_fraction_max: float = 0.50
+    exploit_reverse_progress_threshold_m: float = 15.0
+    intended_candidate_pool: int = 30
+    intended_bundle_size: int = 15
+    exploit_bundle_size: int = 10
     default_bands: tuple[str, ...] = ("1-10", "11-30", "31-60", "61-100")
     max_representatives_per_band: int = 5
     line_switch_hysteresis: int = 5
@@ -532,10 +654,110 @@ class GhostConfig:
                 "ghosts.max_representatives_per_band must be >= 1, "
                 f"got {max_representatives_per_band}."
             )
+        canonical_reference_mode = str(payload.get("canonical_reference_mode", "author_medal")).strip().lower()
+        if canonical_reference_mode not in {"author_medal"}:
+            raise ConfigError(
+                "ghosts.canonical_reference_mode must be 'author_medal', "
+                f"got {canonical_reference_mode!r}."
+            )
+        unavailable_intended_policy = str(
+            payload.get("unavailable_intended_policy", "selected_ghost_then_author_then_error")
+        ).strip().lower()
+        if unavailable_intended_policy not in {"selected_ghost_then_author_then_error"}:
+            raise ConfigError(
+                "ghosts.unavailable_intended_policy must be 'selected_ghost_then_author_then_error', "
+                f"got {unavailable_intended_policy!r}."
+            )
+        training_family = str(payload.get("training_family", "intended_route")).strip().lower()
+        if training_family not in {"intended_route"}:
+            raise ConfigError(
+                "ghosts.training_family must be 'intended_route', "
+                f"got {training_family!r}."
+            )
+        ambiguous_family_policy = str(payload.get("ambiguous_family_policy", "mixed_with_warning")).strip().lower()
+        if ambiguous_family_policy not in {"mixed_with_warning"}:
+            raise ConfigError(
+                "ghosts.ambiguous_family_policy must be 'mixed_with_warning', "
+                f"got {ambiguous_family_policy!r}."
+            )
+        anchor_count = int(payload.get("anchor_count", 24))
+        if anchor_count < 2:
+            raise ConfigError(f"ghosts.anchor_count must be >= 2, got {anchor_count}.")
+        anchor_radius_m = float(payload.get("anchor_radius_m", 12.0))
+        if anchor_radius_m <= 0.0:
+            raise ConfigError(f"ghosts.anchor_radius_m must be > 0, got {anchor_radius_m}.")
+        canonical_divergence_radius_m = float(payload.get("canonical_divergence_radius_m", 25.0))
+        if canonical_divergence_radius_m <= 0.0:
+            raise ConfigError(
+                "ghosts.canonical_divergence_radius_m must be > 0, "
+                f"got {canonical_divergence_radius_m}."
+            )
+        if canonical_divergence_radius_m < anchor_radius_m:
+            raise ConfigError(
+                "ghosts.canonical_divergence_radius_m must be >= ghosts.anchor_radius_m, "
+                f"got {canonical_divergence_radius_m} < {anchor_radius_m}."
+            )
+        early_reverse_window_ms = int(payload.get("early_reverse_window_ms", 10_000))
+        if early_reverse_window_ms < 0:
+            raise ConfigError(f"ghosts.early_reverse_window_ms must be >= 0, got {early_reverse_window_ms}.")
+        intended_anchor_fraction_min = float(payload.get("intended_anchor_fraction_min", 0.80))
+        exploit_anchor_fraction_max = float(payload.get("exploit_anchor_fraction_max", 0.50))
+        if not 0.0 <= exploit_anchor_fraction_max <= 1.0:
+            raise ConfigError(
+                "ghosts.exploit_anchor_fraction_max must be within [0, 1], "
+                f"got {exploit_anchor_fraction_max}."
+            )
+        if not 0.0 <= intended_anchor_fraction_min <= 1.0:
+            raise ConfigError(
+                "ghosts.intended_anchor_fraction_min must be within [0, 1], "
+                f"got {intended_anchor_fraction_min}."
+            )
+        if intended_anchor_fraction_min <= exploit_anchor_fraction_max:
+            raise ConfigError(
+                "ghosts.intended_anchor_fraction_min must be > ghosts.exploit_anchor_fraction_max, "
+                f"got {intended_anchor_fraction_min} <= {exploit_anchor_fraction_max}."
+            )
+        exploit_reverse_progress_threshold_m = float(payload.get("exploit_reverse_progress_threshold_m", 15.0))
+        if exploit_reverse_progress_threshold_m < 0.0:
+            raise ConfigError(
+                "ghosts.exploit_reverse_progress_threshold_m must be >= 0, "
+                f"got {exploit_reverse_progress_threshold_m}."
+            )
+        intended_candidate_pool = int(payload.get("intended_candidate_pool", 30))
+        if intended_candidate_pool < 1:
+            raise ConfigError(f"ghosts.intended_candidate_pool must be >= 1, got {intended_candidate_pool}.")
+        intended_bundle_size = int(payload.get("intended_bundle_size", 15))
+        if intended_bundle_size < 1:
+            raise ConfigError(f"ghosts.intended_bundle_size must be >= 1, got {intended_bundle_size}.")
+        if intended_bundle_size > intended_candidate_pool:
+            raise ConfigError(
+                "ghosts.intended_bundle_size must be <= ghosts.intended_candidate_pool, "
+                f"got {intended_bundle_size} > {intended_candidate_pool}."
+            )
+        exploit_bundle_size = int(payload.get("exploit_bundle_size", 10))
+        if exploit_bundle_size < 1:
+            raise ConfigError(f"ghosts.exploit_bundle_size must be >= 1, got {exploit_bundle_size}.")
         line_switch_hysteresis = int(payload.get("line_switch_hysteresis", 5))
         if line_switch_hysteresis < 0:
             raise ConfigError(f"ghosts.line_switch_hysteresis must be >= 0, got {line_switch_hysteresis}.")
+        selected_ghost_overrides_payload = payload.get("selected_ghost_overrides", {})
+        if selected_ghost_overrides_payload in (None, "null"):
+            selected_ghost_overrides_payload = {}
+        selected_ghost_overrides_mapping = _mapping(
+            selected_ghost_overrides_payload,
+            context="ghosts.selected_ghost_overrides",
+        )
+        selected_ghost_overrides: dict[str, GhostSelectionOverrideConfig] = {}
+        for raw_map_uid, raw_selector in selected_ghost_overrides_mapping.items():
+            map_uid = str(raw_map_uid).strip()
+            if not map_uid:
+                raise ConfigError("ghosts.selected_ghost_overrides keys must be non-empty map UIDs.")
+            selected_ghost_overrides[map_uid] = GhostSelectionOverrideConfig.from_mapping(
+                _mapping(raw_selector, context=f"ghosts.selected_ghost_overrides[{map_uid!r}]"),
+                context=f"ghosts.selected_ghost_overrides[{map_uid!r}]",
+            )
         bundle_manifest = payload.get("bundle_manifest")
+        author_reference_manifest = payload.get("author_reference_manifest")
         return cls(
             enabled=_bool(payload.get("enabled", False), context="ghosts.enabled"),
             root=str(payload.get("root", "data/ghosts")),
@@ -543,6 +765,24 @@ class GhostConfig:
             leaderboard_length=leaderboard_length,
             group_uid=str(payload.get("group_uid", "Personal_Best")),
             only_world=_bool(payload.get("only_world", True), context="ghosts.only_world"),
+            canonical_reference_mode=canonical_reference_mode,
+            author_reference_manifest=(
+                None if author_reference_manifest in (None, "null") else str(author_reference_manifest)
+            ),
+            unavailable_intended_policy=unavailable_intended_policy,
+            selected_ghost_overrides=selected_ghost_overrides,
+            training_family=training_family,
+            ambiguous_family_policy=ambiguous_family_policy,
+            anchor_count=anchor_count,
+            anchor_radius_m=anchor_radius_m,
+            canonical_divergence_radius_m=canonical_divergence_radius_m,
+            early_reverse_window_ms=early_reverse_window_ms,
+            intended_anchor_fraction_min=intended_anchor_fraction_min,
+            exploit_anchor_fraction_max=exploit_anchor_fraction_max,
+            exploit_reverse_progress_threshold_m=exploit_reverse_progress_threshold_m,
+            intended_candidate_pool=intended_candidate_pool,
+            intended_bundle_size=intended_bundle_size,
+            exploit_bundle_size=exploit_bundle_size,
             default_bands=_string_tuple(
                 payload.get("default_bands"),
                 context="ghosts.default_bands",

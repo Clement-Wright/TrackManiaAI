@@ -18,6 +18,7 @@ def _write_summary(
     checkpoint_rows: list[dict],
     termination_reason: str = "max_env_steps",
     clean_shutdown: bool = True,
+    extra_summary: dict | None = None,
 ) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     summary = {
@@ -56,6 +57,8 @@ def _write_summary(
         "timestamp": "2026-04-11T00:10:00+00:00",
         "observation_mode": "full",
     }
+    if extra_summary:
+        summary.update(extra_summary)
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
 
@@ -71,6 +74,18 @@ def test_write_training_report_handles_interrupted_run(tmp_path) -> None:
                 "env_step": 5000,
                 "mean_final_progress_index": 150.0,
                 "median_final_progress_index": 120.0,
+                "mean_final_progress_meters": 75.0,
+                "median_final_progress_meters": 60.0,
+                "mean_final_arc_length_m": 75.0,
+                "median_final_arc_length_m": 60.0,
+                "mean_progress_fraction_of_reference": 0.6,
+                "median_progress_fraction_of_reference": 0.55,
+                "reference_total_arc_length_m": 125.0,
+                "mean_ghost_relative_time_delta_ms": 320.0,
+                "median_ghost_relative_time_delta_ms": 300.0,
+                "best_ghost_relative_time_delta_ms": 250.0,
+                "progress_spacing_meters": 0.5,
+                "progress_index_semantics": "fixed_spacing_meters",
                 "completion_rate": 0.0,
                 "best_reward": 300.0,
             },
@@ -98,6 +113,28 @@ def test_write_training_report_handles_interrupted_run(tmp_path) -> None:
         checkpoint_rows=checkpoint_rows,
         termination_reason="fatal_error",
         clean_shutdown=False,
+        extra_summary={
+            "ghost_bundle_manifest_path": "C:/ghosts/test-map/ghost_bundle_manifest.json",
+            "canonical_reference_source": "author_reference_manifest",
+            "canonical_reference_path": "C:/ghosts/test-map/author_reference.json",
+            "strategy_classification_status": "classified",
+            "selected_training_family": "intended_route",
+            "mixed_fallback": False,
+            "bundle_resolution_mode": "intended_route",
+            "selected_ghost_selector": None,
+            "resolved_selected_ghost_rank": None,
+            "resolved_selected_ghost_name": None,
+            "author_fallback_used": False,
+            "intended_bundle_manifest_path": "C:/ghosts/test-map/ghost_bundle_intended.json",
+            "exploit_bundle_manifest_path": "C:/ghosts/test-map/ghost_bundle_exploit.json",
+            "selected_override_manifest_path": None,
+            "author_fallback_manifest_path": None,
+            "strategy_family_counts": {
+                "intended_route": 15,
+                "shortcut_or_exploit": 10,
+                "unclassified": 3,
+            },
+        },
     )
     video_path = run_dir / "rollout.mp4"
     video_path.write_bytes(b"fake")
@@ -109,6 +146,16 @@ def test_write_training_report_handles_interrupted_run(tmp_path) -> None:
     assert report["failure_notes"]
     assert str(video_path.resolve()) in report["videos"]
     assert report["eval_history_table"][0]["mean_final_progress_index"] == 150.0
+    assert report["eval_history_table"][0]["mean_final_progress_meters"] == 75.0
+    assert report["eval_history_table"][0]["mean_progress_fraction_of_reference"] == 0.6
+    assert report["eval_history_table"][0]["mean_ghost_relative_time_delta_ms"] == 320.0
+    assert report["selected_training_family"] == "intended_route"
+    assert report["mixed_fallback"] is False
+    assert report["bundle_resolution_mode"] == "intended_route"
+    markdown = report_paths.markdown_path.read_text(encoding="utf-8")
+    assert "Strategy selection: status=classified family=intended_route mixed_fallback=False" in markdown
+    assert "Bundle resolution: mode=intended_route selector=None resolved_rank=None resolved_name=None author_fallback_used=False" in markdown
+    assert "Canonical reference: source=author_reference_manifest path=C:/ghosts/test-map/author_reference.json" in markdown
 
 
 def test_write_comparison_report_builds_bc_comparison(tmp_path) -> None:
@@ -268,6 +315,13 @@ def test_write_training_report_includes_diagnostics_sections_and_event_logs(tmp_
                 "positive_progress_fraction": {"mean": 0.6},
                 "nonpositive_progress_fraction": {"mean": 0.4},
                 "max_no_progress_streak": {"p95": 18.0},
+                "final_arc_length_m": {"mean": 75.0},
+                "progress_fraction_of_reference": {"mean": 0.6},
+                "ghost_relative_time_delta_ms": {"mean": 320.0},
+                "corridor_violation_fraction": {"mean": 0.25},
+                "corridor_distance_m": {"p95": 42.0},
+                "max_corridor_distance_m": {"p95": 80.0},
+                "termination_reason_counts": {"corridor_violation": 2},
             },
             "movement_diagnostics": {
                 "no_movement_episode_count": 2,
@@ -305,6 +359,11 @@ def test_write_training_report_includes_diagnostics_sections_and_event_logs(tmp_
     assert "## Diagnostics" in markdown
     assert "Bottleneck verdict: worker_env" in markdown
     assert "achieved_utd_1k=1.75 cumulative_utd=2.0 current_actor_staleness=12" in markdown
+    assert "final_arc_length_mean=75.0" in markdown
+    assert "progress_fraction_mean=0.6" in markdown
+    assert "ghost_delta_mean_ms=320.0" in markdown
+    assert "corridor_violation_fraction_mean=0.25" in markdown
+    assert "corridor_truncations=2" in markdown
 
 
 def test_write_training_report_preserves_per_mode_eval_rows(tmp_path) -> None:

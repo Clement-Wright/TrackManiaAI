@@ -45,6 +45,41 @@ class RewardEpisodeState:
     current_nonpositive_reward_streak: int = 0
     max_nonpositive_reward_streak: int = 0
     final_no_progress_steps: int = 0
+    corridor_violation_steps: int = 0
+    corridor_hard_violation_steps: int = 0
+    corridor_nonrecovering_steps: int = 0
+    max_corridor_violation_steps: int = 0
+    max_corridor_nonrecovering_steps: int = 0
+    corridor_recovery_count: int = 0
+    corridor_truncation_count: int = 0
+    total_corridor_penalty: float = 0.0
+    final_corridor_distance_m: float | None = None
+    max_corridor_distance_m: float | None = None
+    final_corridor_soft_radius_m: float | None = None
+    final_corridor_hard_radius_m: float | None = None
+    final_progress_meters: float | None = None
+    final_arc_length_m: float | None = None
+    final_progress_fraction_of_reference: float | None = None
+    reference_total_arc_length_m: float | None = None
+    final_ghost_relative_time_delta_ms: float | None = None
+    progress_spacing_meters: float | None = None
+    progress_index_semantics: str | None = None
+    ghost_bundle_manifest_path: str | None = None
+    canonical_reference_source: str | None = None
+    canonical_reference_path: str | None = None
+    strategy_classification_status: str | None = None
+    selected_training_family: str | None = None
+    mixed_fallback: bool | None = None
+    bundle_resolution_mode: str | None = None
+    selected_ghost_selector: dict[str, Any] | None = None
+    resolved_selected_ghost_rank: int | None = None
+    resolved_selected_ghost_name: str | None = None
+    author_fallback_used: bool | None = None
+    intended_bundle_manifest_path: str | None = None
+    exploit_bundle_manifest_path: str | None = None
+    selected_override_manifest_path: str | None = None
+    author_fallback_manifest_path: str | None = None
+    strategy_family_counts: dict[str, int] | None = None
 
 
 @dataclass(slots=True)
@@ -112,6 +147,7 @@ class SACWorker:
         self._env_step = 0
         self._episode_state = TrainingEpisodeState()
         self._reward_episode_state = RewardEpisodeState()
+        self._last_route_provenance: dict[str, Any] = {}
         self._last_heartbeat = monotonic()
         self._pending_transitions: list[dict[str, Any]] = []
         self._shutdown_requested = False
@@ -260,6 +296,106 @@ class SACWorker:
         else:
             state.current_nonpositive_reward_streak = 0
         state.final_no_progress_steps = int(info.get("no_progress_steps", 0) or 0)
+        progress_meters = info.get("progress_arc_length_m", info.get("trajectory_arc_length_m"))
+        if progress_meters is not None:
+            state.final_progress_meters = float(progress_meters)
+        final_arc_length_m = info.get("final_arc_length_m", progress_meters)
+        if final_arc_length_m is not None:
+            state.final_arc_length_m = float(final_arc_length_m)
+        if info.get("progress_fraction_of_reference") is not None:
+            state.final_progress_fraction_of_reference = float(info.get("progress_fraction_of_reference", 0.0) or 0.0)
+        if info.get("reference_total_arc_length_m") is not None:
+            state.reference_total_arc_length_m = float(info.get("reference_total_arc_length_m", 0.0) or 0.0)
+        if info.get("ghost_relative_time_delta_ms") is not None:
+            state.final_ghost_relative_time_delta_ms = float(info.get("ghost_relative_time_delta_ms", 0.0) or 0.0)
+        if info.get("progress_spacing_meters") is not None:
+            state.progress_spacing_meters = float(info.get("progress_spacing_meters", 0.0))
+        if info.get("progress_index_semantics") is not None:
+            state.progress_index_semantics = str(info.get("progress_index_semantics"))
+        if info.get("ghost_bundle_manifest_path") is not None:
+            state.ghost_bundle_manifest_path = str(info.get("ghost_bundle_manifest_path"))
+        if info.get("canonical_reference_source") is not None:
+            state.canonical_reference_source = str(info.get("canonical_reference_source"))
+        if info.get("canonical_reference_path") is not None:
+            state.canonical_reference_path = str(info.get("canonical_reference_path"))
+        if info.get("strategy_classification_status") is not None:
+            state.strategy_classification_status = str(info.get("strategy_classification_status"))
+        if info.get("selected_training_family") is not None:
+            state.selected_training_family = str(info.get("selected_training_family"))
+        if info.get("mixed_fallback") is not None:
+            state.mixed_fallback = bool(info.get("mixed_fallback"))
+        if info.get("bundle_resolution_mode") is not None:
+            state.bundle_resolution_mode = str(info.get("bundle_resolution_mode"))
+        if info.get("selected_ghost_selector") is not None:
+            state.selected_ghost_selector = dict(info.get("selected_ghost_selector") or {})
+        if info.get("resolved_selected_ghost_rank") is not None:
+            state.resolved_selected_ghost_rank = int(info.get("resolved_selected_ghost_rank"))
+        if info.get("resolved_selected_ghost_name") is not None:
+            state.resolved_selected_ghost_name = str(info.get("resolved_selected_ghost_name"))
+        if info.get("author_fallback_used") is not None:
+            state.author_fallback_used = bool(info.get("author_fallback_used"))
+        if info.get("intended_bundle_manifest_path") is not None:
+            state.intended_bundle_manifest_path = str(info.get("intended_bundle_manifest_path"))
+        if info.get("exploit_bundle_manifest_path") is not None:
+            state.exploit_bundle_manifest_path = str(info.get("exploit_bundle_manifest_path"))
+        if info.get("selected_override_manifest_path") is not None:
+            state.selected_override_manifest_path = str(info.get("selected_override_manifest_path"))
+        if info.get("author_fallback_manifest_path") is not None:
+            state.author_fallback_manifest_path = str(info.get("author_fallback_manifest_path"))
+        if info.get("strategy_family_counts") is not None:
+            state.strategy_family_counts = dict(info.get("strategy_family_counts") or {})
+        self._last_route_provenance = {
+            "ghost_bundle_manifest_path": state.ghost_bundle_manifest_path,
+            "canonical_reference_source": state.canonical_reference_source,
+            "canonical_reference_path": state.canonical_reference_path,
+            "strategy_classification_status": state.strategy_classification_status,
+            "selected_training_family": state.selected_training_family,
+            "mixed_fallback": state.mixed_fallback,
+            "bundle_resolution_mode": state.bundle_resolution_mode,
+            "selected_ghost_selector": state.selected_ghost_selector,
+            "resolved_selected_ghost_rank": state.resolved_selected_ghost_rank,
+            "resolved_selected_ghost_name": state.resolved_selected_ghost_name,
+            "author_fallback_used": state.author_fallback_used,
+            "intended_bundle_manifest_path": state.intended_bundle_manifest_path,
+            "exploit_bundle_manifest_path": state.exploit_bundle_manifest_path,
+            "selected_override_manifest_path": state.selected_override_manifest_path,
+            "author_fallback_manifest_path": state.author_fallback_manifest_path,
+            "strategy_family_counts": state.strategy_family_counts,
+        }
+        corridor_distance = info.get("corridor_distance_m", info.get("stray_distance"))
+        if corridor_distance is not None:
+            distance = float(corridor_distance)
+            state.final_corridor_distance_m = distance
+            if state.max_corridor_distance_m is None:
+                state.max_corridor_distance_m = distance
+            else:
+                state.max_corridor_distance_m = max(state.max_corridor_distance_m, distance)
+        state.final_corridor_soft_radius_m = (
+            None if info.get("corridor_soft_radius_m") is None else float(info.get("corridor_soft_radius_m", 0.0))
+        )
+        state.final_corridor_hard_radius_m = (
+            None if info.get("corridor_hard_radius_m") is None else float(info.get("corridor_hard_radius_m", 0.0))
+        )
+        if bool(info.get("corridor_soft_violation", False)):
+            state.corridor_violation_steps += 1
+        if bool(info.get("corridor_hard_violation", False)):
+            state.corridor_hard_violation_steps += 1
+        state.max_corridor_violation_steps = max(
+            state.max_corridor_violation_steps,
+            int(info.get("corridor_violation_steps", 0) or 0),
+        )
+        state.corridor_nonrecovering_steps = int(
+            info.get("corridor_nonrecovering_steps", state.corridor_nonrecovering_steps) or 0
+        )
+        state.max_corridor_nonrecovering_steps = max(
+            state.max_corridor_nonrecovering_steps,
+            state.corridor_nonrecovering_steps,
+        )
+        state.corridor_recovery_count = int(info.get("corridor_recovery_count", state.corridor_recovery_count) or 0)
+        state.corridor_truncation_count = int(
+            info.get("corridor_truncation_count", state.corridor_truncation_count) or 0
+        )
+        state.total_corridor_penalty += float(info.get("corridor_penalty", 0.0) or 0.0)
 
     def _reward_episode_summary(self, info: Mapping[str, Any]) -> dict[str, Any]:
         state = self._reward_episode_state
@@ -271,6 +407,43 @@ class SACWorker:
             "max_nonpositive_reward_streak": state.max_nonpositive_reward_streak,
             "final_no_progress_steps": state.final_no_progress_steps,
             "reset_reason": info.get("reward_reason") or info.get("terminal_reason"),
+            "final_progress_meters": state.final_progress_meters,
+            "final_arc_length_m": state.final_arc_length_m,
+            "progress_fraction_of_reference": state.final_progress_fraction_of_reference,
+            "reference_total_arc_length_m": state.reference_total_arc_length_m,
+            "ghost_relative_time_delta_ms": state.final_ghost_relative_time_delta_ms,
+            "progress_spacing_meters": state.progress_spacing_meters,
+            "progress_index_semantics": state.progress_index_semantics,
+            "ghost_bundle_manifest_path": state.ghost_bundle_manifest_path,
+            "canonical_reference_source": state.canonical_reference_source,
+            "canonical_reference_path": state.canonical_reference_path,
+            "strategy_classification_status": state.strategy_classification_status,
+            "selected_training_family": state.selected_training_family,
+            "mixed_fallback": state.mixed_fallback,
+            "bundle_resolution_mode": state.bundle_resolution_mode,
+            "selected_ghost_selector": state.selected_ghost_selector,
+            "resolved_selected_ghost_rank": state.resolved_selected_ghost_rank,
+            "resolved_selected_ghost_name": state.resolved_selected_ghost_name,
+            "author_fallback_used": state.author_fallback_used,
+            "intended_bundle_manifest_path": state.intended_bundle_manifest_path,
+            "exploit_bundle_manifest_path": state.exploit_bundle_manifest_path,
+            "selected_override_manifest_path": state.selected_override_manifest_path,
+            "author_fallback_manifest_path": state.author_fallback_manifest_path,
+            "strategy_family_counts": state.strategy_family_counts,
+            "corridor_distance_m": state.final_corridor_distance_m,
+            "max_corridor_distance_m": state.max_corridor_distance_m,
+            "corridor_soft_radius_m": state.final_corridor_soft_radius_m,
+            "corridor_hard_radius_m": state.final_corridor_hard_radius_m,
+            "corridor_penalty": state.total_corridor_penalty,
+            "mean_corridor_penalty": state.total_corridor_penalty / steps,
+            "corridor_violation_steps": state.corridor_violation_steps,
+            "corridor_hard_violation_steps": state.corridor_hard_violation_steps,
+            "corridor_nonrecovering_steps": state.corridor_nonrecovering_steps,
+            "max_corridor_violation_steps": state.max_corridor_violation_steps,
+            "max_corridor_nonrecovering_steps": state.max_corridor_nonrecovering_steps,
+            "corridor_recovery_count": state.corridor_recovery_count,
+            "corridor_violation_fraction": state.corridor_violation_steps / steps,
+            "corridor_truncation_count": state.corridor_truncation_count,
         }
 
     def _control_metrics_snapshot(self) -> dict[str, Any]:
@@ -494,6 +667,7 @@ class SACWorker:
                             "control_ready_reason": self._control_ready_reason,
                             "runtime_profile": self._runtime_profile_snapshot(),
                             "queue_profile": self._queue_profile_snapshot(),
+                            **self._last_route_provenance,
                         }
                     )
 
@@ -510,6 +684,28 @@ class SACWorker:
                                 "episode_reward": self._episode_state.episode_reward,
                                 "step_count": self._episode_state.step_count,
                                 "final_progress_index": float(next_info.get("progress_index", 0.0) or 0.0),
+                                "final_progress_meters": float(
+                                    next_info.get(
+                                        "progress_arc_length_m",
+                                        next_info.get("trajectory_arc_length_m", 0.0),
+                                    )
+                                    or 0.0
+                                ),
+                                "final_arc_length_m": float(
+                                    next_info.get(
+                                        "final_arc_length_m",
+                                        next_info.get(
+                                            "progress_arc_length_m",
+                                            next_info.get("trajectory_arc_length_m", 0.0),
+                                        ),
+                                    )
+                                    or 0.0
+                                ),
+                                "progress_fraction_of_reference": next_info.get("progress_fraction_of_reference"),
+                                "reference_total_arc_length_m": next_info.get("reference_total_arc_length_m"),
+                                "ghost_relative_time_delta_ms": next_info.get("ghost_relative_time_delta_ms"),
+                                "progress_spacing_meters": next_info.get("progress_spacing_meters"),
+                                "progress_index_semantics": next_info.get("progress_index_semantics"),
                                 "termination_reason": next_info.get("reward_reason") or next_info.get("terminal_reason"),
                                 "map_uid": next_info.get("map_uid"),
                                 "run_id": next_info.get("run_id"),
@@ -725,6 +921,26 @@ class SACWorker:
             payload["final_frame_id"] = int(info.get("frame_id", 0) or 0)
             payload["final_race_time_ms"] = int(info.get("race_time_ms", 0) or 0)
             payload["termination_reason"] = info.get("reward_reason") or info.get("terminal_reason")
+            for key in (
+                "final_arc_length_m",
+                "progress_fraction_of_reference",
+                "reference_total_arc_length_m",
+                "ghost_relative_time_delta_ms",
+                "corridor_distance_m",
+                "corridor_soft_radius_m",
+                "corridor_hard_radius_m",
+                "corridor_penalty",
+                "corridor_violation_steps",
+                "corridor_nonrecovering_steps",
+                "corridor_recovery_count",
+                "corridor_truncation_count",
+                "corridor_recovering",
+                "corridor_distance_delta_m",
+                "corridor_progress_delta_m",
+                "corridor_speed_kmh",
+            ):
+                if key in info:
+                    payload[key] = info.get(key)
         self._write_worker_event("movement_episode_summary", payload)
         self._put_message({"type": "movement_episode_summary", "summary": payload})
         self._movement_state = MovementEpisodeState()
@@ -1263,6 +1479,7 @@ class SACWorker:
                     "control_ready_reason": self._control_ready_reason,
                     "runtime_profile": self._runtime_profile_snapshot(),
                     "queue_profile": self._queue_profile_snapshot(),
+                    **self._last_route_provenance,
                 }
             )
             self._write_actor_status()

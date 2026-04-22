@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from tm20ai.train.metrics import ActiveStepBenchmark, mode_comparison_metrics
+from tm20ai.train.metrics import ActiveStepBenchmark, aggregate_episode_summaries, mode_comparison_metrics
 
 
 def test_active_step_benchmark_excludes_reset_time_from_drift() -> None:
@@ -75,3 +75,49 @@ def test_mode_comparison_metrics_compute_determinism_conversion_score() -> None:
     assert metrics["determinism_conversion_score"] == 0.5
     assert metrics["deterministic_stochastic_progress_gap"] == -50.0
     assert metrics["deterministic_stochastic_completion_gap"] == -0.25
+
+
+def test_aggregate_episode_summaries_reports_progress_meters_and_corridor_rate() -> None:
+    summary = aggregate_episode_summaries(
+        [
+            {
+                "completion_flag": False,
+                "final_progress_index": 10,
+                "final_progress_meters": 5.0,
+                "final_arc_length_m": 5.0,
+                "progress_fraction_of_reference": 0.25,
+                "reference_total_arc_length_m": 20.0,
+                "progress_spacing_meters": 0.5,
+                "progress_index_semantics": "fixed_spacing_meters",
+                "ghost_relative_time_delta_ms": 120.0,
+                "termination_reason": "corridor_violation",
+                "episode_reward_total": 1.0,
+            },
+            {
+                "completion_flag": False,
+                "final_progress_index": 20,
+                "final_progress_meters": 10.0,
+                "final_arc_length_m": 10.0,
+                "progress_fraction_of_reference": 0.5,
+                "reference_total_arc_length_m": 20.0,
+                "progress_spacing_meters": 0.5,
+                "progress_index_semantics": "fixed_spacing_meters",
+                "ghost_relative_time_delta_ms": 80.0,
+                "termination_reason": "no_progress",
+                "episode_reward_total": 2.0,
+            },
+        ],
+        sector_count=2,
+    )
+
+    assert summary["mean_final_progress_index"] == 15.0
+    assert summary["mean_final_progress_meters"] == 7.5
+    assert summary["mean_final_arc_length_m"] == 7.5
+    assert summary["median_final_progress_meters"] == 7.5
+    assert summary["mean_progress_fraction_of_reference"] == 0.375
+    assert summary["reference_total_arc_length_m"] == 20.0
+    assert summary["progress_spacing_meters"] == 0.5
+    assert summary["progress_index_semantics"] == "fixed_spacing_meters"
+    assert summary["mean_ghost_relative_time_delta_ms"] == 100.0
+    assert summary["best_ghost_relative_time_delta_ms"] == 80.0
+    assert summary["corridor_violation_truncation_rate"] == 0.5

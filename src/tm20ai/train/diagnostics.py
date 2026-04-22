@@ -240,6 +240,23 @@ class EpisodeDiagnosticsTracker:
     max_no_progress_streaks: list[int] = field(default_factory=list)
     max_nonpositive_reward_streaks: list[int] = field(default_factory=list)
     final_no_progress_steps: list[int] = field(default_factory=list)
+    final_progress_meters: list[float] = field(default_factory=list)
+    final_arc_length_m: list[float] = field(default_factory=list)
+    progress_fraction_of_reference: list[float] = field(default_factory=list)
+    reference_total_arc_length_m: list[float] = field(default_factory=list)
+    ghost_relative_time_delta_ms: list[float] = field(default_factory=list)
+    progress_spacings_meters: list[float] = field(default_factory=list)
+    progress_index_semantics_counts: dict[str, int] = field(default_factory=dict)
+    corridor_distances_m: list[float] = field(default_factory=list)
+    max_corridor_distances_m: list[float] = field(default_factory=list)
+    corridor_soft_radii_m: list[float] = field(default_factory=list)
+    corridor_hard_radii_m: list[float] = field(default_factory=list)
+    corridor_penalties: list[float] = field(default_factory=list)
+    corridor_violation_fractions: list[float] = field(default_factory=list)
+    corridor_violation_steps: list[int] = field(default_factory=list)
+    corridor_nonrecovering_steps: list[int] = field(default_factory=list)
+    corridor_recovery_counts: list[int] = field(default_factory=list)
+    corridor_truncation_counts: list[int] = field(default_factory=list)
     termination_reason_counts: dict[str, int] = field(default_factory=dict)
 
     def record(self, payload: Mapping[str, Any]) -> None:
@@ -249,6 +266,35 @@ class EpisodeDiagnosticsTracker:
         self.max_no_progress_streaks.append(int(payload.get("max_no_progress_streak", 0) or 0))
         self.max_nonpositive_reward_streaks.append(int(payload.get("max_nonpositive_reward_streak", 0) or 0))
         self.final_no_progress_steps.append(int(payload.get("final_no_progress_steps", 0) or 0))
+        if payload.get("final_progress_meters") is not None:
+            self.final_progress_meters.append(float(payload.get("final_progress_meters", 0.0) or 0.0))
+        if payload.get("final_arc_length_m") is not None:
+            self.final_arc_length_m.append(float(payload.get("final_arc_length_m", 0.0) or 0.0))
+        if payload.get("progress_fraction_of_reference") is not None:
+            self.progress_fraction_of_reference.append(float(payload.get("progress_fraction_of_reference", 0.0) or 0.0))
+        if payload.get("reference_total_arc_length_m") is not None:
+            self.reference_total_arc_length_m.append(float(payload.get("reference_total_arc_length_m", 0.0) or 0.0))
+        if payload.get("ghost_relative_time_delta_ms") is not None:
+            self.ghost_relative_time_delta_ms.append(float(payload.get("ghost_relative_time_delta_ms", 0.0) or 0.0))
+        if payload.get("progress_spacing_meters") is not None:
+            self.progress_spacings_meters.append(float(payload.get("progress_spacing_meters", 0.0) or 0.0))
+        if payload.get("progress_index_semantics") is not None:
+            semantics = str(payload.get("progress_index_semantics"))
+            self.progress_index_semantics_counts[semantics] = self.progress_index_semantics_counts.get(semantics, 0) + 1
+        for key, target in (
+            ("corridor_distance_m", self.corridor_distances_m),
+            ("max_corridor_distance_m", self.max_corridor_distances_m),
+            ("corridor_soft_radius_m", self.corridor_soft_radii_m),
+            ("corridor_hard_radius_m", self.corridor_hard_radii_m),
+            ("corridor_penalty", self.corridor_penalties),
+            ("corridor_violation_fraction", self.corridor_violation_fractions),
+        ):
+            if payload.get(key) is not None:
+                target.append(float(payload.get(key, 0.0) or 0.0))
+        self.corridor_violation_steps.append(int(payload.get("corridor_violation_steps", 0) or 0))
+        self.corridor_nonrecovering_steps.append(int(payload.get("corridor_nonrecovering_steps", 0) or 0))
+        self.corridor_recovery_counts.append(int(payload.get("corridor_recovery_count", 0) or 0))
+        self.corridor_truncation_counts.append(int(payload.get("corridor_truncation_count", 0) or 0))
         termination_reason = str(payload.get("termination_reason") or "unknown")
         self.termination_reason_counts[termination_reason] = self.termination_reason_counts.get(termination_reason, 0) + 1
 
@@ -260,6 +306,23 @@ class EpisodeDiagnosticsTracker:
             "max_no_progress_streak": summarize_values(self.max_no_progress_streaks),
             "max_nonpositive_reward_streak": summarize_values(self.max_nonpositive_reward_streaks),
             "final_no_progress_steps": summarize_values(self.final_no_progress_steps),
+            "final_progress_meters": summarize_values(self.final_progress_meters),
+            "final_arc_length_m": summarize_values(self.final_arc_length_m),
+            "progress_fraction_of_reference": summarize_values(self.progress_fraction_of_reference),
+            "reference_total_arc_length_m": summarize_values(self.reference_total_arc_length_m),
+            "ghost_relative_time_delta_ms": summarize_values(self.ghost_relative_time_delta_ms),
+            "progress_spacing_meters": summarize_values(self.progress_spacings_meters),
+            "progress_index_semantics_counts": dict(sorted(self.progress_index_semantics_counts.items())),
+            "corridor_distance_m": summarize_values(self.corridor_distances_m),
+            "max_corridor_distance_m": summarize_values(self.max_corridor_distances_m),
+            "corridor_soft_radius_m": summarize_values(self.corridor_soft_radii_m),
+            "corridor_hard_radius_m": summarize_values(self.corridor_hard_radii_m),
+            "corridor_penalty": summarize_values(self.corridor_penalties),
+            "corridor_violation_fraction": summarize_values(self.corridor_violation_fractions),
+            "corridor_violation_steps": summarize_values(self.corridor_violation_steps),
+            "corridor_nonrecovering_steps": summarize_values(self.corridor_nonrecovering_steps),
+            "corridor_recovery_count": summarize_values(self.corridor_recovery_counts),
+            "corridor_truncation_count": summarize_values(self.corridor_truncation_counts),
             "termination_reason_counts": dict(sorted(self.termination_reason_counts.items())),
         }
 

@@ -144,7 +144,10 @@ ghosts:
   canonical_reference_mode: "author_medal"
   author_reference_manifest: null
   unavailable_intended_policy: "selected_ghost_then_author_then_error"
-  selected_ghost_overrides: {}
+  selected_ghost_overrides:
+    oqIJ5rQDRrNwLPTh9H2p_W4tLof:
+      ghost_name_contains: "isfoo_(00_33_798)_tmrl-test.Ghost"
+      rank: 11
   training_family: "intended_route"
   ambiguous_family_policy: "mixed_with_warning"
   anchor_count: 24

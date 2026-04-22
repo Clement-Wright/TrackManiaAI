@@ -20,6 +20,7 @@ from ..config import TM20AIConfig, load_tm20ai_config
 from ..data.dataset import seed_replay_from_demo_sidecars
 from ..data.parquet_writer import build_run_artifact_paths, ensure_directory, sha256_file, timestamp_tag, write_json
 from ..ghosts.elite_archive import EliteArchive
+from ..ghosts.dataset import load_ghost_bundle_manifest
 from ..ghosts.offline import seed_replay_from_ghost_bundle
 from ..train.features import TELEMETRY_DIM
 from .diagnostics import (
@@ -120,6 +121,22 @@ class SACLearner:
         self.demo_root = None if demo_root is None else str(Path(demo_root).resolve())
         self.replay_seeded = False
         self.ghost_bundle_manifest_path: str | None = None
+        self.ghost_bundle_metadata: dict[str, Any] | None = None
+        self.canonical_reference_source: str | None = None
+        self.canonical_reference_path: str | None = None
+        self.strategy_classification_status: str | None = None
+        self.selected_training_family: str | None = None
+        self.mixed_fallback: bool | None = None
+        self.bundle_resolution_mode: str | None = None
+        self.selected_ghost_selector: dict[str, Any] | None = None
+        self.resolved_selected_ghost_rank: int | None = None
+        self.resolved_selected_ghost_name: str | None = None
+        self.author_fallback_used: bool | None = None
+        self.intended_bundle_manifest_path: str | None = None
+        self.exploit_bundle_manifest_path: str | None = None
+        self.selected_override_manifest_path: str | None = None
+        self.author_fallback_manifest_path: str | None = None
+        self.strategy_family_counts: dict[str, int] | None = None
         self.offline_init_checkpoint_path: str | None = None
         self.offline_pretrain_metadata: dict[str, Any] | None = None
         self.offline_dataset_metadata: dict[str, Any] | None = None
@@ -323,6 +340,97 @@ class SACLearner:
     def _cumulative_utd(self) -> float:
         return float(self.learner_step) / float(max(self.env_step, 1))
 
+    def _refresh_ghost_bundle_provenance(self) -> None:
+        if self.ghost_bundle_manifest_path is None:
+            self.ghost_bundle_metadata = None
+            self.canonical_reference_source = None
+            self.canonical_reference_path = None
+            self.strategy_classification_status = None
+            self.selected_training_family = None
+            self.mixed_fallback = None
+            self.bundle_resolution_mode = None
+            self.selected_ghost_selector = None
+            self.resolved_selected_ghost_rank = None
+            self.resolved_selected_ghost_name = None
+            self.author_fallback_used = None
+            self.intended_bundle_manifest_path = None
+            self.exploit_bundle_manifest_path = None
+            self.selected_override_manifest_path = None
+            self.author_fallback_manifest_path = None
+            self.strategy_family_counts = None
+            return
+        manifest = load_ghost_bundle_manifest(self.ghost_bundle_manifest_path)
+        self.ghost_bundle_metadata = manifest
+        self.canonical_reference_source = None if manifest.get("canonical_reference_source") is None else str(
+            manifest.get("canonical_reference_source")
+        )
+        self.canonical_reference_path = None if manifest.get("canonical_reference_path") is None else str(
+            manifest.get("canonical_reference_path")
+        )
+        self.strategy_classification_status = None if manifest.get("strategy_classification_status") is None else str(
+            manifest.get("strategy_classification_status")
+        )
+        self.selected_training_family = None if manifest.get("selected_training_family") is None else str(
+            manifest.get("selected_training_family")
+        )
+        self.mixed_fallback = None if manifest.get("mixed_fallback") is None else bool(manifest.get("mixed_fallback"))
+        self.bundle_resolution_mode = None if manifest.get("bundle_resolution_mode") is None else str(
+            manifest.get("bundle_resolution_mode")
+        )
+        selected_ghost_selector = manifest.get("selected_ghost_selector")
+        self.selected_ghost_selector = None if selected_ghost_selector is None else dict(selected_ghost_selector)
+        self.resolved_selected_ghost_rank = (
+            None
+            if manifest.get("resolved_selected_ghost_rank") is None
+            else int(manifest.get("resolved_selected_ghost_rank"))
+        )
+        self.resolved_selected_ghost_name = (
+            None
+            if manifest.get("resolved_selected_ghost_name") is None
+            else str(manifest.get("resolved_selected_ghost_name"))
+        )
+        self.author_fallback_used = (
+            None if manifest.get("author_fallback_used") is None else bool(manifest.get("author_fallback_used"))
+        )
+        self.intended_bundle_manifest_path = None if manifest.get("intended_bundle_manifest_path") is None else str(
+            manifest.get("intended_bundle_manifest_path")
+        )
+        self.exploit_bundle_manifest_path = None if manifest.get("exploit_bundle_manifest_path") is None else str(
+            manifest.get("exploit_bundle_manifest_path")
+        )
+        self.selected_override_manifest_path = (
+            None
+            if manifest.get("selected_override_manifest_path") is None
+            else str(manifest.get("selected_override_manifest_path"))
+        )
+        self.author_fallback_manifest_path = (
+            None
+            if manifest.get("author_fallback_manifest_path") is None
+            else str(manifest.get("author_fallback_manifest_path"))
+        )
+        strategy_family_counts = manifest.get("strategy_family_counts")
+        self.strategy_family_counts = None if strategy_family_counts is None else dict(strategy_family_counts)
+
+    def _ghost_bundle_provenance_payload(self) -> dict[str, Any]:
+        return {
+            "ghost_bundle_manifest_path": self.ghost_bundle_manifest_path,
+            "canonical_reference_source": self.canonical_reference_source,
+            "canonical_reference_path": self.canonical_reference_path,
+            "strategy_classification_status": self.strategy_classification_status,
+            "selected_training_family": self.selected_training_family,
+            "mixed_fallback": self.mixed_fallback,
+            "bundle_resolution_mode": self.bundle_resolution_mode,
+            "selected_ghost_selector": self.selected_ghost_selector,
+            "resolved_selected_ghost_rank": self.resolved_selected_ghost_rank,
+            "resolved_selected_ghost_name": self.resolved_selected_ghost_name,
+            "author_fallback_used": self.author_fallback_used,
+            "intended_bundle_manifest_path": self.intended_bundle_manifest_path,
+            "exploit_bundle_manifest_path": self.exploit_bundle_manifest_path,
+            "selected_override_manifest_path": self.selected_override_manifest_path,
+            "author_fallback_manifest_path": self.author_fallback_manifest_path,
+            "strategy_family_counts": self.strategy_family_counts,
+        }
+
     def _wall_clock_limit_reached(self) -> bool:
         if self.max_wall_clock_minutes is None:
             return False
@@ -384,6 +492,15 @@ class SACLearner:
             "demo_root": self.demo_root,
             "replay_seeded": self.replay_seeded,
             "ghost_bundle_manifest_path": getattr(self, "ghost_bundle_manifest_path", None),
+            "ghost_bundle_metadata": getattr(self, "ghost_bundle_metadata", None),
+            "canonical_reference_source": getattr(self, "canonical_reference_source", None),
+            "canonical_reference_path": getattr(self, "canonical_reference_path", None),
+            "strategy_classification_status": getattr(self, "strategy_classification_status", None),
+            "selected_training_family": getattr(self, "selected_training_family", None),
+            "mixed_fallback": getattr(self, "mixed_fallback", None),
+            "intended_bundle_manifest_path": getattr(self, "intended_bundle_manifest_path", None),
+            "exploit_bundle_manifest_path": getattr(self, "exploit_bundle_manifest_path", None),
+            "strategy_family_counts": getattr(self, "strategy_family_counts", None),
             "offline_init_checkpoint_path": getattr(self, "offline_init_checkpoint_path", None),
             "offline_pretrain_metadata": getattr(self, "offline_pretrain_metadata", None),
             "offline_dataset_metadata": getattr(self, "offline_dataset_metadata", None),
@@ -446,6 +563,10 @@ class SACLearner:
     def load_checkpoint(self, checkpoint_path: str | Path) -> None:
         payload = torch.load(Path(checkpoint_path).resolve(), map_location=self.device)
         self.agent.load_state_dict(payload)
+        checkpoint_bundle_path = payload.get("ghost_bundle_manifest_path")
+        if checkpoint_bundle_path is not None and self.ghost_bundle_manifest_path is None:
+            self.ghost_bundle_manifest_path = str(checkpoint_bundle_path)
+        self._refresh_ghost_bundle_provenance()
         self.learner_step = int(payload.get("learner_step", 0))
         self.env_step = int(payload.get("env_step", 0))
         self._reschedule_from_counters()
@@ -461,6 +582,7 @@ class SACLearner:
             "env_step": self.env_step,
             "config_snapshot": self.config_snapshot,
             "run_name": self.run_name,
+            **self._ghost_bundle_provenance_payload(),
         }
         torch.save(payload, checkpoint_path)
         write_json(
@@ -493,6 +615,7 @@ class SACLearner:
                 "bc_checkpoint_path": self.bc_checkpoint_path,
                 "demo_root": self.demo_root,
                 "replay_seeded": self.replay_seeded,
+                **self._ghost_bundle_provenance_payload(),
             },
         )
         self.latest_checkpoint_path = checkpoint_path
@@ -946,6 +1069,38 @@ class SACLearner:
                 self.worker_runtime_profile = dict(message["runtime_profile"])
             if message.get("queue_profile") is not None:
                 self.worker_queue_profile = dict(message["queue_profile"])
+            if message.get("ghost_bundle_manifest_path") is not None:
+                self.ghost_bundle_manifest_path = str(message["ghost_bundle_manifest_path"])
+            if message.get("canonical_reference_source") is not None:
+                self.canonical_reference_source = str(message["canonical_reference_source"])
+            if message.get("canonical_reference_path") is not None:
+                self.canonical_reference_path = str(message["canonical_reference_path"])
+            if message.get("strategy_classification_status") is not None:
+                self.strategy_classification_status = str(message["strategy_classification_status"])
+            if message.get("selected_training_family") is not None:
+                self.selected_training_family = str(message["selected_training_family"])
+            if message.get("mixed_fallback") is not None:
+                self.mixed_fallback = bool(message["mixed_fallback"])
+            if message.get("bundle_resolution_mode") is not None:
+                self.bundle_resolution_mode = str(message["bundle_resolution_mode"])
+            if message.get("selected_ghost_selector") is not None:
+                self.selected_ghost_selector = dict(message["selected_ghost_selector"] or {})
+            if message.get("resolved_selected_ghost_rank") is not None:
+                self.resolved_selected_ghost_rank = int(message["resolved_selected_ghost_rank"])
+            if message.get("resolved_selected_ghost_name") is not None:
+                self.resolved_selected_ghost_name = str(message["resolved_selected_ghost_name"])
+            if message.get("author_fallback_used") is not None:
+                self.author_fallback_used = bool(message["author_fallback_used"])
+            if message.get("intended_bundle_manifest_path") is not None:
+                self.intended_bundle_manifest_path = str(message["intended_bundle_manifest_path"])
+            if message.get("exploit_bundle_manifest_path") is not None:
+                self.exploit_bundle_manifest_path = str(message["exploit_bundle_manifest_path"])
+            if message.get("selected_override_manifest_path") is not None:
+                self.selected_override_manifest_path = str(message["selected_override_manifest_path"])
+            if message.get("author_fallback_manifest_path") is not None:
+                self.author_fallback_manifest_path = str(message["author_fallback_manifest_path"])
+            if message.get("strategy_family_counts") is not None:
+                self.strategy_family_counts = dict(message["strategy_family_counts"] or {})
             if isinstance(message.get("latest_action_stats"), Mapping):
                 self.actor_sync_tracker.record_control_window(
                     dict(message["latest_action_stats"]),
@@ -1293,6 +1448,7 @@ class REDQLearner(SACLearner):
             if ghost_bundle is not None
             else self.config.ghosts.bundle_manifest
         )
+        self._refresh_ghost_bundle_provenance()
         self.offline_init_checkpoint_path = (
             None if offline_init_checkpoint is None else str(Path(offline_init_checkpoint).resolve())
         )
@@ -1433,6 +1589,10 @@ class REDQLearner(SACLearner):
     def load_checkpoint(self, checkpoint_path: str | Path) -> None:
         payload = torch.load(Path(checkpoint_path).resolve(), map_location=self.device)
         self.agent.load_state_dict(payload)
+        checkpoint_bundle_path = payload.get("ghost_bundle_manifest_path")
+        if checkpoint_bundle_path is not None and self.ghost_bundle_manifest_path is None:
+            self.ghost_bundle_manifest_path = str(checkpoint_bundle_path)
+        self._refresh_ghost_bundle_provenance()
         self.learner_step = int(payload.get("learner_step", 0))
         self.actor_step = int(payload.get("actor_step", 0))
         self.env_step = int(payload.get("env_step", 0))
@@ -1449,6 +1609,16 @@ class REDQLearner(SACLearner):
             "ghost_bundle_manifest_path": payload.get("ghost_bundle_manifest_path"),
             "offline_dataset_hash": payload.get("offline_dataset_hash"),
             "offline_transition_count": payload.get("offline_transition_count"),
+            "canonical_reference_source": payload.get("canonical_reference_source"),
+            "canonical_reference_path": payload.get("canonical_reference_path"),
+            "strategy_classification_status": payload.get("strategy_classification_status"),
+            "selected_training_family": payload.get("selected_training_family"),
+            "mixed_fallback": payload.get("mixed_fallback"),
+            "bundle_resolution_mode": payload.get("bundle_resolution_mode"),
+            "selected_ghost_selector": payload.get("selected_ghost_selector"),
+            "resolved_selected_ghost_rank": payload.get("resolved_selected_ghost_rank"),
+            "resolved_selected_ghost_name": payload.get("resolved_selected_ghost_name"),
+            "author_fallback_used": payload.get("author_fallback_used"),
         }
 
     def _ready_for_control(self) -> bool:
@@ -1484,7 +1654,7 @@ class REDQLearner(SACLearner):
             "env_step": self.env_step,
             "config_snapshot": self.config_snapshot,
             "run_name": self.run_name,
-            "ghost_bundle_manifest_path": self.ghost_bundle_manifest_path,
+            **self._ghost_bundle_provenance_payload(),
             "offline_pretrain_strategy": (
                 None if self.offline_pretrain_metadata is None else self.offline_pretrain_metadata.get("offline_pretrain_strategy")
             ),
@@ -1525,7 +1695,7 @@ class REDQLearner(SACLearner):
                 "bc_checkpoint_path": self.bc_checkpoint_path,
                 "demo_root": self.demo_root,
                 "replay_seeded": self.replay_seeded,
-                "ghost_bundle_manifest_path": self.ghost_bundle_manifest_path,
+                **self._ghost_bundle_provenance_payload(),
                 "offline_init_checkpoint_path": self.offline_init_checkpoint_path,
                 "offline_pretrain_metadata": self.offline_pretrain_metadata,
                 "offline_dataset_metadata": self.offline_dataset_metadata,

@@ -340,6 +340,34 @@ def test_learner_checkpoint_roundtrip_and_command_scheduling(tmp_path) -> None:
     write_train_config(config_path, artifacts_root, trajectory_path)
 
     demo_root = tmp_path / "demo_root"
+    ghost_root = tmp_path / "ghosts" / "test-map"
+    ghost_root.mkdir(parents=True, exist_ok=True)
+    ghost_manifest_path = ghost_root / "ghost_bundle_manifest.json"
+    intended_manifest_path = ghost_root / "ghost_bundle_intended.json"
+    exploit_manifest_path = ghost_root / "ghost_bundle_exploit.json"
+    for manifest_path, family in (
+        (ghost_manifest_path, "intended_route"),
+        (intended_manifest_path, "intended_route"),
+        (exploit_manifest_path, "shortcut_or_exploit"),
+    ):
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "ghost_bundle_v1",
+                    "selected_training_family": family,
+                    "mixed_fallback": False,
+                    "canonical_reference_source": "author_reference_manifest",
+                    "canonical_reference_path": str((ghost_root / "author_reference.json").resolve()),
+                    "strategy_classification_status": "classified",
+                    "strategy_family_counts": {
+                        "intended_route": 12,
+                        "shortcut_or_exploit": 4,
+                        "unclassified": 1,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
     learner = SACLearner(
         config_path=config_path,
         run_name="unit_train",
@@ -453,6 +481,19 @@ def test_learner_checkpoint_roundtrip_and_command_scheduling(tmp_path) -> None:
             "last_actor_apply_env_step": learner.env_step,
             "last_actor_apply_episode_index": 1,
             "control_ready_reason": desired_actor_payload["control_ready_reason"],
+            "ghost_bundle_manifest_path": str(ghost_manifest_path.resolve()),
+            "canonical_reference_source": "author_reference_manifest",
+            "canonical_reference_path": str((ghost_root / "author_reference.json").resolve()),
+            "strategy_classification_status": "classified",
+            "selected_training_family": "intended_route",
+            "mixed_fallback": False,
+            "intended_bundle_manifest_path": str(intended_manifest_path.resolve()),
+            "exploit_bundle_manifest_path": str(exploit_manifest_path.resolve()),
+            "strategy_family_counts": {
+                "intended_route": 12,
+                "shortcut_or_exploit": 4,
+                "unclassified": 1,
+            },
         }
     )
     assert learner.drain_messages(timeout=0.01) == 0
@@ -577,6 +618,10 @@ def test_learner_checkpoint_roundtrip_and_command_scheduling(tmp_path) -> None:
     assert summary_payload["demo_root"] == str(demo_root.resolve())
     assert summary_payload["eval_episodes"] == 3
     assert summary_payload["last_worker_heartbeat"] is not None
+    assert summary_payload["selected_training_family"] == "intended_route"
+    assert summary_payload["mixed_fallback"] is False
+    assert summary_payload["canonical_reference_source"] == "author_reference_manifest"
+    assert summary_payload["strategy_family_counts"]["shortcut_or_exploit"] == 4
     checkpoint_sidecar = json.loads(checkpoint_path.with_suffix(".json").read_text(encoding="utf-8"))
     assert checkpoint_sidecar["desired_actor_ready_for_control"] is True
     assert checkpoint_sidecar["ready_for_control_seen"] is True
@@ -585,6 +630,8 @@ def test_learner_checkpoint_roundtrip_and_command_scheduling(tmp_path) -> None:
     assert checkpoint_sidecar["init_mode"] == "scratch"
     assert checkpoint_sidecar["demo_root"] == str(demo_root.resolve())
     assert checkpoint_sidecar["replay_seeded"] is False
+    assert checkpoint_sidecar["selected_training_family"] == "intended_route"
+    assert checkpoint_sidecar["canonical_reference_path"] == str((ghost_root / "author_reference.json").resolve())
     learner.close()
     restored.close()
 
@@ -847,7 +894,21 @@ def test_worker_logs_first_sustained_movement_stall(tmp_path) -> None:
             "pos_xyz": (1.0, 0.0, 0.0),
         }
     )
-    worker._finalize_movement_episode({"run_id": "run-stall", "frame_id": 3, "race_time_ms": 1600, "reward_reason": "no_progress"})
+    worker._finalize_movement_episode(
+        {
+            "run_id": "run-stall",
+            "frame_id": 3,
+            "race_time_ms": 1600,
+            "reward_reason": "no_progress",
+            "corridor_distance_m": 42.0,
+            "corridor_soft_radius_m": 25.0,
+            "corridor_hard_radius_m": 90.0,
+            "corridor_penalty": 1.5,
+            "corridor_violation_steps": 2,
+            "corridor_recovery_count": 1,
+            "corridor_truncation_count": 0,
+        }
+    )
 
     worker_events = [
         json.loads(line)
@@ -864,3 +925,98 @@ def test_worker_logs_first_sustained_movement_stall(tmp_path) -> None:
     assert summary["payload"]["movement_started"] is True
     assert summary["payload"]["stall_count"] == 1
     assert summary["payload"]["first_stall"]["race_time_ms"] == 500
+    assert summary["payload"]["corridor_distance_m"] == 42.0
+    assert summary["payload"]["corridor_penalty"] == 1.5
+
+
+def test_worker_reward_episode_summary_includes_corridor_diagnostics(tmp_path) -> None:
+    config_path = tmp_path / "config.yaml"
+    artifacts_root = tmp_path / "artifacts"
+    trajectory_path = tmp_path / "reward" / "trajectory_0p5m.npz"
+    write_train_config(config_path, artifacts_root, trajectory_path)
+
+    worker = SACWorker(
+        config_path=str(config_path),
+        command_queue=queue.Queue(),
+        output_queue=queue.Queue(),
+        eval_result_queue=queue.Queue(),
+        shutdown_event=threading.Event(),
+        worker_done_event=threading.Event(),
+        bootstrap_log_path=str(artifacts_root / "worker_bootstrap.log"),
+        env_factory=lambda _path, _benchmark=False: FakeTrainingEnv(),
+    )
+    worker._begin_reward_episode()
+    worker._observe_reward_step(
+        reward=-1.0,
+        info={
+            "progress_delta": 0,
+            "no_progress_steps": 1,
+            "final_arc_length_m": 4.0,
+            "progress_arc_length_m": 4.0,
+            "reference_total_arc_length_m": 20.0,
+            "progress_fraction_of_reference": 0.2,
+            "ghost_relative_time_delta_ms": 100.0,
+            "progress_spacing_meters": 0.5,
+            "progress_index_semantics": "fixed_spacing_meters",
+            "corridor_distance_m": 40.0,
+            "corridor_soft_radius_m": 25.0,
+            "corridor_hard_radius_m": 90.0,
+            "corridor_penalty": 1.0,
+            "corridor_soft_violation": True,
+            "corridor_hard_violation": False,
+            "corridor_violation_steps": 0,
+            "corridor_recovery_count": 0,
+            "corridor_truncation_count": 0,
+            "ghost_bundle_manifest_path": str((tmp_path / "ghosts" / "test-map" / "ghost_bundle_manifest.json").resolve()),
+            "canonical_reference_source": "author_reference_manifest",
+            "canonical_reference_path": str((tmp_path / "ghosts" / "test-map" / "author_reference.json").resolve()),
+            "strategy_classification_status": "classified",
+            "selected_training_family": "intended_route",
+            "mixed_fallback": False,
+            "intended_bundle_manifest_path": str((tmp_path / "ghosts" / "test-map" / "ghost_bundle_intended.json").resolve()),
+            "exploit_bundle_manifest_path": str((tmp_path / "ghosts" / "test-map" / "ghost_bundle_exploit.json").resolve()),
+            "strategy_family_counts": {
+                "intended_route": 12,
+                "shortcut_or_exploit": 4,
+                "unclassified": 1,
+            },
+        },
+    )
+    worker._observe_reward_step(
+        reward=2.0,
+        info={
+            "progress_delta": 1,
+            "no_progress_steps": 0,
+            "final_arc_length_m": 10.0,
+            "progress_arc_length_m": 10.0,
+            "reference_total_arc_length_m": 20.0,
+            "progress_fraction_of_reference": 0.5,
+            "ghost_relative_time_delta_ms": 50.0,
+            "progress_spacing_meters": 0.5,
+            "progress_index_semantics": "fixed_spacing_meters",
+            "corridor_distance_m": 10.0,
+            "corridor_soft_radius_m": 25.0,
+            "corridor_hard_radius_m": 90.0,
+            "corridor_penalty": 0.0,
+            "corridor_soft_violation": False,
+            "corridor_hard_violation": False,
+            "corridor_violation_steps": 0,
+            "corridor_recovery_count": 1,
+            "corridor_truncation_count": 0,
+        },
+    )
+
+    summary = worker._reward_episode_summary({"reward_reason": "finished"})
+
+    assert summary["corridor_distance_m"] == 10.0
+    assert summary["max_corridor_distance_m"] == 40.0
+    assert summary["corridor_violation_fraction"] == 0.5
+    assert summary["corridor_recovery_count"] == 1
+    assert summary["corridor_penalty"] == 1.0
+    assert summary["final_arc_length_m"] == 10.0
+    assert summary["progress_fraction_of_reference"] == 0.5
+    assert summary["ghost_relative_time_delta_ms"] == 50.0
+    assert summary["selected_training_family"] == "intended_route"
+    assert summary["mixed_fallback"] is False
+    assert summary["canonical_reference_source"] == "author_reference_manifest"
+    assert summary["strategy_family_counts"]["shortcut_or_exploit"] == 4

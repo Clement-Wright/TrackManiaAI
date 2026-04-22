@@ -59,6 +59,18 @@ def _build_eval_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
                 "learner_step": int(entry.get("learner_step", eval_summary.get("learner_step", 0))),
                 "mean_final_progress_index": float(eval_summary.get("mean_final_progress_index", 0.0) or 0.0),
                 "median_final_progress_index": eval_summary.get("median_final_progress_index"),
+                "mean_final_progress_meters": eval_summary.get("mean_final_progress_meters"),
+                "median_final_progress_meters": eval_summary.get("median_final_progress_meters"),
+                "mean_final_arc_length_m": eval_summary.get("mean_final_arc_length_m"),
+                "median_final_arc_length_m": eval_summary.get("median_final_arc_length_m"),
+                "mean_progress_fraction_of_reference": eval_summary.get("mean_progress_fraction_of_reference"),
+                "median_progress_fraction_of_reference": eval_summary.get("median_progress_fraction_of_reference"),
+                "reference_total_arc_length_m": eval_summary.get("reference_total_arc_length_m"),
+                "mean_ghost_relative_time_delta_ms": eval_summary.get("mean_ghost_relative_time_delta_ms"),
+                "median_ghost_relative_time_delta_ms": eval_summary.get("median_ghost_relative_time_delta_ms"),
+                "best_ghost_relative_time_delta_ms": eval_summary.get("best_ghost_relative_time_delta_ms"),
+                "progress_spacing_meters": eval_summary.get("progress_spacing_meters"),
+                "progress_index_semantics": eval_summary.get("progress_index_semantics"),
                 "completion_rate": float(eval_summary.get("completion_rate", 0.0) or 0.0),
                 "determinism_conversion_score": eval_summary.get("determinism_conversion_score"),
                 "deterministic_stochastic_progress_gap": eval_summary.get("deterministic_stochastic_progress_gap"),
@@ -183,6 +195,23 @@ def build_training_report(
         "bc_checkpoint_path": summary.get("bc_checkpoint_path"),
         "demo_root": summary.get("demo_root"),
         "replay_seeded": bool(summary.get("replay_seeded", False)),
+        "ghost_bundle_manifest_path": summary.get("ghost_bundle_manifest_path"),
+        "ghost_bundle_metadata": dict(summary.get("ghost_bundle_metadata") or {}),
+        "canonical_reference_source": summary.get("canonical_reference_source"),
+        "canonical_reference_path": summary.get("canonical_reference_path"),
+        "strategy_classification_status": summary.get("strategy_classification_status"),
+        "selected_training_family": summary.get("selected_training_family"),
+        "mixed_fallback": summary.get("mixed_fallback"),
+        "bundle_resolution_mode": summary.get("bundle_resolution_mode"),
+        "selected_ghost_selector": summary.get("selected_ghost_selector"),
+        "resolved_selected_ghost_rank": summary.get("resolved_selected_ghost_rank"),
+        "resolved_selected_ghost_name": summary.get("resolved_selected_ghost_name"),
+        "author_fallback_used": summary.get("author_fallback_used"),
+        "intended_bundle_manifest_path": summary.get("intended_bundle_manifest_path"),
+        "exploit_bundle_manifest_path": summary.get("exploit_bundle_manifest_path"),
+        "selected_override_manifest_path": summary.get("selected_override_manifest_path"),
+        "author_fallback_manifest_path": summary.get("author_fallback_manifest_path"),
+        "strategy_family_counts": dict(summary.get("strategy_family_counts") or {}),
         "device": summary.get("device"),
         "run_start_timestamp": summary.get("run_start_timestamp"),
         "run_end_timestamp": summary.get("run_end_timestamp"),
@@ -361,9 +390,24 @@ def _render_run_report_markdown(report: dict[str, Any]) -> str:
         f"- Current actor staleness: {report.get('current_actor_staleness')}",
         f"- Replay size: {report['replay_size']}",
         f"- Training duration (s): {report.get('training_duration_seconds')}",
+        f"- Ghost bundle: {report.get('ghost_bundle_manifest_path')}",
+        f"- Canonical reference: source={report.get('canonical_reference_source')} path={report.get('canonical_reference_path')}",
+        f"- Strategy selection: status={report.get('strategy_classification_status')} family={report.get('selected_training_family')} mixed_fallback={report.get('mixed_fallback')}",
+        f"- Bundle resolution: mode={report.get('bundle_resolution_mode')} selector={report.get('selected_ghost_selector')} resolved_rank={report.get('resolved_selected_ghost_rank')} resolved_name={report.get('resolved_selected_ghost_name')} author_fallback_used={report.get('author_fallback_used')}",
         "",
-        "## Checkpoints",
     ]
+    strategy_family_counts = dict(report.get("strategy_family_counts", {}))
+    if strategy_family_counts:
+        lines.append(f"- Strategy family counts: {strategy_family_counts}")
+    if report.get("intended_bundle_manifest_path") is not None:
+        lines.append(f"- Intended bundle: {report.get('intended_bundle_manifest_path')}")
+    if report.get("exploit_bundle_manifest_path") is not None:
+        lines.append(f"- Exploit bundle: {report.get('exploit_bundle_manifest_path')}")
+    if report.get("selected_override_manifest_path") is not None:
+        lines.append(f"- Selected override bundle: {report.get('selected_override_manifest_path')}")
+    if report.get("author_fallback_manifest_path") is not None:
+        lines.append(f"- Author fallback bundle: {report.get('author_fallback_manifest_path')}")
+    lines.extend(["", "## Checkpoints"])
     for checkpoint in report.get("checkpoint_list", []):
         lines.append(
             f"- env_step={checkpoint.get('env_step')} replay_size={checkpoint.get('replay_size')} path={checkpoint.get('path')}"
@@ -372,9 +416,20 @@ def _render_run_report_markdown(report: dict[str, Any]) -> str:
     for row in report.get("eval_history_table", []):
         lines.append(
             f"- env_step={row['env_step']} mean_progress={row['mean_final_progress_index']} "
-            f"median_progress={row['median_final_progress_index']} completion_rate={row['completion_rate']} "
+            f"median_progress={row['median_final_progress_index']} "
+            f"mean_progress_m={row.get('mean_final_progress_meters')} "
+            f"mean_final_arc_length_m={row.get('mean_final_arc_length_m')} "
+            f"mean_progress_fraction={row.get('mean_progress_fraction_of_reference')} "
+            f"mean_ghost_delta_ms={row.get('mean_ghost_relative_time_delta_ms')} "
+            f"completion_rate={row['completion_rate']} "
             f"dcs={row.get('determinism_conversion_score')}"
         )
+        if row.get("progress_index_semantics") is not None:
+            lines.append(
+                f"-   progress_semantics={row.get('progress_index_semantics')} "
+                f"spacing_m={row.get('progress_spacing_meters')} "
+                f"reference_total_arc_m={row.get('reference_total_arc_length_m')}"
+            )
         if row.get("eval_checkpoint_path") is not None:
             lines.append(
                 f"-   provenance: mode={row.get('eval_provenance_mode')} "
@@ -423,7 +478,18 @@ def _render_run_report_markdown(report: dict[str, Any]) -> str:
         lines.append(
             f"- positive_progress_mean={dict(episode_diagnostics.get('positive_progress_fraction', {})).get('mean')} "
             f"nonpositive_progress_mean={dict(episode_diagnostics.get('nonpositive_progress_fraction', {})).get('mean')} "
-            f"max_no_progress_p95={dict(episode_diagnostics.get('max_no_progress_streak', {})).get('p95')}"
+            f"max_no_progress_p95={dict(episode_diagnostics.get('max_no_progress_streak', {})).get('p95')} "
+            f"final_arc_length_mean={dict(episode_diagnostics.get('final_arc_length_m', {})).get('mean')} "
+            f"progress_fraction_mean={dict(episode_diagnostics.get('progress_fraction_of_reference', {})).get('mean')} "
+            f"ghost_delta_mean_ms={dict(episode_diagnostics.get('ghost_relative_time_delta_ms', {})).get('mean')}"
+        )
+        lines.append(
+            f"- corridor_violation_fraction_mean="
+            f"{dict(episode_diagnostics.get('corridor_violation_fraction', {})).get('mean')} "
+            f"corridor_distance_p95={dict(episode_diagnostics.get('corridor_distance_m', {})).get('p95')} "
+            f"max_corridor_distance_p95={dict(episode_diagnostics.get('max_corridor_distance_m', {})).get('p95')} "
+            f"corridor_nonrecovering_p95={dict(episode_diagnostics.get('corridor_nonrecovering_steps', {})).get('p95')} "
+            f"corridor_truncations={dict(episode_diagnostics.get('termination_reason_counts', {})).get('corridor_violation', 0)}"
         )
     if movement_diagnostics:
         lines.append(

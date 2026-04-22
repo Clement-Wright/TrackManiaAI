@@ -169,10 +169,50 @@ def summarize_episode_trace(
     sector_count: int,
 ) -> dict[str, Any]:
     progress_values = [int(row["progress_index"]) for row in step_rows]
+    progress_meter_values = [
+        float(row.get("progress_arc_length_m", row.get("trajectory_arc_length_m", 0.0)) or 0.0)
+        for row in step_rows
+    ]
+    progress_fraction_values = [
+        float(row["progress_fraction_of_reference"])
+        for row in step_rows
+        if row.get("progress_fraction_of_reference") is not None
+    ]
+    reference_total_arc_values = [
+        float(row["reference_total_arc_length_m"])
+        for row in step_rows
+        if row.get("reference_total_arc_length_m") is not None
+    ]
+    ghost_relative_time_delta_values = [
+        float(row["ghost_relative_time_delta_ms"])
+        for row in step_rows
+        if row.get("ghost_relative_time_delta_ms") is not None
+    ]
+    ghost_reference_time_values = [
+        float(row["ghost_reference_time_ms"])
+        for row in step_rows
+        if row.get("ghost_reference_time_ms") is not None
+    ]
+    progress_spacing_values = [
+        float(row["progress_spacing_meters"])
+        for row in step_rows
+        if row.get("progress_spacing_meters") is not None
+    ]
+    progress_semantics = next(
+        (str(row["progress_index_semantics"]) for row in step_rows if row.get("progress_index_semantics")),
+        None,
+    )
     reward_values = [float(row["reward"]) for row in step_rows]
     completion_times = [int(row["race_time_ms"]) for row in step_rows if row.get("done_type") == "terminated" and row.get("terminal_reason") == "finished"]
     furthest_progress = max(progress_values) if progress_values else 0
     final_progress = progress_values[-1] if progress_values else 0
+    furthest_progress_meters = max(progress_meter_values) if progress_meter_values else 0.0
+    final_progress_meters = progress_meter_values[-1] if progress_meter_values else 0.0
+    furthest_progress_fraction = max(progress_fraction_values) if progress_fraction_values else None
+    final_progress_fraction = progress_fraction_values[-1] if progress_fraction_values else None
+    final_ghost_relative_time_delta_ms = (
+        ghost_relative_time_delta_values[-1] if ghost_relative_time_delta_values else None
+    )
     furthest_sector = trajectory.sector_index_for_progress(furthest_progress, sector_count) if progress_values else 0
 
     sector_entry_speed = [0.0 for _ in range(sector_count)]
@@ -198,6 +238,17 @@ def summarize_episode_trace(
         "step_count": len(step_rows),
         "best_progress_index": furthest_progress,
         "final_progress_index": final_progress,
+        "best_progress_meters": furthest_progress_meters,
+        "final_progress_meters": final_progress_meters,
+        "best_arc_length_m": furthest_progress_meters,
+        "final_arc_length_m": final_progress_meters,
+        "best_progress_fraction_of_reference": furthest_progress_fraction,
+        "progress_fraction_of_reference": final_progress_fraction,
+        "reference_total_arc_length_m": reference_total_arc_values[-1] if reference_total_arc_values else None,
+        "progress_spacing_meters": progress_spacing_values[-1] if progress_spacing_values else None,
+        "progress_index_semantics": progress_semantics,
+        "ghost_reference_time_ms": ghost_reference_time_values[-1] if ghost_reference_time_values else None,
+        "ghost_relative_time_delta_ms": final_ghost_relative_time_delta_ms,
         "completion_flag": completion_flag,
         "completion_time_ms": completion_times[0] if completion_times else None,
         "termination_reason": termination_reason,
@@ -217,11 +268,51 @@ def summarize_episode_trace(
 def aggregate_episode_summaries(episodes: Sequence[Mapping[str, Any]], *, sector_count: int) -> dict[str, Any]:
     completion_flags = [bool(episode.get("completion_flag")) for episode in episodes]
     final_progress = [float(episode.get("final_progress_index", 0)) for episode in episodes]
+    final_progress_meters = [
+        float(episode["final_progress_meters"])
+        for episode in episodes
+        if episode.get("final_progress_meters") is not None
+    ]
+    final_arc_length_values = [
+        float(episode["final_arc_length_m"])
+        for episode in episodes
+        if episode.get("final_arc_length_m") is not None
+    ]
+    progress_fraction_values = [
+        float(episode["progress_fraction_of_reference"])
+        for episode in episodes
+        if episode.get("progress_fraction_of_reference") is not None
+    ]
+    reference_total_arc_values = [
+        float(episode["reference_total_arc_length_m"])
+        for episode in episodes
+        if episode.get("reference_total_arc_length_m") is not None
+    ]
+    ghost_relative_time_delta_values = [
+        float(episode["ghost_relative_time_delta_ms"])
+        for episode in episodes
+        if episode.get("ghost_relative_time_delta_ms") is not None
+    ]
+    ghost_reference_time_values = [
+        float(episode["ghost_reference_time_ms"])
+        for episode in episodes
+        if episode.get("ghost_reference_time_ms") is not None
+    ]
+    progress_spacings = [
+        float(episode["progress_spacing_meters"])
+        for episode in episodes
+        if episode.get("progress_spacing_meters") is not None
+    ]
+    progress_semantics = next(
+        (str(episode["progress_index_semantics"]) for episode in episodes if episode.get("progress_index_semantics")),
+        None,
+    )
     rewards = [float(episode.get("episode_reward_total", 0.0)) for episode in episodes]
     completion_times = [float(episode["completion_time_ms"]) for episode in episodes if episode.get("completion_time_ms") is not None]
     timeout_flags = [episode.get("termination_reason") in {"no_progress", "ep_max_length"} for episode in episodes]
     no_progress_flags = [episode.get("termination_reason") == "no_progress" for episode in episodes]
     stray_flags = [episode.get("termination_reason") == "stray" for episode in episodes]
+    corridor_violation_flags = [episode.get("termination_reason") == "corridor_violation" for episode in episodes]
 
     per_sector_best_entry_speed = [0.0 for _ in range(sector_count)]
     per_sector_reward_gain: list[list[float]] = [[] for _ in range(sector_count)]
@@ -239,9 +330,26 @@ def aggregate_episode_summaries(episodes: Sequence[Mapping[str, Any]], *, sector
         "completion_rate": sum(completion_flags) / max(1, len(episodes)),
         "mean_final_progress_index": _mean(final_progress),
         "median_final_progress_index": _median(final_progress),
+        "mean_final_progress_meters": _mean(final_progress_meters),
+        "median_final_progress_meters": _median(final_progress_meters),
+        "mean_final_arc_length_m": _mean(final_arc_length_values) if final_arc_length_values else None,
+        "median_final_arc_length_m": _median(final_arc_length_values),
+        "mean_progress_fraction_of_reference": _mean(progress_fraction_values) if progress_fraction_values else None,
+        "median_progress_fraction_of_reference": _median(progress_fraction_values),
+        "reference_total_arc_length_m": reference_total_arc_values[-1] if reference_total_arc_values else None,
+        "progress_spacing_meters": progress_spacings[-1] if progress_spacings else None,
+        "progress_index_semantics": progress_semantics,
+        "mean_ghost_reference_time_ms": _mean(ghost_reference_time_values) if ghost_reference_time_values else None,
+        "median_ghost_reference_time_ms": _median(ghost_reference_time_values),
+        "mean_ghost_relative_time_delta_ms": (
+            _mean(ghost_relative_time_delta_values) if ghost_relative_time_delta_values else None
+        ),
+        "median_ghost_relative_time_delta_ms": _median(ghost_relative_time_delta_values),
+        "best_ghost_relative_time_delta_ms": min(ghost_relative_time_delta_values) if ghost_relative_time_delta_values else None,
         "timeout_rate": sum(timeout_flags) / max(1, len(episodes)),
         "no_progress_termination_rate": sum(no_progress_flags) / max(1, len(episodes)),
         "stray_termination_rate": sum(stray_flags) / max(1, len(episodes)),
+        "corridor_violation_truncation_rate": sum(corridor_violation_flags) / max(1, len(episodes)),
         "mean_episode_reward": _mean(rewards),
         "best_reward": max(rewards) if rewards else None,
         "best_completion_time_ms": min(completion_times) if completion_times else None,

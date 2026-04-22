@@ -90,6 +90,18 @@ class TrajectoryProgressReward:
             "reward_reason": done_reason,
             "stray_distance": stray_distance,
             "trajectory_arc_length_m": float(self.trajectory.arc_length[self._current_index]),
+            "final_arc_length_m": float(self.trajectory.arc_length[self._current_index]),
+            "progress_arc_length_m": float(self.trajectory.arc_length[self._current_index]),
+            "reference_total_arc_length_m": float(self.trajectory.total_length),
+            "progress_fraction_of_reference": (
+                float(self.trajectory.arc_length[self._current_index] / max(1.0e-9, self.trajectory.total_length))
+                if self.trajectory.total_length > 0.0
+                else None
+            ),
+            "progress_spacing_meters": float(self.config.spacing_meters),
+            "progress_index_semantics": "fixed_spacing_meters",
+            "ghost_reference_time_ms": None,
+            "ghost_relative_time_delta_ms": None,
             "tm20ai_done_type": done_type,
         }
         return RewardStepResult(

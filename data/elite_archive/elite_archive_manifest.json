@@ -2,6 +2,76 @@
   "schema_version": "elite_archive_v1",
   "entries": [
     {
+      "run_name": "reference_suite_20260422_rank11_100",
+      "mode": "deterministic",
+      "run_dir": "C:\\Users\\clewr\\TrackManiaAI\\.tmp\\live_reference_target_suite_20260422\\artifacts\\eval\\reference_suite_20260422_rank11_100_step_00080011_deterministic",
+      "checkpoint_path": "C:\\Users\\clewr\\TrackManiaAI\\.tmp\\live_reference_target_suite_20260422\\artifacts\\train\\reference_suite_20260422_rank11_100\\checkpoints\\checkpoint_00080011.pt",
+      "mean_final_progress_index": 1694.0,
+      "completion_rate": 0.0,
+      "cluster_key": "progress_006_completion_00_steer_00",
+      "promotion_reason": "progress_improvement"
+    },
+    {
+      "run_name": "reference_suite_20260422_author_account_proxy",
+      "mode": "stochastic",
+      "run_dir": "C:\\Users\\clewr\\TrackManiaAI\\.tmp\\live_reference_target_suite_20260422\\artifacts\\eval\\reference_suite_20260422_author_account_proxy_step_00065004_stochastic",
+      "checkpoint_path": "C:\\Users\\clewr\\TrackManiaAI\\.tmp\\live_reference_target_suite_20260422\\artifacts\\train\\reference_suite_20260422_author_account_proxy\\checkpoints\\checkpoint_00065004.pt",
+      "mean_final_progress_index": 1424.8,
+      "completion_rate": 0.0,
+      "cluster_key": "progress_005_completion_00_steer_00",
+      "promotion_reason": "novel_cluster"
+    },
+    {
+      "run_name": "reference_suite_20260422_isfoo_rank11",
+      "mode": "deterministic",
+      "run_dir": "C:\\Users\\clewr\\TrackManiaAI\\.tmp\\live_reference_target_suite_20260422\\artifacts\\eval\\reference_suite_20260422_isfoo_rank11_step_00080009_deterministic",
+      "checkpoint_path": "C:\\Users\\clewr\\TrackManiaAI\\.tmp\\live_reference_target_suite_20260422\\artifacts\\train\\reference_suite_20260422_isfoo_rank11\\checkpoints\\checkpoint_00080009.pt",
+      "mean_final_progress_index": 1062.6,
+      "completion_rate": 0.0,
+      "cluster_key": "progress_004_completion_00_steer_00",
+      "promotion_reason": "progress_improvement"
+    },
+    {
+      "run_name": "reference_suite_20260422_isfoo_rank11",
+      "mode": "deterministic",
+      "run_dir": "C:\\Users\\clewr\\TrackManiaAI\\.tmp\\live_reference_target_suite_20260422\\artifacts\\eval\\reference_suite_20260422_isfoo_rank11_step_00070009_deterministic",
+      "checkpoint_path": "C:\\Users\\clewr\\TrackManiaAI\\.tmp\\live_reference_target_suite_20260422\\artifacts\\train\\reference_suite_20260422_isfoo_rank11\\checkpoints\\checkpoint_00070009.pt",
+      "mean_final_progress_index": 904.4,
+      "completion_rate": 0.0,
+      "cluster_key": "progress_003_completion_00_steer_00",
+      "promotion_reason": "progress_improvement"
+    },
+    {
+      "run_name": "reference_suite_20260422_isfoo_rank11",
+      "mode": "deterministic",
+      "run_dir": "C:\\Users\\clewr\\TrackManiaAI\\.tmp\\live_reference_target_suite_20260422\\artifacts\\eval\\reference_suite_20260422_isfoo_rank11_step_00055007_deterministic",
+      "checkpoint_path": "C:\\Users\\clewr\\TrackManiaAI\\.tmp\\live_reference_target_suite_20260422\\artifacts\\train\\reference_suite_20260422_isfoo_rank11\\checkpoints\\checkpoint_00055007.pt",
+      "mean_final_progress_index": 536.2,
+      "completion_rate": 0.0,
+      "cluster_key": "progress_002_completion_00_steer_00",
+      "promotion_reason": "progress_improvement"
+    },
+    {
+      "run_name": "reference_suite_20260422_isfoo_rank11",
+      "mode": "deterministic",
+      "run_dir": "C:\\Users\\clewr\\TrackManiaAI\\.tmp\\live_reference_target_suite_20260422\\artifacts\\eval\\reference_suite_20260422_isfoo_rank11_step_00030006_deterministic",
+      "checkpoint_path": "C:\\Users\\clewr\\TrackManiaAI\\.tmp\\live_reference_target_suite_20260422\\artifacts\\train\\reference_suite_20260422_isfoo_rank11\\checkpoints\\checkpoint_00030006.pt",
+      "mean_final_progress_index": 469.2,
+      "completion_rate": 0.0,
+      "cluster_key": "progress_001_completion_00_steer_00",
+      "promotion_reason": "progress_improvement"
+    },
+    {
+      "run_name": "redq_top100_20260421_30min_routeaware",
+      "mode": "deterministic",
+      "run_dir": "C:\\Users\\clewr\\TrackManiaAI\\artifacts\\eval\\redq_top100_20260421_30min_routeaware_step_00010007_deterministic",
+      "checkpoint_path": "C:\\Users\\clewr\\TrackManiaAI\\artifacts\\train\\redq_top100_20260421_30min_routeaware\\checkpoints\\checkpoint_00010007.pt",
+      "mean_final_progress_index": 285.45,
+      "completion_rate": 0.0,
+      "cluster_key": "progress_001_completion_00_steer_00",
+      "promotion_reason": "progress_improvement"
+    },
+    {
       "run_name": "redq_top100_20260420_120min",
       "mode": "deterministic",
       "run_dir": "C:\\Users\\clewr\\TrackManiaAI\\artifacts\\eval\\redq_top100_20260420_120min_step_00020004_deterministic",

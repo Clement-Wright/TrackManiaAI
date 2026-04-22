@@ -54,6 +54,11 @@ FROZEN_STEP_INFO_KEYS = (
     "ghost_line_id",
     "ghost_line_rank",
     "ghost_line_switch_count",
+    "bundle_resolution_mode",
+    "selected_ghost_selector",
+    "resolved_selected_ghost_rank",
+    "resolved_selected_ghost_name",
+    "author_fallback_used",
     "reward_reason",
     "tm20ai_done_type",
 )
@@ -156,10 +161,22 @@ class TM20AIRtInterface(RealTimeGymInterface):
     def _ghost_bundle_manifest_for_map(self, map_uid: str) -> Path:
         if self.config.ghosts.bundle_manifest is not None:
             path = Path(self.config.ghosts.bundle_manifest)
-        else:
-            path = Path(self.config.ghosts.root) / map_uid / "ghost_bundle_manifest.json"
-        if not path.is_absolute():
-            path = self.repo_root / path
+            if not path.is_absolute():
+                path = self.repo_root / path
+            return path.resolve()
+        base_root = Path(self.config.ghosts.root)
+        if not base_root.is_absolute():
+            base_root = self.repo_root / base_root
+        candidate_paths = (
+            base_root / map_uid / "ghost_bundle_manifest.json",
+            base_root / map_uid / "ghost_bundle_intended.json",
+            base_root / map_uid / "ghost_bundle_selected_override.json",
+            base_root / map_uid / "ghost_bundle_author_reference.json",
+        )
+        for candidate in candidate_paths:
+            if candidate.exists():
+                return candidate.resolve()
+        path = base_root / map_uid / "ghost_bundle_manifest.json"
         return path.resolve()
 
     def _ensure_reward_model(self, map_uid: str) -> TrajectoryProgressReward | GhostBundleReward:

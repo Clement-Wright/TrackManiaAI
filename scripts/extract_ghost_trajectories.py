@@ -25,12 +25,20 @@ def _metadata_from_top_manifest(manifest_path: Path) -> dict[str, dict]:
         replay_path = status.get("path")
         if not replay_path:
             continue
+        record_filename = None
+        record_metadata = entry.get("record_metadata") or {}
+        if isinstance(record_metadata, dict):
+            record_filename = record_metadata.get("filename")
         by_stem[Path(str(replay_path)).stem] = {
             "map_uid": manifest.get("map_uid"),
             "account_id": entry.get("account_id"),
             "rank": entry.get("rank"),
             "record_time_ms": entry.get("time_ms"),
             "replay_source": "nadeo_top100",
+            "record_filename": record_filename,
+            "record_filename_basename": None if record_filename in (None, "") else Path(str(record_filename)).name,
+            "downloaded_replay_path": replay_path,
+            "downloaded_replay_basename": Path(str(replay_path)).name,
         }
     return by_stem
 

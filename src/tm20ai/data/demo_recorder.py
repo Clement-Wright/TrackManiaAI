@@ -115,6 +115,7 @@ class DemoRecorder:
         analog_action = ThrottleAction.from_iterable(action_array)
         progress_index = int(info["progress_index"])
         sector_index = self._trajectory.sector_index_for_progress(progress_index, self._sector_count)
+        progress_arc_length_m = float(info.get("progress_arc_length_m", info["trajectory_arc_length_m"]))
         row = {
             "episode_id": self._current_episode_id,
             "step_index": self._current_step_index,
@@ -128,6 +129,15 @@ class DemoRecorder:
             "progress_index": progress_index,
             "progress_delta": int(info["progress_delta"]),
             "trajectory_arc_length_m": float(info["trajectory_arc_length_m"]),
+            "progress_arc_length_m": progress_arc_length_m,
+            "final_arc_length_m": float(info.get("final_arc_length_m", progress_arc_length_m)),
+            "reference_total_arc_length_m": info.get("reference_total_arc_length_m"),
+            "progress_fraction_of_reference": info.get("progress_fraction_of_reference"),
+            "progress_spacing_meters": info.get("progress_spacing_meters"),
+            "progress_index_semantics": info.get("progress_index_semantics"),
+            "ghost_source_row_index": info.get("ghost_source_row_index"),
+            "ghost_reference_time_ms": info.get("ghost_reference_time_ms"),
+            "ghost_relative_time_delta_ms": info.get("ghost_relative_time_delta_ms"),
             "sector_index": sector_index,
             "speed_kmh": float(info.get("speed_kmh", 0.0)),
             "gear": int(info.get("gear", 0)),
@@ -144,6 +154,11 @@ class DemoRecorder:
             "terminal_reason": info.get("terminal_reason"),
             "done_type": info.get("tm20ai_done_type"),
             "stray_distance": info.get("stray_distance"),
+            "corridor_nonrecovering_steps": info.get("corridor_nonrecovering_steps"),
+            "corridor_recovering": info.get("corridor_recovering"),
+            "corridor_distance_delta_m": info.get("corridor_distance_delta_m"),
+            "corridor_progress_delta_m": info.get("corridor_progress_delta_m"),
+            "corridor_speed_kmh": info.get("corridor_speed_kmh"),
         }
         self._current_rows.append(row)
         abs_action = np.abs(action_array)
@@ -192,6 +207,23 @@ class DemoRecorder:
             "done_type": "terminated" if terminated else "truncated" if truncated else None,
             "termination_reason": termination_reason,
             "final_progress_index": int(self._current_rows[-1]["progress_index"]),
+            "final_progress_meters": float(
+                self._current_rows[-1].get("progress_arc_length_m")
+                or self._current_rows[-1].get("trajectory_arc_length_m")
+                or 0.0
+            ),
+            "final_arc_length_m": float(
+                self._current_rows[-1].get("final_arc_length_m")
+                or self._current_rows[-1].get("progress_arc_length_m")
+                or self._current_rows[-1].get("trajectory_arc_length_m")
+                or 0.0
+            ),
+            "reference_total_arc_length_m": self._current_rows[-1].get("reference_total_arc_length_m"),
+            "progress_fraction_of_reference": self._current_rows[-1].get("progress_fraction_of_reference"),
+            "progress_spacing_meters": self._current_rows[-1].get("progress_spacing_meters"),
+            "progress_index_semantics": self._current_rows[-1].get("progress_index_semantics"),
+            "ghost_reference_time_ms": self._current_rows[-1].get("ghost_reference_time_ms"),
+            "ghost_relative_time_delta_ms": self._current_rows[-1].get("ghost_relative_time_delta_ms"),
             "completion_time_ms": int(final_info["race_time_ms"]) if completion_flag else None,
             "sampled_frames_dir": str(self._current_episode_paths.frames_dir) if self._current_episode_paths.frames_dir else None,
             "video_path": None,

@@ -351,9 +351,25 @@ def _build_eval_trace_row(
         "steer": float(action[1]) if action.size > 1 else 0.0,
         "speed_kmh": float(info.get("speed_kmh", 0.0) or 0.0),
         "progress_index": float(info.get("progress_index", 0.0) or 0.0),
+        "progress_arc_length_m": float(
+            info.get("progress_arc_length_m", info.get("trajectory_arc_length_m", 0.0)) or 0.0
+        ),
+        "final_arc_length_m": float(
+            info.get("final_arc_length_m", info.get("progress_arc_length_m", info.get("trajectory_arc_length_m", 0.0)))
+            or 0.0
+        ),
+        "progress_fraction_of_reference": info.get("progress_fraction_of_reference"),
+        "ghost_reference_time_ms": info.get("ghost_reference_time_ms"),
+        "ghost_relative_time_delta_ms": info.get("ghost_relative_time_delta_ms"),
+        "progress_spacing_meters": info.get("progress_spacing_meters"),
+        "progress_index_semantics": info.get("progress_index_semantics"),
         "reward": float(reward),
         "terminated": bool(terminated),
         "truncated": bool(truncated),
+        "corridor_nonrecovering_steps": info.get("corridor_nonrecovering_steps"),
+        "corridor_recovering": info.get("corridor_recovering"),
+        "corridor_distance_delta_m": info.get("corridor_distance_delta_m"),
+        "corridor_progress_delta_m": info.get("corridor_progress_delta_m"),
     }
 
 
