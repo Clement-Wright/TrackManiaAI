@@ -15,6 +15,9 @@ class ArtifactCleanupResult:
 
 
 def _best_progress(summary: dict[str, Any]) -> float:
+    exact_final_eval = dict(summary.get("exact_final_eval_summary") or {})
+    if bool(summary.get("exact_final_eval_complete", False)) and exact_final_eval:
+        return float(exact_final_eval.get("mean_final_progress_index", 0.0) or 0.0)
     best = 0.0
     for entry in summary.get("eval_history", []):
         payload = dict(entry.get("summary", {}))
@@ -64,11 +67,12 @@ def referenced_eval_dirs(artifact_root: str | Path, keeper_run_dirs: Iterable[st
     eval_root = Path(artifact_root).resolve() / "eval"
     if not eval_root.exists():
         return []
-    prefixes = [f"{Path(run_dir).name}_step_" for run_dir in keeper_run_dirs]
+    run_names = [Path(run_dir).name for run_dir in keeper_run_dirs]
     return sorted(
         path
         for path in eval_root.iterdir()
-        if path.is_dir() and any(path.name.startswith(prefix) for prefix in prefixes)
+        if path.is_dir()
+        and any(path.name == run_name or path.name.startswith(f"{run_name}_") for run_name in run_names)
     )
 
 

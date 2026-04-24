@@ -152,10 +152,13 @@ def test_write_training_report_handles_interrupted_run(tmp_path) -> None:
     assert report["selected_training_family"] == "intended_route"
     assert report["mixed_fallback"] is False
     assert report["bundle_resolution_mode"] == "intended_route"
+    assert report["exact_final_eval_complete"] is False
+    assert report["incomplete_final_eval"] is True
     markdown = report_paths.markdown_path.read_text(encoding="utf-8")
     assert "Strategy selection: status=classified family=intended_route mixed_fallback=False" in markdown
     assert "Bundle resolution: mode=intended_route selector=None resolved_rank=None resolved_name=None author_fallback_used=False" in markdown
     assert "Canonical reference: source=author_reference_manifest path=C:/ghosts/test-map/author_reference.json" in markdown
+    assert "Exact final eval complete: False" in markdown
 
 
 def test_write_comparison_report_builds_bc_comparison(tmp_path) -> None:

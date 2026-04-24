@@ -16,6 +16,7 @@ if str(SRC) not in sys.path:
 
 from tm20ai.data.parquet_writer import build_run_artifact_paths, sha256_file, write_json
 from tm20ai.config import load_tm20ai_config
+from tm20ai.train.campaign import analyze_policy_mode_sweep_results
 from tm20ai.train.evaluator import resolve_policy_adapter, run_policy_episodes
 
 
@@ -118,11 +119,16 @@ def main() -> int:
             "summary_path": str(result["summary_path"]),
             "mean_final_progress_index": result["summary"].get("mean_final_progress_index"),
             "median_final_progress_index": result["summary"].get("median_final_progress_index"),
+            "mean_final_progress_meters": result["summary"].get("mean_final_progress_meters"),
+            "mean_final_arc_length_m": result["summary"].get("mean_final_arc_length_m"),
+            "mean_progress_fraction_of_reference": result["summary"].get("mean_progress_fraction_of_reference"),
+            "mean_ghost_relative_time_delta_ms": result["summary"].get("mean_ghost_relative_time_delta_ms"),
             "completion_rate": result["summary"].get("completion_rate"),
             "mean_abs_steer": result["summary"].get("mean_abs_steer"),
             "mean_abs_throttle": result["summary"].get("mean_abs_throttle"),
         }
         print(f"[evaluate-redq-policy-modes] {name}_summary={result['summary_path']}", flush=True)
+    analysis = analyze_policy_mode_sweep_results(results)
     run_paths = build_run_artifact_paths(config, mode="eval", run_name=base_run_name)
     combined_path = run_paths.run_dir / "policy_mode_sweep.json"
     write_json(
@@ -132,10 +138,11 @@ def main() -> int:
             "checkpoint_sha256": sha256_file(checkpoint_path),
             "base_run_name": base_run_name,
             "results": results,
+            "analysis": analysis,
         },
     )
     print(f"[evaluate-redq-policy-modes] combined={combined_path}", flush=True)
-    print(json.dumps(results, indent=2), flush=True)
+    print(json.dumps({"results": results, "analysis": analysis}, indent=2), flush=True)
     return 0
 
 

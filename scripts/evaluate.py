@@ -2,10 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import multiprocessing
-import queue
 import sys
-import time
 from pathlib import Path
 
 import numpy as np
@@ -19,119 +16,11 @@ if str(SRC) not in sys.path:
 from tm20ai.action_space import ACTION_DIM, LEGACY_ACTION_DIM, clamp_action
 from tm20ai.data.parquet_writer import sha256_file
 from tm20ai.config import load_tm20ai_config
-from tm20ai.train.evaluator import resolve_policy_adapter, run_policy_episodes
+from tm20ai.train.evaluator import resolve_policy_adapter, run_checkpoint_eval_via_worker, run_policy_episodes
 
 
 def log(message: str) -> None:
     print(f"[evaluate] {message}", flush=True)
-
-
-def checkpoint_eval_worker_entry(
-    config_path: str,
-    command_queue,
-    output_queue,
-    eval_result_queue,
-    shutdown_event,
-    worker_done_event,
-) -> None:
-    from tm20ai.train.worker import SACWorker
-
-    worker = SACWorker(
-        config_path=config_path,
-        command_queue=command_queue,
-        output_queue=output_queue,
-        eval_result_queue=eval_result_queue,
-        shutdown_event=shutdown_event,
-        worker_done_event=worker_done_event,
-        bootstrap_log_path=None,
-    )
-    worker.run()
-
-
-def run_checkpoint_eval_via_worker(
-    *,
-    config_path: str,
-    checkpoint_path: Path,
-    episodes: int,
-    seed_base: int,
-    record_video: bool,
-    modes: list[str],
-    run_name: str | None,
-    trace_seconds: float,
-    checkpoint_summary_extra: dict[str, object],
-) -> dict[str, dict]:
-    ctx = multiprocessing.get_context("spawn")
-    command_queue = ctx.Queue(maxsize=8)
-    output_queue = ctx.Queue(maxsize=8)
-    eval_result_queue = ctx.Queue(maxsize=8)
-    shutdown_event = ctx.Event()
-    worker_done_event = ctx.Event()
-    worker = ctx.Process(
-        target=checkpoint_eval_worker_entry,
-        args=(
-            config_path,
-            command_queue,
-            output_queue,
-            eval_result_queue,
-            shutdown_event,
-            worker_done_event,
-        ),
-        name="tm20ai-eval-worker",
-    )
-    worker.start()
-    try:
-        command_queue.put(
-            {
-                "type": "run_eval",
-                "run_name": run_name,
-                "env_step": int(checkpoint_summary_extra.get("eval_checkpoint_env_step", 0) or 0),
-                "learner_step": int(checkpoint_summary_extra.get("eval_checkpoint_learner_step", 0) or 0),
-                "episodes": int(episodes),
-                "seed_base": int(seed_base),
-                "record_video": bool(record_video),
-                "modes": list(modes),
-                "trace_seconds": float(trace_seconds),
-                "scheduled_actor_version": None,
-                **checkpoint_summary_extra,
-            }
-        )
-        command_queue.put({"type": "shutdown"})
-
-        deadline = time.time() + max(300.0, float(episodes) * 180.0)
-        eval_result = None
-        while time.time() < deadline:
-            try:
-                eval_result = eval_result_queue.get(timeout=1.0)
-                break
-            except queue.Empty:
-                if not worker.is_alive() and eval_result_queue.empty():
-                    break
-        if eval_result is None:
-            if worker.exitcode not in (None, 0):
-                raise RuntimeError(f"Checkpoint eval worker exited with code {worker.exitcode} before producing a result.")
-            raise RuntimeError("Checkpoint eval worker did not produce an eval result before the timeout.")
-
-        summary = dict(eval_result.summary)
-        mode_summaries = dict(summary.get("eval_mode_summaries") or {})
-        mode_summary_paths = dict(summary.get("eval_mode_summary_paths") or {})
-        results: dict[str, dict] = {}
-        primary_mode = str(summary.get("eval_mode") or ("deterministic" if "deterministic" in modes else modes[0]))
-        for mode_name in modes:
-            mode_summary = dict(mode_summaries.get(mode_name) or (summary if mode_name == primary_mode else {}))
-            mode_summary_path = mode_summary_paths.get(mode_name)
-            if mode_summary_path is None and mode_name == primary_mode:
-                mode_summary_path = str(eval_result.summary_path)
-            results[mode_name] = {
-                "summary": mode_summary,
-                "summary_path": mode_summary_path,
-            }
-        return results
-    finally:
-        shutdown_event.set()
-        worker.join(timeout=30.0)
-        if worker.is_alive():
-            worker.terminate()
-            worker.join(timeout=5.0)
 
 
 def parse_action(value: str) -> np.ndarray:

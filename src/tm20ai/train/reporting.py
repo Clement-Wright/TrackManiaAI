@@ -80,6 +80,7 @@ def _build_eval_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
                 "mode_summaries": mode_summaries,
                 "mode_summary_paths": dict(entry.get("mode_summary_paths") or {}),
                 "deterministic_collapse": entry.get("deterministic_collapse"),
+                "final_checkpoint_eval": bool(entry.get("final_checkpoint_eval", eval_summary.get("final_checkpoint_eval", False))),
                 "eval_provenance_mode": entry.get("eval_provenance_mode", eval_summary.get("eval_provenance_mode")),
                 "eval_checkpoint_path": entry.get("eval_checkpoint_path", eval_summary.get("eval_checkpoint_path")),
                 "eval_checkpoint_sha256": entry.get("eval_checkpoint_sha256", eval_summary.get("eval_checkpoint_sha256")),
@@ -105,6 +106,53 @@ def _build_eval_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def _exact_final_eval_from_summary(summary: dict[str, Any], eval_rows: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
+    exact_summary = summary.get("exact_final_eval_summary")
+    if isinstance(exact_summary, dict):
+        return {
+            "env_step": int(exact_summary.get("env_step", summary.get("env_step", 0)) or 0),
+            "learner_step": int(exact_summary.get("learner_step", summary.get("learner_step", 0)) or 0),
+            "mean_final_progress_index": float(exact_summary.get("mean_final_progress_index", 0.0) or 0.0),
+            "median_final_progress_index": exact_summary.get("median_final_progress_index"),
+            "mean_final_progress_meters": exact_summary.get("mean_final_progress_meters"),
+            "median_final_progress_meters": exact_summary.get("median_final_progress_meters"),
+            "mean_final_arc_length_m": exact_summary.get("mean_final_arc_length_m"),
+            "median_final_arc_length_m": exact_summary.get("median_final_arc_length_m"),
+            "mean_progress_fraction_of_reference": exact_summary.get("mean_progress_fraction_of_reference"),
+            "median_progress_fraction_of_reference": exact_summary.get("median_progress_fraction_of_reference"),
+            "reference_total_arc_length_m": exact_summary.get("reference_total_arc_length_m"),
+            "mean_ghost_relative_time_delta_ms": exact_summary.get("mean_ghost_relative_time_delta_ms"),
+            "median_ghost_relative_time_delta_ms": exact_summary.get("median_ghost_relative_time_delta_ms"),
+            "best_ghost_relative_time_delta_ms": exact_summary.get("best_ghost_relative_time_delta_ms"),
+            "progress_spacing_meters": exact_summary.get("progress_spacing_meters"),
+            "progress_index_semantics": exact_summary.get("progress_index_semantics"),
+            "completion_rate": float(exact_summary.get("completion_rate", 0.0) or 0.0),
+            "determinism_conversion_score": exact_summary.get("determinism_conversion_score"),
+            "deterministic_stochastic_progress_gap": exact_summary.get("deterministic_stochastic_progress_gap"),
+            "deterministic_stochastic_completion_gap": exact_summary.get("deterministic_stochastic_completion_gap"),
+            "best_reward": exact_summary.get("best_reward"),
+            "summary_path": summary.get("exact_final_eval_summary_path"),
+            "mode_summaries": dict(summary.get("exact_final_eval_mode_summaries") or {}),
+            "mode_summary_paths": dict(summary.get("exact_final_eval_mode_summary_paths") or {}),
+            "deterministic_collapse": exact_summary.get("deterministic_collapse"),
+            "final_checkpoint_eval": True,
+            "eval_provenance_mode": exact_summary.get("eval_provenance_mode"),
+            "eval_checkpoint_path": exact_summary.get("eval_checkpoint_path"),
+            "eval_checkpoint_sha256": exact_summary.get("eval_checkpoint_sha256"),
+            "eval_checkpoint_env_step": exact_summary.get("eval_checkpoint_env_step"),
+            "eval_checkpoint_learner_step": exact_summary.get("eval_checkpoint_learner_step"),
+            "eval_checkpoint_actor_step": exact_summary.get("eval_checkpoint_actor_step"),
+            "scheduled_actor_version": exact_summary.get("scheduled_actor_version"),
+            "applied_actor_version": exact_summary.get("applied_actor_version"),
+            "applied_actor_source_learner_step": exact_summary.get("applied_actor_source_learner_step"),
+            "worker_env_step_at_eval_start": exact_summary.get("worker_env_step_at_eval_start"),
+        }
+    for row in reversed(list(eval_rows)):
+        if bool(row.get("final_checkpoint_eval")):
+            return row
+    return None
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -171,6 +219,27 @@ def build_training_report(
         key=lambda row: float(row.get("mean_final_progress_index", 0.0) or 0.0),
         default=None,
     )
+    exact_final_eval = _exact_final_eval_from_summary(summary, eval_rows)
+    final_checkpoint_eval_enabled = bool(
+        summary.get(
+            "final_checkpoint_eval_enabled",
+            int(summary.get("eval_episodes", 0) or 0) > 0,
+        )
+    )
+    exact_final_eval_complete = bool(summary.get("exact_final_eval_complete", exact_final_eval is not None))
+    incomplete_final_eval = bool(
+        summary.get("incomplete_final_eval", final_checkpoint_eval_enabled and not exact_final_eval_complete)
+    )
+    final_eval_state = str(
+        summary.get(
+            "final_eval_state",
+            "disabled"
+            if not final_checkpoint_eval_enabled
+            else "complete"
+            if exact_final_eval_complete
+            else "exact_final_eval_missing",
+        )
+    )
 
     failure_notes: list[str] = []
     termination_reason = summary.get("termination_reason")
@@ -181,6 +250,13 @@ def build_training_report(
     worker_exit = summary.get("worker_exit", {})
     if worker_exit.get("terminated"):
         failure_notes.append("worker process was force-terminated")
+    final_eval_status = dict(summary.get("final_eval_status") or {})
+    if incomplete_final_eval:
+        detail = final_eval_status.get("skipped_reason")
+        failure_notes.append(
+            "exact final checkpoint-backed dual-mode eval is missing"
+            + ("" if detail in (None, "") else f" ({detail})")
+        )
 
     report = {
         "run_name": summary.get("run_name"),
@@ -227,6 +303,12 @@ def build_training_report(
         "latest_eval_summary_path": summary.get("latest_eval_summary_path"),
         "latest_eval_mode_summaries": dict(summary.get("latest_eval_mode_summaries") or {}),
         "latest_eval_mode_summary_paths": dict(summary.get("latest_eval_mode_summary_paths") or {}),
+        "final_eval_status": final_eval_status,
+        "final_checkpoint_eval_enabled": final_checkpoint_eval_enabled,
+        "exact_final_eval": exact_final_eval,
+        "exact_final_eval_complete": exact_final_eval_complete,
+        "incomplete_final_eval": incomplete_final_eval,
+        "final_eval_state": final_eval_state,
         "checkpoint_list": checkpoint_rows,
         "replay_growth": replay_growth,
         "eval_history_table": eval_rows,
@@ -390,6 +472,8 @@ def _render_run_report_markdown(report: dict[str, Any]) -> str:
         f"- Current actor staleness: {report.get('current_actor_staleness')}",
         f"- Replay size: {report['replay_size']}",
         f"- Training duration (s): {report.get('training_duration_seconds')}",
+        f"- Exact final eval complete: {report.get('exact_final_eval_complete')}",
+        f"- Final eval state: {report.get('final_eval_state')}",
         f"- Ghost bundle: {report.get('ghost_bundle_manifest_path')}",
         f"- Canonical reference: source={report.get('canonical_reference_source')} path={report.get('canonical_reference_path')}",
         f"- Strategy selection: status={report.get('strategy_classification_status')} family={report.get('selected_training_family')} mixed_fallback={report.get('mixed_fallback')}",
@@ -407,6 +491,24 @@ def _render_run_report_markdown(report: dict[str, Any]) -> str:
         lines.append(f"- Selected override bundle: {report.get('selected_override_manifest_path')}")
     if report.get("author_fallback_manifest_path") is not None:
         lines.append(f"- Author fallback bundle: {report.get('author_fallback_manifest_path')}")
+    exact_final_eval = dict(report.get("exact_final_eval") or {})
+    if exact_final_eval:
+        lines.extend(
+            [
+                "",
+                "## Exact Final Eval",
+                f"- mean_final_progress_index={exact_final_eval.get('mean_final_progress_index')} "
+                f"mean_final_progress_meters={exact_final_eval.get('mean_final_progress_meters')} "
+                f"mean_final_arc_length_m={exact_final_eval.get('mean_final_arc_length_m')} "
+                f"mean_progress_fraction={exact_final_eval.get('mean_progress_fraction_of_reference')} "
+                f"mean_ghost_delta_ms={exact_final_eval.get('mean_ghost_relative_time_delta_ms')} "
+                f"completion_rate={exact_final_eval.get('completion_rate')}",
+                f"- provenance: mode={exact_final_eval.get('eval_provenance_mode')} "
+                f"checkpoint={exact_final_eval.get('eval_checkpoint_path')} "
+                f"checkpoint_env_step={exact_final_eval.get('eval_checkpoint_env_step')} "
+                f"checkpoint_learner_step={exact_final_eval.get('eval_checkpoint_learner_step')}",
+            ]
+        )
     lines.extend(["", "## Checkpoints"])
     for checkpoint in report.get("checkpoint_list", []):
         lines.append(

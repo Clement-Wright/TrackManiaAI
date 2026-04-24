@@ -178,6 +178,9 @@ def test_artifact_cleanup_keeps_best_and_latest_runs(tmp_path: Path) -> None:
     assert str(stale_redq.resolve()) in cleanup_result.removed_paths
     assert not stale_redq.exists()
     assert best_redq.exists()
+    assert (artifact_root / "eval" / "best_redq_final_exact_step_00001000_deterministic").exists()
+    assert (artifact_root / "eval" / "best_redq_final_exact_step_00001000_stochastic").exists()
+    assert not (artifact_root / "eval" / "stale_redq_final_exact_step_00001000_deterministic").exists()
 
 
 def test_run_algorithm_ladder_dry_run(tmp_path: Path) -> None:

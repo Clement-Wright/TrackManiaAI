@@ -34,6 +34,7 @@ from .diagnostics import (
     build_agent_resource_profile,
     build_bottleneck_verdict,
 )
+from .evaluator import combine_mode_run_results, run_checkpoint_eval_via_worker
 from .metrics import TensorBoardScalarLogger
 from .protocol import EvalResult
 from .replay import BalancedReplayBuffer, ReplayBuffer
@@ -472,6 +473,7 @@ class SACLearner:
     def _summary_payload(self) -> dict[str, Any]:
         now_timestamp = self.run_end_timestamp or _utc_now()
         self._refresh_resource_profile()
+        exact_final_eval = self._exact_final_eval_payload()
         payload = {
             "run_name": self.run_name,
             "config_path": str(self.config_path),
@@ -515,6 +517,12 @@ class SACLearner:
             "latest_eval_mode_summaries": self.latest_eval_mode_summaries,
             "latest_eval_mode_summary_paths": self.latest_eval_mode_summary_paths,
             "latest_eval_mode_run_dirs": self.latest_eval_mode_run_dirs,
+            "exact_final_eval_summary": exact_final_eval["summary"],
+            "exact_final_eval_summary_path": exact_final_eval["summary_path"],
+            "exact_final_eval_mode_summaries": exact_final_eval["mode_summaries"],
+            "exact_final_eval_mode_summary_paths": exact_final_eval["mode_summary_paths"],
+            "exact_final_eval_mode_run_dirs": exact_final_eval["mode_run_dirs"],
+            "exact_final_eval_complete": exact_final_eval["complete"],
             "eval_in_flight": self.eval_in_flight,
             "pending_eval": self.pending_eval,
             "started_eval": self.started_eval,
@@ -547,6 +555,14 @@ class SACLearner:
             "current_actor_staleness": self.current_actor_staleness,
             "final_checkpoint_eval_enabled": self.config.eval.final_checkpoint_eval,
             "final_eval_status": getattr(self, "final_eval_status", None),
+            "incomplete_final_eval": bool(self.config.eval.final_checkpoint_eval and not exact_final_eval["complete"]),
+            "final_eval_state": (
+                "disabled"
+                if not self.config.eval.final_checkpoint_eval
+                else "complete"
+                if exact_final_eval["complete"]
+                else "exact_final_eval_missing"
+            ),
             "max_wall_clock_minutes": self.max_wall_clock_minutes,
             "runtime_profile": self._runtime_profile_snapshot(),
             "queue_profile": self._queue_profile_snapshot(),
@@ -559,6 +575,105 @@ class SACLearner:
         if actor_step is not None:
             payload["actor_step"] = int(actor_step)
         return payload
+
+    def _exact_final_eval_entry(self) -> dict[str, Any] | None:
+        for entry in reversed(self.eval_history):
+            summary = dict(entry.get("summary") or {})
+            if bool(entry.get("final_checkpoint_eval", summary.get("final_checkpoint_eval", False))):
+                return entry
+        return None
+
+    def _exact_final_eval_payload(self) -> dict[str, Any]:
+        entry = self._exact_final_eval_entry()
+        if entry is None:
+            return {
+                "complete": False,
+                "summary": None,
+                "summary_path": None,
+                "mode_summaries": None,
+                "mode_summary_paths": None,
+                "mode_run_dirs": None,
+            }
+        return {
+            "complete": True,
+            "summary": dict(entry.get("summary") or {}),
+            "summary_path": entry.get("summary_path"),
+            "mode_summaries": dict(entry.get("mode_summaries") or {}) or None,
+            "mode_summary_paths": dict(entry.get("mode_summary_paths") or {}) or None,
+            "mode_run_dirs": dict(entry.get("mode_run_dirs") or {}) or None,
+        }
+
+    def _run_standalone_final_checkpoint_eval(self, checkpoint_path: Path, *, timeout_seconds: float) -> bool:
+        run_name = f"{self.run_name}_final_exact_step_{self.env_step:08d}"
+        eval_actor_version = self.applied_actor_version
+        if eval_actor_version is None:
+            eval_actor_version = self.desired_actor_version
+        eval_actor_source_learner_step = self.applied_source_learner_step
+        if eval_actor_source_learner_step is None:
+            eval_actor_source_learner_step = self.learner_step
+        checkpoint_metadata = {
+            "eval_provenance_mode": "checkpoint_authoritative",
+            "eval_checkpoint_path": str(checkpoint_path),
+            "eval_checkpoint_sha256": sha256_file(checkpoint_path),
+            "eval_checkpoint_env_step": self.env_step,
+            "eval_checkpoint_learner_step": self.learner_step,
+            "eval_checkpoint_actor_step": self._current_actor_step(),
+            "final_checkpoint_eval": True,
+            "eval_actor_version": eval_actor_version,
+            "eval_actor_source_learner_step": eval_actor_source_learner_step,
+            "scheduled_actor_version": eval_actor_version,
+            "applied_actor_version": self.applied_actor_version,
+            "applied_actor_source_learner_step": self.applied_source_learner_step,
+        }
+        self._write_learner_event(
+            "final_eval_begin",
+            {
+                "run_name": run_name,
+                **checkpoint_metadata,
+            },
+        )
+        eval_runner = getattr(self, "_standalone_eval_runner", run_checkpoint_eval_via_worker)
+        results = eval_runner(
+            config_path=self.config_path,
+            checkpoint_path=checkpoint_path,
+            episodes=self.eval_episodes,
+            seed_base=self.config.eval.seed_base,
+            record_video=self.config.eval.record_video,
+            modes=list(self.config.eval.modes),
+            run_name=run_name,
+            trace_seconds=float(self.config.eval.trace_seconds),
+            checkpoint_summary_extra=checkpoint_metadata,
+            timeout_seconds=max(300.0, float(timeout_seconds)),
+        )
+        normalized_results: dict[str, dict[str, Any]] = {}
+        for mode_name, mode_result in dict(results).items():
+            normalized_mode_result = dict(mode_result)
+            normalized_summary = dict(normalized_mode_result.get("summary") or {})
+            for key, value in checkpoint_metadata.items():
+                if normalized_summary.get(key) is None and value is not None:
+                    normalized_summary[key] = value
+            if normalized_summary.get("eval_mode") is None:
+                normalized_summary["eval_mode"] = str(mode_name)
+            normalized_mode_result["summary"] = normalized_summary
+            normalized_results[str(mode_name)] = normalized_mode_result
+        results = normalized_results
+        primary_result = combine_mode_run_results(results)
+        eval_result = EvalResult.from_run_result(
+            checkpoint_step=self.env_step,
+            env_step=self.env_step,
+            learner_step=self.learner_step,
+            result=primary_result,
+        )
+        self._handle_eval_result(eval_result)
+        self._write_learner_event(
+            "final_eval_end",
+            {
+                "run_name": run_name,
+                "summary_path": primary_result.get("summary_path"),
+                **checkpoint_metadata,
+            },
+        )
+        return True
 
     def load_checkpoint(self, checkpoint_path: str | Path) -> None:
         payload = torch.load(Path(checkpoint_path).resolve(), map_location=self.device)
@@ -1208,10 +1323,11 @@ class SACLearner:
     def _handle_eval_result(self, result: EvalResult | Mapping[str, Any]) -> None:
         handling_start = time.perf_counter()
         payload = result if isinstance(result, EvalResult) else EvalResult(**dict(result))
-        if payload.env_step < self.latest_eval_step:
+        raw_summary = dict(payload.summary)
+        final_checkpoint_eval = bool(raw_summary.get("final_checkpoint_eval", False))
+        if payload.env_step < self.latest_eval_step and not final_checkpoint_eval:
             self._learner_runtime["eval_result_handling"].record(time.perf_counter() - handling_start)
             return
-        raw_summary = dict(payload.summary)
         mode_summaries = {
             str(mode): dict(summary)
             for mode, summary in dict(raw_summary.get("eval_mode_summaries", {})).items()
@@ -1224,6 +1340,28 @@ class SACLearner:
             if mode_summaries
             else raw_summary
         )
+        # Keep authoritative eval provenance on the flattened primary summary so
+        # checkpoint-backed final evals are not stripped down to bare metrics.
+        for key in (
+            "final_checkpoint_eval",
+            "eval_actor_version",
+            "eval_actor_source_learner_step",
+            "scheduled_actor_version",
+            "eval_provenance_mode",
+            "eval_checkpoint_path",
+            "eval_checkpoint_sha256",
+            "eval_checkpoint_env_step",
+            "eval_checkpoint_learner_step",
+            "eval_checkpoint_actor_step",
+            "worker_env_step_at_eval_start",
+            "applied_actor_version",
+            "applied_actor_source_learner_step",
+            "deterministic_collapse",
+            "progress_spacing_meters",
+            "progress_index_semantics",
+        ):
+            if primary_summary.get(key) is None and raw_summary.get(key) is not None:
+                primary_summary[key] = raw_summary.get(key)
         self.latest_eval_step = payload.env_step
         self.latest_eval_summary = primary_summary
         self.latest_eval_summary_path = str(
@@ -1265,6 +1403,7 @@ class SACLearner:
             "checkpoint_step": payload.checkpoint_step,
             "env_step": payload.env_step,
             "learner_step": payload.learner_step,
+            "final_checkpoint_eval": final_checkpoint_eval,
             "summary_path": self.latest_eval_summary_path,
             "summary": dict(self.latest_eval_summary),
             "mode_summaries": self.latest_eval_mode_summaries,
@@ -1286,6 +1425,13 @@ class SACLearner:
             "timestamp": payload.timestamp,
         }
         self.eval_history.append(eval_entry)
+        if final_checkpoint_eval:
+            if not isinstance(getattr(self, "final_eval_status", None), dict):
+                self.final_eval_status = {}
+            self.final_eval_status["requested"] = True
+            self.final_eval_status["scheduled"] = True
+            self.final_eval_status["completed"] = True
+            self.final_eval_status["skipped_reason"] = None
         if self.elite_archive is not None:
             promotions = {}
             for mode, summary in (self.latest_eval_mode_summaries or {primary_summary.get("eval_mode", "primary"): primary_summary}).items():
@@ -1327,28 +1473,6 @@ class SACLearner:
         }
         if self.eval_in_flight or self.pending_eval is not None:
             self._wait_for_eval_completion(timeout_seconds=min(max(0.0, timeout_seconds), 120.0))
-        worker_done_for_eval = self.worker_done_event is not None and self.worker_done_event.is_set()
-        worker_alive_for_eval = (not worker_done_for_eval) and (
-            self.worker_process is None or self.worker_process.is_alive()
-        )
-        if self.config.eval.final_checkpoint_eval and self.eval_episodes > 0 and self.command_queue is not None and worker_alive_for_eval:
-            final_checkpoint = self.save_checkpoint(final=True)
-            final_run_name = f"{self.run_name}_final_exact_step_{self.env_step:08d}"
-            self._schedule_checkpoint_eval(
-                final_checkpoint,
-                scheduled_step=self.env_step,
-                run_name=final_run_name,
-                final=True,
-            )
-            self.final_eval_status["scheduled"] = True
-            eval_completed = self._wait_for_eval_completion(timeout_seconds=max(30.0, timeout_seconds))
-            self.final_eval_status["completed"] = bool(eval_completed)
-            if not eval_completed:
-                self.final_eval_status["skipped_reason"] = "timeout_or_worker_exit_before_result"
-        elif self.config.eval.final_checkpoint_eval:
-            self.final_eval_status["skipped_reason"] = (
-                "eval_disabled_or_worker_unavailable" if self.eval_episodes > 0 else "eval_episodes_zero"
-            )
         self.request_shutdown()
         deadline = time.monotonic() + timeout_seconds
         done_event_set = False
@@ -1400,6 +1524,26 @@ class SACLearner:
         )
         if final_checkpoint is None:
             final_checkpoint = self.save_checkpoint(final=True)
+        if self.config.eval.final_checkpoint_eval:
+            if self.eval_episodes <= 0:
+                self.final_eval_status["skipped_reason"] = "eval_episodes_zero"
+            else:
+                self.final_eval_status["scheduled"] = True
+                try:
+                    self.final_eval_status["completed"] = self._run_standalone_final_checkpoint_eval(
+                        final_checkpoint,
+                        timeout_seconds=max(30.0, timeout_seconds),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self.final_eval_status["completed"] = False
+                    self.final_eval_status["skipped_reason"] = "standalone_final_eval_failed"
+                    self._write_learner_event(
+                        "final_eval_failed",
+                        {
+                            "checkpoint_path": str(final_checkpoint),
+                            "error": repr(exc),
+                        },
+                    )
         self._write_run_summary()
         return final_checkpoint
 
@@ -1505,7 +1649,7 @@ class REDQLearner(SACLearner):
                 self.demo_root = str(self.bc_checkpoint_metadata["demo_root"])
         self.replay = (
             BalancedReplayBuffer.from_config(self.config)
-            if self.config.balanced_replay.enabled or self.ghost_bundle_manifest_path is not None
+            if self.config.balanced_replay.enabled
             else ReplayBuffer.from_config(self.config)
         )
         if seed_demos is not None:

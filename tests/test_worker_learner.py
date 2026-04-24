@@ -592,6 +592,30 @@ def test_learner_checkpoint_roundtrip_and_command_scheduling(tmp_path) -> None:
     restored.load_checkpoint(checkpoint_path)
     assert restored.env_step == learner.env_step
     assert restored.learner_step == learner.learner_step
+    learner._standalone_eval_runner = lambda **_kwargs: {
+        "deterministic": {
+            "summary": {
+                "env_step": learner.env_step,
+                "mean_final_progress_index": 14.0,
+                "completion_rate": 0.0,
+                "final_checkpoint_eval": True,
+                "eval_mode": "deterministic",
+            },
+            "summary_path": str(tmp_path / "eval" / "deterministic" / "summary.json"),
+            "run_dir": str(tmp_path / "eval" / "deterministic"),
+        },
+        "stochastic": {
+            "summary": {
+                "env_step": learner.env_step,
+                "mean_final_progress_index": 18.0,
+                "completion_rate": 0.0,
+                "final_checkpoint_eval": True,
+                "eval_mode": "stochastic",
+            },
+            "summary_path": str(tmp_path / "eval" / "stochastic" / "summary.json"),
+            "run_dir": str(tmp_path / "eval" / "stochastic"),
+        },
+    }
     worker_done_event.set()
     final_checkpoint = learner.finalize_run(timeout_seconds=0.1)
     assert final_checkpoint.exists()
@@ -618,6 +642,8 @@ def test_learner_checkpoint_roundtrip_and_command_scheduling(tmp_path) -> None:
     assert summary_payload["demo_root"] == str(demo_root.resolve())
     assert summary_payload["eval_episodes"] == 3
     assert summary_payload["last_worker_heartbeat"] is not None
+    assert summary_payload["exact_final_eval_complete"] is True
+    assert summary_payload["incomplete_final_eval"] is False
     assert summary_payload["selected_training_family"] == "intended_route"
     assert summary_payload["mixed_fallback"] is False
     assert summary_payload["canonical_reference_source"] == "author_reference_manifest"

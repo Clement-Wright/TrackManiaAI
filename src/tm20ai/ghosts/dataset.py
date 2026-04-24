@@ -1378,3 +1378,108 @@ def build_ghost_bundle(
         author_fallback_manifest_path=author_fallback_manifest_result,
         mixed_fallback_manifest_path=mixed_fallback_manifest_result,
     )
+
+
+def build_reference_target_bundle(
+    *,
+    map_uid: str,
+    trajectory_metadata_paths: Sequence[str | Path],
+    output_dir: str | Path,
+    manifest_name: str,
+    selected_training_family: str,
+    bundle_resolution_mode: str,
+    strategy_classification_status: str,
+    rank_min: int | None = None,
+    rank_max: int | None = None,
+    spacing_meters: float = 0.5,
+    ghost_config=None,  # noqa: ANN001
+    author_reference_manifest: str | Path | None = None,
+    bands: Sequence[str],
+    max_representatives_per_band: int,
+    set_default_alias: bool = False,
+) -> GhostBundleBuildResult:
+    output_root = Path(output_dir).resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    canonical_reference, _canonical_status = _canonical_reference(
+        map_uid=map_uid,
+        spacing_meters=spacing_meters,
+        author_reference_manifest=(
+            None
+            if author_reference_manifest is None
+            else str(Path(author_reference_manifest).resolve())
+        ),
+    )
+    anchor_payload = (
+        None
+        if canonical_reference is None or ghost_config is None
+        else _anchor_payload(canonical_reference, int(ghost_config.anchor_count))
+    )
+    candidates: list[dict[str, Any]] = []
+    for metadata_path in trajectory_metadata_paths:
+        resolved_metadata_path = Path(metadata_path).resolve()
+        metadata = _load_trajectory_metadata(resolved_metadata_path)
+        candidates.append(
+            _bundle_candidate(
+                metadata,
+                metadata_path=resolved_metadata_path,
+                canonical_reference=canonical_reference,
+                anchor_payload=anchor_payload,
+                ghost_config=ghost_config,
+                bands=bands,
+            )
+        )
+    candidates.sort(key=lambda item: int(item.get("rank") or 0))
+
+    selected = [
+        dict(item)
+        for item in candidates
+        if (rank_min is None or int(item.get("rank") or 0) >= rank_min)
+        and (rank_max is None or int(item.get("rank") or 0) <= rank_max)
+    ]
+    if not selected:
+        raise RuntimeError(
+            "Reference target bundle selection matched no trajectories"
+            + (
+                ""
+                if rank_min is None and rank_max is None
+                else f" for rank range [{rank_min}, {rank_max}]"
+            )
+            + "."
+        )
+
+    manifest_path = output_root / manifest_name
+    payload = _bundle_payload(
+        map_uid=map_uid,
+        selected=selected,
+        candidates=candidates,
+        canonical_reference=canonical_reference,
+        strategy_classification_status=strategy_classification_status,
+        selected_training_family=selected_training_family,
+        mixed_fallback=False,
+        bundle_resolution_mode=bundle_resolution_mode,
+        selected_ghost_selector=None,
+        resolved_selected_ghost_rank=None,
+        resolved_selected_ghost_name=None,
+        author_fallback_used=False,
+        intended_bundle_manifest_path=None,
+        exploit_bundle_manifest_path=None,
+        mixed_fallback_manifest_path=None,
+        selected_override_manifest_path=None,
+        author_fallback_manifest_path=None,
+        output_root=output_root / manifest_path.stem,
+        bands=bands,
+        max_representatives_per_band=max_representatives_per_band,
+    )
+    write_json(manifest_path, payload)
+    if set_default_alias:
+        default_manifest = dict(payload)
+        default_manifest["default_bundle_alias_of"] = str(manifest_path.resolve())
+        write_json(output_root / "ghost_bundle_manifest.json", default_manifest)
+    return GhostBundleBuildResult(
+        manifest_path=manifest_path.resolve(),
+        selected_count=len(selected),
+        trajectory_count=len(candidates),
+        action_channel_valid=bool(payload.get("action_channel_valid")),
+        offline_transition_count=int(payload.get("offline_transition_count", 0) or 0),
+        bundle_resolution_mode=bundle_resolution_mode,
+    )

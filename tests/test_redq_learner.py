@@ -10,6 +10,7 @@ import numpy as np
 
 from tm20ai.train.features import TELEMETRY_DIM
 from tm20ai.train.learner import REDQLearner
+from tm20ai.train.replay import ReplayBuffer
 
 
 def write_redq_train_config(
@@ -127,6 +128,11 @@ bc:
   learning_rate: 3.0e-4
   weight_decay: 0.0
   validation_fraction: 0.2
+offline_pretrain:
+  enabled: false
+  seed_replay_buffer: false
+balanced_replay:
+  enabled: false
 artifacts:
   root: "{artifacts_root.as_posix()}"
 """.strip(),
@@ -148,6 +154,33 @@ def _transition(step: int) -> dict:
         "map_uid": "test-map",
         "step_idx": step,
     }
+
+
+def test_redq_ghost_reward_manifest_does_not_allocate_balanced_replay_when_disabled(tmp_path) -> None:
+    config_path = tmp_path / "config.yaml"
+    artifacts_root = tmp_path / "artifacts"
+    manifest_path = tmp_path / "ghost_bundle_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "ghost_bundle_v1",
+                "map_uid": "test-map",
+                "bundle_resolution_mode": "selected_ghost_override",
+                "selected_training_family": "intended_route",
+            }
+        ),
+        encoding="utf-8",
+    )
+    write_redq_train_config(config_path, artifacts_root)
+
+    learner = REDQLearner(
+        config_path=config_path,
+        run_name="unit_redq_ghost_reward_manifest",
+        eval_episodes_override=0,
+        ghost_bundle=manifest_path,
+    )
+
+    assert isinstance(learner.replay, ReplayBuffer)
 
 
 def test_redq_learner_marks_actor_ready_only_after_actor_update(tmp_path) -> None:
@@ -544,6 +577,34 @@ def test_redq_finalize_run_preserves_inflight_eval_result(tmp_path) -> None:
     learner.eval_in_flight = True
     learner.pending_eval = {"run_name": "eval_pending", "env_step": 4}
 
+    def fake_final_eval_runner(**_kwargs):
+        return {
+            "deterministic": {
+                "summary": {
+                    "env_step": 4,
+                    "mean_final_progress_index": 21.0,
+                    "completion_rate": 0.0,
+                    "final_checkpoint_eval": True,
+                    "eval_mode": "deterministic",
+                },
+                "summary_path": str(tmp_path / "eval" / "deterministic" / "summary.json"),
+                "run_dir": str(tmp_path / "eval" / "deterministic"),
+            },
+            "stochastic": {
+                "summary": {
+                    "env_step": 4,
+                    "mean_final_progress_index": 24.0,
+                    "completion_rate": 0.0,
+                    "final_checkpoint_eval": True,
+                    "eval_mode": "stochastic",
+                },
+                "summary_path": str(tmp_path / "eval" / "stochastic" / "summary.json"),
+                "run_dir": str(tmp_path / "eval" / "stochastic"),
+            },
+        }
+
+    learner._standalone_eval_runner = fake_final_eval_runner
+
     def publish_eval() -> None:
         time.sleep(0.05)
         eval_result_queue.put(
@@ -587,7 +648,9 @@ def test_redq_finalize_run_preserves_inflight_eval_result(tmp_path) -> None:
     thread.join(timeout=1.0)
 
     assert learner.latest_eval_summary is not None
-    assert learner.latest_eval_summary["mean_final_progress_index"] == 12.0
+    assert learner.latest_eval_summary["mean_final_progress_index"] == 21.0
     assert learner.latest_eval_mode_summaries is not None
-    assert learner.latest_eval_mode_summaries["stochastic"]["mean_final_progress_index"] == 18.0
+    assert learner.latest_eval_mode_summaries["stochastic"]["mean_final_progress_index"] == 24.0
+    assert learner.final_eval_status["completed"] is True
+    assert learner._exact_final_eval_entry() is not None
     learner.close()

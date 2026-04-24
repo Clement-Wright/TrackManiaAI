@@ -45,6 +45,15 @@ def _collect_eval_rows_for_run(run_report: Mapping[str, Any]) -> list[dict[str, 
     return rows
 
 
+def _is_exact_final_eval_row(row: Mapping[str, Any]) -> bool:
+    summary = dict(row.get("summary") or {})
+    if bool(summary.get("final_checkpoint_eval", False)):
+        return True
+    summary_path = str(row.get("summary_path") or "")
+    run_dir = str(row.get("run_dir") or "")
+    return "_final_exact_step_" in summary_path or "_final_exact_step_" in run_dir
+
+
 @dataclass(slots=True, frozen=True)
 class ResearchReportPaths:
     json_path: Path
@@ -65,14 +74,31 @@ def build_algorithm_comparison_report(
         all_eval_rows = _collect_eval_rows_for_run(report)
         deterministic_rows = [row for row in all_eval_rows if row.get("eval_mode") == "deterministic"]
         stochastic_rows = [row for row in all_eval_rows if row.get("eval_mode") == "stochastic"]
-        best_eval = (
-            max(deterministic_rows, key=lambda row: row["mean_final_progress_index"])
-            if deterministic_rows
-            else dict(report.get("best_deterministic_eval") or {})
+        exact_final_deterministic_row = next((row for row in deterministic_rows if _is_exact_final_eval_row(row)), None)
+        exact_final_stochastic_row = next((row for row in stochastic_rows if _is_exact_final_eval_row(row)), None)
+        exact_final_eval = dict(report.get("exact_final_eval") or {})
+        if not exact_final_eval and exact_final_deterministic_row is not None:
+            exact_final_eval = dict(exact_final_deterministic_row.get("summary") or {})
+            exact_final_eval["summary_path"] = exact_final_deterministic_row.get("summary_path")
+            exact_final_eval["mode_summaries"] = {
+                "deterministic": dict(exact_final_deterministic_row.get("summary") or {}),
+                **(
+                    {}
+                    if exact_final_stochastic_row is None
+                    else {"stochastic": dict(exact_final_stochastic_row.get("summary") or {})}
+                ),
+            }
+        exact_final_eval_complete = bool(
+            report.get("exact_final_eval_complete", False)
+            or (exact_final_deterministic_row is not None and exact_final_stochastic_row is not None)
         )
+        best_eval = max(deterministic_rows, key=lambda row: row["mean_final_progress_index"]) if deterministic_rows else dict(report.get("best_deterministic_eval") or {})
         best_eval_summary = dict(best_eval.get("summary") or best_eval)
+        exact_stochastic_summary = dict((exact_final_eval.get("mode_summaries") or {}).get("stochastic") or {})
         stochastic_summary = (
-            dict(max(stochastic_rows, key=lambda row: row["mean_final_progress_index"]).get("summary") or {})
+            exact_stochastic_summary
+            if exact_final_eval_complete and exact_stochastic_summary
+            else dict(max(stochastic_rows, key=lambda row: row["mean_final_progress_index"]).get("summary") or {})
             if stochastic_rows
             else dict(best_eval_summary.get("mode_summaries", {}).get("stochastic") or {})
         )
@@ -81,34 +107,62 @@ def build_algorithm_comparison_report(
                 "algorithm": report.get("algorithm"),
                 "run_name": report.get("run_name"),
                 "run_dir": report.get("run_dir"),
+                "final_eval_state": report.get(
+                    "final_eval_state",
+                    "complete" if exact_final_eval_complete else "exact_final_eval_missing",
+                ),
+                "exact_final_eval_complete": exact_final_eval_complete,
+                "incomplete_final_eval": bool(report.get("incomplete_final_eval", not exact_final_eval_complete)),
                 "env_steps_reached": int(report.get("env_step", 0)),
                 "learner_steps_reached": int(report.get("learner_step", 0)),
                 "training_duration_seconds": report.get("training_duration_seconds"),
-                "best_deterministic_mean_final_progress_index": float(
-                    best_eval_summary.get("mean_final_progress_index", 0.0) or 0.0
+                "exact_final_deterministic_mean_final_progress_index": float(
+                    exact_final_eval.get("mean_final_progress_index", 0.0) or 0.0
                 ),
-                "best_deterministic_mean_final_progress_meters": best_eval_summary.get(
+                "best_deterministic_mean_final_progress_index": float(
+                    exact_final_eval.get("mean_final_progress_index", 0.0) or 0.0
+                ),
+                "exact_final_deterministic_mean_final_progress_meters": exact_final_eval.get(
                     "mean_final_progress_meters"
                 ),
-                "best_deterministic_mean_progress_fraction_of_reference": best_eval_summary.get(
+                "best_deterministic_mean_final_progress_meters": exact_final_eval.get(
+                    "mean_final_progress_meters"
+                ),
+                "exact_final_deterministic_mean_progress_fraction_of_reference": exact_final_eval.get(
                     "mean_progress_fraction_of_reference"
                 ),
-                "best_deterministic_mean_ghost_relative_time_delta_ms": best_eval_summary.get(
+                "best_deterministic_mean_progress_fraction_of_reference": exact_final_eval.get(
+                    "mean_progress_fraction_of_reference"
+                ),
+                "exact_final_deterministic_mean_ghost_relative_time_delta_ms": exact_final_eval.get(
                     "mean_ghost_relative_time_delta_ms"
                 ),
-                "best_deterministic_progress_index_semantics": best_eval_summary.get(
+                "best_deterministic_mean_ghost_relative_time_delta_ms": exact_final_eval.get(
+                    "mean_ghost_relative_time_delta_ms"
+                ),
+                "exact_final_deterministic_progress_index_semantics": exact_final_eval.get(
                     "progress_index_semantics"
                 ),
-                "best_deterministic_progress_spacing_meters": best_eval_summary.get(
+                "best_deterministic_progress_index_semantics": exact_final_eval.get(
+                    "progress_index_semantics"
+                ),
+                "exact_final_deterministic_progress_spacing_meters": exact_final_eval.get(
                     "progress_spacing_meters"
                 ),
-                "best_deterministic_eval_env_step": best_eval_summary.get("env_step"),
-                "best_deterministic_summary_path": best_eval.get("summary_path"),
-                "best_deterministic_checkpoint_path": best_eval_summary.get("eval_checkpoint_path"),
-                "best_deterministic_checkpoint_sha256": best_eval_summary.get("eval_checkpoint_sha256"),
-                "best_deterministic_checkpoint_env_step": best_eval_summary.get("eval_checkpoint_env_step"),
-                "best_deterministic_checkpoint_learner_step": best_eval_summary.get("eval_checkpoint_learner_step"),
-                "best_deterministic_checkpoint_actor_step": best_eval_summary.get("eval_checkpoint_actor_step"),
+                "best_deterministic_progress_spacing_meters": exact_final_eval.get(
+                    "progress_spacing_meters"
+                ),
+                "exact_final_deterministic_eval_env_step": exact_final_eval.get("env_step"),
+                "exact_final_deterministic_summary_path": exact_final_eval.get("summary_path"),
+                "exact_final_deterministic_checkpoint_path": exact_final_eval.get("eval_checkpoint_path"),
+                "best_deterministic_checkpoint_path": exact_final_eval.get("eval_checkpoint_path"),
+                "exact_final_deterministic_checkpoint_sha256": exact_final_eval.get("eval_checkpoint_sha256"),
+                "exact_final_deterministic_checkpoint_env_step": exact_final_eval.get("eval_checkpoint_env_step"),
+                "exact_final_deterministic_checkpoint_learner_step": exact_final_eval.get("eval_checkpoint_learner_step"),
+                "exact_final_deterministic_checkpoint_actor_step": exact_final_eval.get("eval_checkpoint_actor_step"),
+                "best_deterministic_checkpoint_progress": float(
+                    best_eval_summary.get("mean_final_progress_index", 0.0) or 0.0
+                ),
                 "best_stochastic_mean_final_progress_index": float(
                     stochastic_summary.get("mean_final_progress_index", 0.0) or 0.0
                 ),
@@ -132,7 +186,8 @@ def build_algorithm_comparison_report(
         )
     scoreboard.sort(
         key=lambda row: (
-            float(row["best_deterministic_mean_final_progress_index"]),
+            bool(row["exact_final_eval_complete"]),
+            float(row["exact_final_deterministic_mean_final_progress_index"]),
             int(row["env_steps_reached"]),
         ),
         reverse=True,
@@ -144,7 +199,7 @@ def build_algorithm_comparison_report(
         "run_count": len(scoreboard),
         "scoreboard": scoreboard,
         "winner": winner,
-        "headline_metric": "checkpoint-backed deterministic mean_final_progress_index",
+        "headline_metric": "exact final checkpoint-backed deterministic mean_final_progress_index",
     }
 
 
@@ -160,22 +215,26 @@ def _render_algorithm_comparison_markdown(report: Mapping[str, Any]) -> str:
     ]
     for row in report.get("scoreboard", []):
         lines.append(
-            f"- {row.get('algorithm')}: best_deterministic_progress={row.get('best_deterministic_mean_final_progress_index')} "
-            f"best_deterministic_m={row.get('best_deterministic_mean_final_progress_meters')} "
-            f"best_deterministic_fraction={row.get('best_deterministic_mean_progress_fraction_of_reference')} "
+            f"- {row.get('algorithm')}: exact_final_complete={row.get('exact_final_eval_complete')} "
+            f"final_eval_state={row.get('final_eval_state')} "
+            f"exact_final_progress={row.get('exact_final_deterministic_mean_final_progress_index')} "
+            f"exact_final_m={row.get('exact_final_deterministic_mean_final_progress_meters')} "
+            f"exact_final_fraction={row.get('exact_final_deterministic_mean_progress_fraction_of_reference')} "
             f"env_steps={row.get('env_steps_reached')} learner_steps={row.get('learner_steps_reached')} "
-            f"best_checkpoint={row.get('best_deterministic_checkpoint_path')}"
+            f"final_checkpoint={row.get('exact_final_deterministic_checkpoint_path')}"
         )
         lines.append(
             f"-   stochastic_progress={row.get('best_stochastic_mean_final_progress_index')} "
             f"stochastic_m={row.get('best_stochastic_mean_final_progress_meters')} "
             f"stochastic_fraction={row.get('best_stochastic_mean_progress_fraction_of_reference')} "
-            f"ghost_delta_ms={row.get('best_deterministic_mean_ghost_relative_time_delta_ms')} "
+            f"ghost_delta_ms={row.get('exact_final_deterministic_mean_ghost_relative_time_delta_ms')} "
             f"dcs={row.get('determinism_conversion_score')} "
-            f"semantics={row.get('best_deterministic_progress_index_semantics')} "
-            f"spacing_m={row.get('best_deterministic_progress_spacing_meters')} "
+            f"semantics={row.get('exact_final_deterministic_progress_index_semantics')} "
+            f"spacing_m={row.get('exact_final_deterministic_progress_spacing_meters')} "
             f"achieved_utd_1k={row.get('achieved_utd_1k')} cumulative_utd={row.get('cumulative_utd')} "
-            f"current_actor_staleness={row.get('current_actor_staleness')}"
+            f"current_actor_staleness={row.get('current_actor_staleness')} "
+            f"best_checkpoint_progress={row.get('best_deterministic_checkpoint_progress')} "
+            f"incomplete_final_eval={row.get('incomplete_final_eval')}"
         )
     winner = dict(report.get("winner") or {})
     if winner:
@@ -184,9 +243,9 @@ def _render_algorithm_comparison_markdown(report: Mapping[str, Any]) -> str:
                 "",
                 "## Winner",
                 f"- algorithm={winner.get('algorithm')}",
-                f"- best_deterministic_progress={winner.get('best_deterministic_mean_final_progress_index')}",
-                f"- best_deterministic_progress_meters={winner.get('best_deterministic_mean_final_progress_meters')}",
-                f"- checkpoint={winner.get('best_deterministic_checkpoint_path')}",
+                f"- exact_final_progress={winner.get('exact_final_deterministic_mean_final_progress_index')}",
+                f"- exact_final_progress_meters={winner.get('exact_final_deterministic_mean_final_progress_meters')}",
+                f"- checkpoint={winner.get('exact_final_deterministic_checkpoint_path')}",
             ]
         )
     return "\n".join(lines) + "\n"

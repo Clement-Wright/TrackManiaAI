@@ -12,7 +12,12 @@ from tm20ai.bridge import TelemetryFrame
 from tm20ai.config import GhostConfig, RewardConfig
 from tm20ai.data.parquet_writer import read_json, write_json
 from tm20ai.env.rt_interface import TM20AIRtInterface
-from tm20ai.ghosts.dataset import build_ghost_bundle, extract_openplanet_export, load_ghost_bundle_manifest
+from tm20ai.ghosts.dataset import (
+    build_ghost_bundle,
+    build_reference_target_bundle,
+    extract_openplanet_export,
+    load_ghost_bundle_manifest,
+)
 from tm20ai.ghosts.nadeo import NadeoCredentials, NadeoServicesClient, fetch_top100_ghost_manifest
 from tm20ai.ghosts.offline import seed_replay_from_ghost_bundle
 from tm20ai.ghosts.reward import GhostBundleReward
@@ -840,6 +845,59 @@ def test_route_aware_bundle_errors_when_no_default_bundle_can_be_resolved(
     strategy_manifest = read_json(tmp_path / "route_bundle" / "ghost_strategy_manifest.json")
     assert strategy_manifest["bundle_resolution_mode"] == "error_no_default_bundle"
     assert strategy_manifest["default_bundle_manifest_path"] is None
+
+
+def test_build_reference_target_bundle_selects_rank_range(tmp_path: Path) -> None:
+    author_reference = _write_route_metadata(
+        tmp_path,
+        name="author_reference",
+        rank=999,
+        points=_straight_points(),
+        record_time_ms=2500,
+    )
+    rank_paths = [
+        _write_route_metadata(
+            tmp_path,
+            name=f"rank_{rank:03d}",
+            rank=rank,
+            points=_straight_points(z_offset=float(rank)),
+            record_time_ms=2_000 + rank,
+        )
+        for rank in range(1, 13)
+    ]
+
+    result = build_reference_target_bundle(
+        map_uid="map",
+        trajectory_metadata_paths=rank_paths,
+        output_dir=tmp_path / "rank_bundle",
+        manifest_name="ghost_bundle_rank_011_100.json",
+        selected_training_family="rank_011_100_bundle",
+        bundle_resolution_mode="manual_rank_range_11_100",
+        strategy_classification_status="manual_rank_range_11_100",
+        rank_min=11,
+        rank_max=100,
+        spacing_meters=0.5,
+        ghost_config=GhostConfig(
+            anchor_count=8,
+            anchor_radius_m=6.0,
+            canonical_divergence_radius_m=12.0,
+            intended_candidate_pool=3,
+            intended_bundle_size=2,
+            exploit_bundle_size=1,
+        ),
+        author_reference_manifest=str(author_reference),
+        bands=("1-10", "11-30", "31-60"),
+        max_representatives_per_band=2,
+        set_default_alias=True,
+    )
+
+    manifest = load_ghost_bundle_manifest(result.manifest_path)
+    assert manifest["bundle_resolution_mode"] == "manual_rank_range_11_100"
+    assert manifest["selected_training_family"] == "rank_011_100_bundle"
+    assert [int(item["rank"]) for item in manifest["selected_trajectories"]] == [11, 12]
+    assert read_json(tmp_path / "rank_bundle" / "ghost_bundle_manifest.json")["default_bundle_alias_of"] == str(
+        result.manifest_path
+    )
 
 
 def test_route_aware_bundle_keeps_intended_selection_when_fast_unclassified_candidates_exist(tmp_path: Path) -> None:

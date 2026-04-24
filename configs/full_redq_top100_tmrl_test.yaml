@@ -137,17 +137,14 @@ bc:
 ghosts:
   enabled: true
   root: "data/ghosts"
-  bundle_manifest: null
+  bundle_manifest: "data/ghosts/oqIJ5rQDRrNwLPTh9H2p_W4tLof/ghost_bundle_rank_011_100.json"
   leaderboard_length: 100
   group_uid: "Personal_Best"
   only_world: true
   canonical_reference_mode: "author_medal"
   author_reference_manifest: null
   unavailable_intended_policy: "selected_ghost_then_author_then_error"
-  selected_ghost_overrides:
-    oqIJ5rQDRrNwLPTh9H2p_W4tLof:
-      ghost_name_contains: "isfoo_(00_33_798)_tmrl-test.Ghost"
-      rank: 11
+  selected_ghost_overrides: {}
   training_family: "intended_route"
   ambiguous_family_policy: "mixed_with_warning"
   anchor_count: 24

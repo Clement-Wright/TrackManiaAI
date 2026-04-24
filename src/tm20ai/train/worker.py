@@ -1268,8 +1268,7 @@ class SACWorker:
         self._put_message({"type": "action_stats", **stats})
 
     def _run_eval(self, env: TM20AIGymEnv, command: Mapping[str, Any]) -> dict[str, Any]:
-        from .evaluator import resolve_policy_adapter, run_policy_episodes_on_env
-        from .metrics import mode_comparison_metrics
+        from .evaluator import combine_mode_run_results, resolve_policy_adapter, run_policy_episodes_on_env
 
         raw_modes = command.get("modes", self.config.eval.modes)
         if isinstance(raw_modes, str):
@@ -1316,6 +1315,7 @@ class SACWorker:
                     "learner_step": int(command.get("learner_step", 0)),
                     "env_step": int(command.get("env_step", self._env_step)),
                     "observation_mode": self.observation_mode,
+                    "final_checkpoint_eval": bool(command.get("final_checkpoint_eval", False)),
                     "eval_actor_version": self._eval_actor_version,
                     "eval_actor_source_learner_step": self._eval_actor_source_learner_step,
                     "scheduled_actor_version": command.get("scheduled_actor_version"),
@@ -1331,52 +1331,7 @@ class SACWorker:
                 },
                 close_env=False,
             )
-
-        primary_mode = "deterministic" if "deterministic" in mode_results else next(iter(mode_results))
-        primary_result = dict(mode_results[primary_mode])
-        mode_summaries = {mode: dict(result["summary"]) for mode, result in mode_results.items()}
-        mode_summary_paths = {mode: str(result["summary_path"]) for mode, result in mode_results.items()}
-        mode_run_dirs = {mode: str(result["run_dir"]) for mode, result in mode_results.items()}
-        comparison_metrics = mode_comparison_metrics(mode_summaries)
-        deterministic_collapse = None
-        deterministic_summary = mode_summaries.get("deterministic")
-        stochastic_summary = mode_summaries.get("stochastic")
-        if deterministic_summary is not None and stochastic_summary is not None:
-            progress_delta = float(
-                (stochastic_summary.get("mean_final_progress_index") or 0.0)
-                - (deterministic_summary.get("mean_final_progress_index") or 0.0)
-            )
-            completion_delta = float(
-                (stochastic_summary.get("completion_rate") or 0.0)
-                - (deterministic_summary.get("completion_rate") or 0.0)
-            )
-            reward_delta = float(
-                (stochastic_summary.get("mean_episode_reward") or 0.0)
-                - (deterministic_summary.get("mean_episode_reward") or 0.0)
-            )
-            deterministic_collapse = {
-                "deterministic_mode": "deterministic",
-                "stochastic_mode": "stochastic",
-                "progress_delta": progress_delta,
-                "completion_rate_delta": completion_delta,
-                "mean_episode_reward_delta": reward_delta,
-                "meaningfully_outperformed": bool(
-                    progress_delta >= 5.0 or completion_delta >= 0.1 or reward_delta >= 1.0
-                ),
-            }
-            deterministic_summary.update(comparison_metrics)
-            mode_summaries["deterministic"] = deterministic_summary
-        primary_summary = dict(primary_result["summary"])
-        primary_summary["eval_mode_summaries"] = mode_summaries
-        primary_summary["eval_mode_summary_paths"] = mode_summary_paths
-        primary_summary["eval_mode_run_dirs"] = mode_run_dirs
-        primary_summary.update(comparison_metrics)
-        if deterministic_collapse is not None:
-            primary_summary["deterministic_collapse"] = deterministic_collapse
-        primary_result["summary"] = primary_summary
-        primary_result["summary_path"] = mode_summary_paths[primary_mode]
-        primary_result["run_dir"] = mode_run_dirs[primary_mode]
-        return primary_result
+        return combine_mode_run_results(mode_results)
 
     def _flush_pending_transitions(self, *, force: bool = False) -> None:
         if not self._pending_transitions:

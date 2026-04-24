@@ -334,14 +334,13 @@ def test_top100_redq_config_uses_map_calibrated_corridor() -> None:
     assert config.ghosts.unavailable_intended_policy == "selected_ghost_then_author_then_error"
 
 
-def test_tmrl_test_top100_redq_config_uses_selected_ghost_override() -> None:
+def test_tmrl_test_top100_redq_config_uses_rank11_100_bundle_manifest() -> None:
     config = load_tm20ai_config(ROOT / "configs" / "full_redq_top100_tmrl_test.yaml")
 
-    selector = config.ghosts.selected_ghost_overrides["oqIJ5rQDRrNwLPTh9H2p_W4tLof"]
     assert config.train.algorithm == "redq"
     assert config.ghosts.unavailable_intended_policy == "selected_ghost_then_author_then_error"
-    assert selector.ghost_name_contains == "isfoo_(00_33_798)_tmrl-test.Ghost"
-    assert selector.rank == 11
+    assert config.ghosts.bundle_manifest == "data/ghosts/oqIJ5rQDRrNwLPTh9H2p_W4tLof/ghost_bundle_rank_011_100.json"
+    assert config.ghosts.selected_ghost_overrides == {}
 
 
 def test_redq_agent_update_smoke_for_full() -> None:

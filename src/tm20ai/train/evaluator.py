@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import multiprocessing
+import queue
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Protocol
@@ -16,7 +18,12 @@ from ..data.parquet_writer import build_run_artifact_paths, sha256_file, timesta
 from ..env import TM20AIGymEnv, make_env
 from ..env.trajectory import load_runtime_trajectory, runtime_trajectory_path_for_map
 from .features import TELEMETRY_DIM, TelemetryFeatureBuilder
-from .metrics import TensorBoardScalarLogger, aggregate_episode_summaries, time_to_progress_thresholds
+from .metrics import (
+    TensorBoardScalarLogger,
+    aggregate_episode_summaries,
+    mode_comparison_metrics,
+    time_to_progress_thresholds,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -373,6 +380,59 @@ def _build_eval_trace_row(
     }
 
 
+def combine_mode_run_results(mode_results: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    if not mode_results:
+        raise RuntimeError("At least one eval mode result is required.")
+
+    primary_mode = "deterministic" if "deterministic" in mode_results else next(iter(mode_results))
+    primary_result = dict(mode_results[primary_mode])
+    mode_summaries = {str(mode): dict(result["summary"]) for mode, result in mode_results.items()}
+    mode_summary_paths = {str(mode): str(result["summary_path"]) for mode, result in mode_results.items()}
+    mode_run_dirs = {str(mode): str(result["run_dir"]) for mode, result in mode_results.items()}
+    comparison_metrics = mode_comparison_metrics(mode_summaries)
+
+    deterministic_collapse = None
+    deterministic_summary = mode_summaries.get("deterministic")
+    stochastic_summary = mode_summaries.get("stochastic")
+    if deterministic_summary is not None and stochastic_summary is not None:
+        progress_delta = float(
+            (stochastic_summary.get("mean_final_progress_index") or 0.0)
+            - (deterministic_summary.get("mean_final_progress_index") or 0.0)
+        )
+        completion_delta = float(
+            (stochastic_summary.get("completion_rate") or 0.0)
+            - (deterministic_summary.get("completion_rate") or 0.0)
+        )
+        reward_delta = float(
+            (stochastic_summary.get("mean_episode_reward") or 0.0)
+            - (deterministic_summary.get("mean_episode_reward") or 0.0)
+        )
+        deterministic_collapse = {
+            "deterministic_mode": "deterministic",
+            "stochastic_mode": "stochastic",
+            "progress_delta": progress_delta,
+            "completion_rate_delta": completion_delta,
+            "mean_episode_reward_delta": reward_delta,
+            "meaningfully_outperformed": bool(
+                progress_delta >= 5.0 or completion_delta >= 0.1 or reward_delta >= 1.0
+            ),
+        }
+        deterministic_summary.update(comparison_metrics)
+        mode_summaries["deterministic"] = deterministic_summary
+
+    primary_summary = dict(primary_result["summary"])
+    primary_summary["eval_mode_summaries"] = mode_summaries
+    primary_summary["eval_mode_summary_paths"] = mode_summary_paths
+    primary_summary["eval_mode_run_dirs"] = mode_run_dirs
+    primary_summary.update(comparison_metrics)
+    if deterministic_collapse is not None:
+        primary_summary["deterministic_collapse"] = deterministic_collapse
+    primary_result["summary"] = primary_summary
+    primary_result["summary_path"] = mode_summary_paths[primary_mode]
+    primary_result["run_dir"] = mode_run_dirs[primary_mode]
+    return primary_result
+
+
 def run_policy_episodes_on_env(
     *,
     env: TM20AIGymEnv,
@@ -579,3 +639,105 @@ def run_policy_episodes(
         summary_extra=summary_extra,
         close_env=True,
     )
+
+
+def run_checkpoint_eval_via_worker(
+    *,
+    config_path: str | Path,
+    checkpoint_path: str | Path,
+    episodes: int,
+    seed_base: int,
+    record_video: bool,
+    modes: Sequence[str],
+    run_name: str | None,
+    trace_seconds: float,
+    checkpoint_summary_extra: Mapping[str, object],
+    timeout_seconds: float | None = None,
+) -> dict[str, dict[str, Any]]:
+    from .worker import worker_entry
+
+    resolved_config_path = str(Path(config_path).resolve())
+    resolved_checkpoint_path = Path(checkpoint_path).resolve()
+    ctx = multiprocessing.get_context("spawn")
+    command_queue = ctx.Queue(maxsize=8)
+    output_queue = ctx.Queue(maxsize=8)
+    eval_result_queue = ctx.Queue(maxsize=8)
+    shutdown_event = ctx.Event()
+    worker_done_event = ctx.Event()
+    worker = ctx.Process(
+        target=worker_entry,
+        args=(
+            resolved_config_path,
+            command_queue,
+            output_queue,
+            eval_result_queue,
+            shutdown_event,
+            worker_done_event,
+            None,
+            None,
+        ),
+        name="tm20ai-checkpoint-eval-worker",
+    )
+    worker.start()
+    try:
+        command_queue.put(
+            {
+                "type": "run_eval",
+                "run_name": run_name,
+                "env_step": int(checkpoint_summary_extra.get("eval_checkpoint_env_step", 0) or 0),
+                "learner_step": int(checkpoint_summary_extra.get("eval_checkpoint_learner_step", 0) or 0),
+                "episodes": int(episodes),
+                "seed_base": int(seed_base),
+                "record_video": bool(record_video),
+                "modes": [str(mode) for mode in modes],
+                "trace_seconds": float(trace_seconds),
+                "scheduled_actor_version": None,
+                **dict(checkpoint_summary_extra),
+            }
+        )
+        command_queue.put({"type": "shutdown"})
+
+        wait_timeout = (
+            max(300.0, float(timeout_seconds))
+            if timeout_seconds is not None
+            else max(300.0, float(episodes) * 180.0)
+        )
+        deadline = time.time() + wait_timeout
+        eval_result = None
+        while time.time() < deadline:
+            try:
+                eval_result = eval_result_queue.get(timeout=1.0)
+                break
+            except queue.Empty:
+                if not worker.is_alive() and eval_result_queue.empty():
+                    break
+        if eval_result is None:
+            if worker.exitcode not in (None, 0):
+                raise RuntimeError(
+                    f"Checkpoint eval worker exited with code {worker.exitcode} before producing a result."
+                )
+            raise RuntimeError("Checkpoint eval worker did not produce an eval result before the timeout.")
+
+        summary = dict(eval_result.summary)
+        mode_summaries = dict(summary.get("eval_mode_summaries") or {})
+        mode_summary_paths = dict(summary.get("eval_mode_summary_paths") or {})
+        mode_run_dirs = dict(summary.get("eval_mode_run_dirs") or {})
+        results: dict[str, dict[str, Any]] = {}
+        primary_mode = str(summary.get("eval_mode") or ("deterministic" if "deterministic" in modes else modes[0]))
+        for mode_name in modes:
+            mode_summary = dict(mode_summaries.get(mode_name) or (summary if mode_name == primary_mode else {}))
+            mode_summary_path = mode_summary_paths.get(mode_name)
+            if mode_summary_path is None and mode_name == primary_mode:
+                mode_summary_path = str(eval_result.summary_path)
+            results[str(mode_name)] = {
+                "summary": mode_summary,
+                "summary_path": mode_summary_path,
+                "run_dir": mode_run_dirs.get(mode_name),
+            }
+        return results
+    finally:
+        shutdown_event.set()
+        worker.join(timeout=30.0)
+        if worker.is_alive():
+            worker.terminate()
+            worker.join(timeout=5.0)
