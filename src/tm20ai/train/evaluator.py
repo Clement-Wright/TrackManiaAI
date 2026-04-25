@@ -4,6 +4,7 @@ import importlib
 import importlib.util
 import multiprocessing
 import queue
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Protocol

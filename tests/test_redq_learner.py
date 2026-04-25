@@ -654,3 +654,109 @@ def test_redq_finalize_run_preserves_inflight_eval_result(tmp_path) -> None:
     assert learner.final_eval_status["completed"] is True
     assert learner._exact_final_eval_entry() is not None
     learner.close()
+
+
+def test_redq_finalize_run_uses_live_worker_for_final_exact_eval(tmp_path) -> None:
+    config_path = tmp_path / "config.yaml"
+    artifacts_root = tmp_path / "artifacts"
+    write_redq_train_config(config_path, artifacts_root, q_updates_per_policy_update=1)
+
+    learner = REDQLearner(config_path=config_path, run_name="unit_redq_live_final_eval")
+    command_queue: queue.Queue = queue.Queue()
+    output_queue: queue.Queue = queue.Queue()
+    eval_result_queue: queue.Queue = queue.Queue()
+    shutdown_event = threading.Event()
+    worker_done_event = threading.Event()
+
+    class FakeWorkerProcess:
+        def __init__(self) -> None:
+            self.exitcode = 0
+            self.terminated = False
+
+        def is_alive(self) -> bool:
+            return not worker_done_event.is_set()
+
+        def join(self, timeout: float | None = None) -> None:
+            return None
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+    fake_worker = FakeWorkerProcess()
+    learner.attach_worker(
+        command_queue=command_queue,
+        output_queue=output_queue,
+        eval_result_queue=eval_result_queue,
+        shutdown_event=shutdown_event,
+        worker_done_event=worker_done_event,
+        worker_process=fake_worker,
+    )
+    learner.env_step = 4
+    learner.learner_step = 8
+    learner.actor_step = 2
+
+    def fail_standalone(**_kwargs):
+        raise AssertionError("standalone final eval should not run when the live worker can execute final eval")
+
+    learner._standalone_eval_runner = fail_standalone
+
+    def publish_final_eval() -> None:
+        while True:
+            command = command_queue.get(timeout=1.0)
+            if command.get("type") != "run_eval":
+                continue
+            assert command.get("final_checkpoint_eval") is True
+            eval_result_queue.put(
+                {
+                    "checkpoint_step": 4,
+                    "env_step": 4,
+                    "learner_step": 8,
+                    "summary_path": str(tmp_path / "eval" / "deterministic" / "summary.json"),
+                    "summary": {
+                        "env_step": 4,
+                        "mean_final_progress_index": 33.0,
+                        "final_checkpoint_eval": True,
+                        "eval_mode": "deterministic",
+                        "eval_mode_summaries": {
+                            "deterministic": {
+                                "env_step": 4,
+                                "mean_final_progress_index": 33.0,
+                                "completion_rate": 0.0,
+                                "final_checkpoint_eval": True,
+                                "eval_mode": "deterministic",
+                            },
+                            "stochastic": {
+                                "env_step": 4,
+                                "mean_final_progress_index": 40.0,
+                                "completion_rate": 0.0,
+                                "final_checkpoint_eval": True,
+                                "eval_mode": "stochastic",
+                            },
+                        },
+                        "eval_mode_summary_paths": {
+                            "deterministic": str(tmp_path / "eval" / "deterministic" / "summary.json"),
+                            "stochastic": str(tmp_path / "eval" / "stochastic" / "summary.json"),
+                        },
+                        "eval_mode_run_dirs": {
+                            "deterministic": str(tmp_path / "eval" / "deterministic"),
+                            "stochastic": str(tmp_path / "eval" / "stochastic"),
+                        },
+                    },
+                    "timestamp": time.time(),
+                }
+            )
+            worker_done_event.set()
+            return
+
+    thread = threading.Thread(target=publish_final_eval, daemon=True)
+    thread.start()
+    learner.finalize_run(timeout_seconds=1.0)
+    thread.join(timeout=1.0)
+
+    assert learner.final_eval_status["completed"] is True
+    assert learner.final_eval_status["skipped_reason"] is None
+    assert learner.latest_eval_summary is not None
+    assert learner.latest_eval_summary["mean_final_progress_index"] == 33.0
+    assert learner._exact_final_eval_entry() is not None
+    assert fake_worker.terminated is False
+    learner.close()

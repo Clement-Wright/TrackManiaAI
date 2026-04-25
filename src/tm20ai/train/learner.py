@@ -1473,8 +1473,30 @@ class SACLearner:
         }
         if self.eval_in_flight or self.pending_eval is not None:
             self._wait_for_eval_completion(timeout_seconds=min(max(0.0, timeout_seconds), 120.0))
+        if final_checkpoint is None:
+            final_checkpoint = self.save_checkpoint(final=True)
+        worker_can_run_final_eval = bool(
+            self.config.eval.final_checkpoint_eval
+            and self.eval_episodes > 0
+            and self.command_queue is not None
+            and self.worker_process is not None
+            and self.worker_process.is_alive()
+        )
+        if worker_can_run_final_eval:
+            self.final_eval_status["scheduled"] = True
+            self._schedule_checkpoint_eval(
+                final_checkpoint,
+                scheduled_step=self.env_step,
+                run_name=f"{self.run_name}_final_exact_step_{self.env_step:08d}",
+                final=True,
+            )
         self.request_shutdown()
-        deadline = time.monotonic() + timeout_seconds
+        final_eval_wait_seconds = (
+            max(float(timeout_seconds), 300.0, float(self.eval_episodes) * 180.0)
+            if worker_can_run_final_eval
+            else float(timeout_seconds)
+        )
+        deadline = time.monotonic() + final_eval_wait_seconds
         done_event_set = False
         while time.monotonic() < deadline:
             self.drain_messages(timeout=0.25)
@@ -1522,11 +1544,12 @@ class SACLearner:
                 "clean_shutdown": self.clean_shutdown,
             },
         )
-        if final_checkpoint is None:
-            final_checkpoint = self.save_checkpoint(final=True)
         if self.config.eval.final_checkpoint_eval:
             if self.eval_episodes <= 0:
                 self.final_eval_status["skipped_reason"] = "eval_episodes_zero"
+            elif worker_can_run_final_eval and self._exact_final_eval_payload()["complete"]:
+                self.final_eval_status["completed"] = True
+                self.final_eval_status["skipped_reason"] = None
             else:
                 self.final_eval_status["scheduled"] = True
                 try:

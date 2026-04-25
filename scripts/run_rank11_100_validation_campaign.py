@@ -109,6 +109,16 @@ REWARD_VARIANTS: tuple[dict[str, Any], ...] = (
     },
 )
 
+REPAIRABLE_FINAL_EVAL_REASONS = {
+    "exact_final_eval_complete_false",
+    "incomplete_final_eval_true",
+    "final_eval_state=exact_final_eval_missing",
+    "deterministic_summary_path_missing",
+    "deterministic_summary_missing_on_disk",
+    "stochastic_summary_path_missing",
+    "stochastic_summary_missing_on_disk",
+}
+
 
 def _deep_merge(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
     merged = dict(base)
@@ -151,13 +161,21 @@ def _latest_resume_checkpoint(run_dir: Path) -> Path | None:
     candidates = sorted(checkpoint_dir.glob("checkpoint_*.pt"))
     if not candidates:
         return None
-    return candidates[-1].resolve()
+    valid_candidates = [candidate for candidate in candidates if candidate.is_file() and candidate.stat().st_size > 0]
+    if not valid_candidates:
+        return None
+    return valid_candidates[-1].resolve()
 
 
 def _write_status(status_path: Path, payload: dict[str, Any]) -> None:
     body = dict(payload)
     body["updated_at"] = now_iso()
     write_json(status_path, body)
+
+
+def _is_repairable_final_eval_gap(validation) -> bool:  # noqa: ANN001
+    reasons = set(validation.reasons)
+    return bool(reasons) and reasons.issubset(REPAIRABLE_FINAL_EVAL_REASONS)
 
 
 def _preflight(*, base_config_path: Path, bundle_manifest_path: Path, dry_run: bool) -> None:
@@ -186,6 +204,37 @@ def _gate_environment(*, config_path: Path, dry_run: bool) -> None:
     _remove_stale_live_lock()
     _run_command(
         [sys.executable, str(ROOT / "scripts" / "force_window_size.py"), "--config", str(config_path)],
+        dry_run=dry_run,
+    )
+
+
+def _repair_missing_exact_final_eval(
+    *,
+    run_dir: Path,
+    config_path: Path,
+    dry_run: bool,
+    status_path: Path,
+    leg_label: str,
+) -> None:
+    _write_status(
+        status_path,
+        {
+            "state": "repairing_exact_final_eval",
+            "current_leg": leg_label,
+            "current_run_name": run_dir.name,
+            "current_config_path": str(config_path),
+        },
+    )
+    _gate_environment(config_path=config_path, dry_run=dry_run)
+    _run_command(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "backfill_final_checkpoint_eval.py"),
+            "--run-dir",
+            str(run_dir),
+            "--config",
+            str(config_path),
+        ],
         dry_run=dry_run,
     )
     _run_command(
@@ -217,6 +266,19 @@ def _run_training_leg(
         if validation.valid:
             log(f"leg_reused_valid={run_name}")
             return run_dir
+        if _is_repairable_final_eval_gap(validation):
+            log(f"leg_repair_exact_final_eval={run_name}")
+            _repair_missing_exact_final_eval(
+                run_dir=run_dir,
+                config_path=config_path,
+                dry_run=dry_run,
+                status_path=status_path,
+                leg_label=leg_label,
+            )
+            validation = validate_campaign_run(run_dir)
+            if validation.valid:
+                log(f"leg_reused_repaired={run_name}")
+                return run_dir
 
     _gate_environment(config_path=config_path, dry_run=dry_run)
     _write_status(
@@ -248,6 +310,16 @@ def _run_training_leg(
         return run_dir
 
     validation = validate_campaign_run(run_dir)
+    if not validation.valid and _is_repairable_final_eval_gap(validation):
+        log(f"leg_backfill_exact_final_eval={run_name}")
+        _repair_missing_exact_final_eval(
+            run_dir=run_dir,
+            config_path=config_path,
+            dry_run=dry_run,
+            status_path=status_path,
+            leg_label=leg_label,
+        )
+        validation = validate_campaign_run(run_dir)
     if not validation.valid:
         raise RuntimeError(
             f"Run {run_name} is not valid for campaign ranking: {', '.join(validation.reasons)}"

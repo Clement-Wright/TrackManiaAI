@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
 import sys
@@ -15,6 +16,15 @@ from tm20ai.train.campaign import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CAMPAIGN_SCRIPT_PATH = ROOT / "scripts" / "run_rank11_100_validation_campaign.py"
+
+
+def _load_campaign_script_module():
+    spec = importlib.util.spec_from_file_location("rank11_validation_campaign_script", CAMPAIGN_SCRIPT_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _write_campaign_run(
@@ -220,3 +230,75 @@ def test_run_rank11_validation_campaign_dry_run(tmp_path: Path) -> None:
     )
     payload = yaml.safe_load(generated_config.read_text(encoding="utf-8"))
     assert Path(payload["ghosts"]["bundle_manifest"]).is_absolute()
+
+
+def test_run_training_leg_repairs_missing_exact_final_eval_before_retry(tmp_path: Path, monkeypatch) -> None:
+    campaign_script = _load_campaign_script_module()
+    artifact_root = tmp_path / "artifacts"
+    run_name = "campaign_repairable"
+    run_dir = _write_campaign_run(
+        artifact_root,
+        run_name=run_name,
+        exact_progress=100.0,
+        ghost_delta_ms=200.0,
+        progress_fraction=0.8,
+        corridor_truncation_rate=0.1,
+        corridor_nonrecovering_p95=5.0,
+        exact_complete=False,
+        final_eval_state="exact_final_eval_missing",
+    )
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("ghosts:\n  bundle_manifest: C:/bundle.json\n", encoding="utf-8")
+    status_path = tmp_path / "status.json"
+
+    repaired: list[Path] = []
+
+    def fake_gate_environment(*, config_path: Path, dry_run: bool) -> None:
+        return None
+
+    def fake_repair_missing_exact_final_eval(
+        *, run_dir: Path, config_path: Path, dry_run: bool, status_path: Path, leg_label: str
+    ) -> None:
+        repaired.append(run_dir)
+        _write_campaign_run(
+            artifact_root,
+            run_name=run_name,
+            exact_progress=150.0,
+            ghost_delta_ms=150.0,
+            progress_fraction=0.85,
+            corridor_truncation_rate=0.05,
+            corridor_nonrecovering_p95=2.0,
+            exact_complete=True,
+            final_eval_state="complete",
+        )
+
+    monkeypatch.setattr(campaign_script, "_gate_environment", fake_gate_environment)
+    monkeypatch.setattr(campaign_script, "_repair_missing_exact_final_eval", fake_repair_missing_exact_final_eval)
+
+    repaired_run_dir = campaign_script._run_training_leg(
+        run_name=run_name,
+        config_path=config_path,
+        artifact_root=artifact_root,
+        wall_clock_minutes=90.0,
+        dry_run=False,
+        status_path=status_path,
+        leg_label="A0_baseline_current",
+    )
+
+    assert repaired_run_dir == run_dir
+    assert repaired == [run_dir]
+    assert validate_campaign_run(repaired_run_dir).valid is True
+
+
+def test_latest_resume_checkpoint_skips_zero_byte_partial_files(tmp_path: Path) -> None:
+    campaign_script = _load_campaign_script_module()
+    checkpoint_dir = tmp_path / "run" / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    valid_checkpoint = checkpoint_dir / "checkpoint_00010009.pt"
+    valid_checkpoint.write_bytes(b"not-empty")
+    zero_byte_partial = checkpoint_dir / "checkpoint_00010026_final.pt"
+    zero_byte_partial.write_bytes(b"")
+
+    resume_checkpoint = campaign_script._latest_resume_checkpoint(tmp_path / "run")
+
+    assert resume_checkpoint == valid_checkpoint.resolve()
