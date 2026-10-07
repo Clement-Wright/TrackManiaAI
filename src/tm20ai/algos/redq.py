@@ -361,7 +361,7 @@ class REDQSACAgent:
             "share_encoders": self.share_encoders_requested,
         }
 
-    def load_state_dict(self, payload: dict[str, Any]) -> None:
+    def load_state_dict(self, payload: dict[str, Any], *, load_optimizers: bool = True) -> None:
         critic_state_dicts = list(payload.get("critic_state_dicts", []))
         target_critic_state_dicts = list(payload.get("target_critic_state_dicts", []))
         if len(critic_state_dicts) != self.n_critics:
@@ -378,15 +378,21 @@ class REDQSACAgent:
             critic.load_state_dict(critic_state)
         for target_critic, critic_state in zip(self.target_critics, target_critic_state_dicts, strict=True):
             target_critic.load_state_dict(critic_state)
-        self.actor_optimizer.load_state_dict(payload["actor_optimizer_state_dict"])
-        self.critic_optimizer.load_state_dict(payload["critic_optimizer_state_dict"])
+        if load_optimizers:
+            self.actor_optimizer.load_state_dict(payload["actor_optimizer_state_dict"])
+            self.critic_optimizer.load_state_dict(payload["critic_optimizer_state_dict"])
         if self.sac_config.learn_entropy_coef:
             assert isinstance(self.log_alpha, nn.Parameter)
             with torch.no_grad():
                 self.log_alpha.copy_(payload["log_alpha"].detach().to(self.device))
         elif not isinstance(self.log_alpha, nn.Parameter):
             self.log_alpha = torch.log(torch.tensor(float(payload["log_alpha"].exp().item()), device=self.device))
-        if self.sac_config.learn_entropy_coef and self.alpha_optimizer is not None and payload.get("alpha_optimizer_state_dict") is not None:
+        if (
+            load_optimizers
+            and self.sac_config.learn_entropy_coef
+            and self.alpha_optimizer is not None
+            and payload.get("alpha_optimizer_state_dict") is not None
+        ):
             self.alpha_optimizer.load_state_dict(payload["alpha_optimizer_state_dict"])
         self.critic_updates_since_actor = int(payload.get("critic_updates_since_actor", 0))
 

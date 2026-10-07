@@ -45,8 +45,26 @@ def seed_replay_from_ghost_bundle(
     manifest_path: str | Path,
     *,
     require_actions: bool = True,
+    required_training_family: str | None = None,
+    required_selected_count: int | None = None,
 ) -> dict[str, Any]:
     manifest = load_ghost_bundle_manifest(manifest_path)
+    if bool(manifest.get("mixed_fallback", False)):
+        raise RuntimeError(
+            f"Ghost bundle {manifest_path} is marked as mixed fallback; refusing offline training on mixed route families."
+        )
+    if required_training_family is not None and str(manifest.get("selected_training_family") or "") != str(
+        required_training_family
+    ):
+        raise RuntimeError(
+            f"Ghost bundle {manifest_path} selected_training_family={manifest.get('selected_training_family')!r}; "
+            f"expected {required_training_family!r}."
+        )
+    if required_selected_count is not None and int(manifest.get("selected_count", 0) or 0) != int(required_selected_count):
+        raise RuntimeError(
+            f"Ghost bundle {manifest_path} selected_count={manifest.get('selected_count')!r}; "
+            f"expected {int(required_selected_count)}."
+        )
     if require_actions and not bool(manifest.get("action_channel_valid")):
         raise RuntimeError(
             f"Ghost bundle {manifest_path} does not have validated action channels; "
@@ -67,6 +85,7 @@ def seed_replay_from_ghost_bundle(
             "canonical_reference_path": manifest.get("canonical_reference_path"),
             "strategy_classification_status": manifest.get("strategy_classification_status"),
             "selected_training_family": manifest.get("selected_training_family"),
+            "selected_count": manifest.get("selected_count"),
             "mixed_fallback": bool(manifest.get("mixed_fallback", False)),
             "bundle_resolution_mode": manifest.get("bundle_resolution_mode"),
             "selected_ghost_selector": manifest.get("selected_ghost_selector"),
@@ -97,6 +116,7 @@ def seed_replay_from_ghost_bundle(
         "canonical_reference_path": manifest.get("canonical_reference_path"),
         "strategy_classification_status": manifest.get("strategy_classification_status"),
         "selected_training_family": manifest.get("selected_training_family"),
+        "selected_count": manifest.get("selected_count"),
         "mixed_fallback": bool(manifest.get("mixed_fallback", False)),
         "bundle_resolution_mode": manifest.get("bundle_resolution_mode"),
         "selected_ghost_selector": manifest.get("selected_ghost_selector"),

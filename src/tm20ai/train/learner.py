@@ -335,6 +335,9 @@ class SACLearner:
     def _ready_for_control(self) -> bool:
         return self.learner_step > 0
 
+    def _control_ready_reason(self, ready_for_control: bool) -> str:
+        return "trained_updates_available" if ready_for_control else "startup_untrained"
+
     def _current_actor_step(self) -> int | None:
         return None
 
@@ -523,6 +526,7 @@ class SACLearner:
             "exact_final_eval_mode_summary_paths": exact_final_eval["mode_summary_paths"],
             "exact_final_eval_mode_run_dirs": exact_final_eval["mode_run_dirs"],
             "exact_final_eval_complete": exact_final_eval["complete"],
+            "exact_final_eval_missing_reasons": exact_final_eval["missing_reasons"],
             "eval_in_flight": self.eval_in_flight,
             "pending_eval": self.pending_eval,
             "started_eval": self.started_eval,
@@ -588,19 +592,34 @@ class SACLearner:
         if entry is None:
             return {
                 "complete": False,
+                "missing_reasons": ("final_eval_entry_missing",),
                 "summary": None,
                 "summary_path": None,
                 "mode_summaries": None,
                 "mode_summary_paths": None,
                 "mode_run_dirs": None,
             }
+        expected_modes = set(str(mode) for mode in self.config.eval.modes)
+        mode_summaries = dict(entry.get("mode_summaries") or {})
+        mode_summary_paths = dict(entry.get("mode_summary_paths") or {})
+        mode_run_dirs = dict(entry.get("mode_run_dirs") or {})
+        missing_reasons: list[str] = []
+        for mode_name in sorted(expected_modes):
+            if mode_name not in mode_summaries:
+                missing_reasons.append(f"{mode_name}_summary_missing")
+            summary_path = mode_summary_paths.get(mode_name)
+            if summary_path in (None, ""):
+                missing_reasons.append(f"{mode_name}_summary_path_missing")
+            elif not Path(str(summary_path)).exists():
+                missing_reasons.append(f"{mode_name}_summary_missing_on_disk")
         return {
-            "complete": True,
+            "complete": not missing_reasons,
+            "missing_reasons": tuple(missing_reasons),
             "summary": dict(entry.get("summary") or {}),
             "summary_path": entry.get("summary_path"),
-            "mode_summaries": dict(entry.get("mode_summaries") or {}) or None,
-            "mode_summary_paths": dict(entry.get("mode_summary_paths") or {}) or None,
-            "mode_run_dirs": dict(entry.get("mode_run_dirs") or {}) or None,
+            "mode_summaries": mode_summaries or None,
+            "mode_summary_paths": mode_summary_paths or None,
+            "mode_run_dirs": mode_run_dirs or None,
         }
 
     def _run_standalone_final_checkpoint_eval(self, checkpoint_path: Path, *, timeout_seconds: float) -> bool:
@@ -673,7 +692,7 @@ class SACLearner:
                 **checkpoint_metadata,
             },
         )
-        return True
+        return bool(self._exact_final_eval_payload()["complete"])
 
     def load_checkpoint(self, checkpoint_path: str | Path) -> None:
         payload = torch.load(Path(checkpoint_path).resolve(), map_location=self.device)
@@ -1270,7 +1289,7 @@ class SACLearner:
         temp_path = actor_state_path.with_suffix(".tmp")
         self._actor_sync_version = next_version
         ready_for_control = self._ready_for_control()
-        control_ready_reason = "trained_updates_available" if ready_for_control else "startup_untrained"
+        control_ready_reason = self._control_ready_reason(ready_for_control)
         broadcast_start = time.perf_counter()
         torch.save(self.agent.actor_state_dict_cpu(), temp_path)
         _replace_with_retries(temp_path, actor_state_path)
@@ -1553,10 +1572,13 @@ class SACLearner:
             else:
                 self.final_eval_status["scheduled"] = True
                 try:
-                    self.final_eval_status["completed"] = self._run_standalone_final_checkpoint_eval(
+                    standalone_completed = self._run_standalone_final_checkpoint_eval(
                         final_checkpoint,
                         timeout_seconds=max(30.0, timeout_seconds),
                     )
+                    self.final_eval_status["completed"] = standalone_completed
+                    if not standalone_completed:
+                        self.final_eval_status["skipped_reason"] = "exact_final_eval_incomplete"
                 except Exception as exc:  # noqa: BLE001
                     self.final_eval_status["completed"] = False
                     self.final_eval_status["skipped_reason"] = "standalone_final_eval_failed"
@@ -1588,6 +1610,7 @@ class REDQLearner(SACLearner):
         max_wall_clock_minutes: float | None = None,
         ghost_bundle: str | Path | None = None,
         offline_init_checkpoint: str | Path | None = None,
+        offline_init_mode: str = "weights_only",
     ) -> None:
         self.config_path = Path(config_path).resolve()
         self.config: TM20AIConfig = load_tm20ai_config(self.config_path)
@@ -1619,6 +1642,9 @@ class REDQLearner(SACLearner):
         self.offline_init_checkpoint_path = (
             None if offline_init_checkpoint is None else str(Path(offline_init_checkpoint).resolve())
         )
+        self.offline_init_mode = str(offline_init_mode).strip().lower()
+        if self.offline_init_mode not in {"weights_only", "weights_and_optimizers"}:
+            raise ValueError(f"Unsupported offline_init_mode: {offline_init_mode!r}")
         self.offline_pretrain_metadata: dict[str, Any] | None = None
         self.offline_dataset_metadata: dict[str, Any] | None = None
         self.offline_transition_count = 0
@@ -1692,7 +1718,7 @@ class REDQLearner(SACLearner):
             self.replay_seeded = self.replay_seeded or self.offline_transition_count > 0
             self.writer.add_scalar("train/ghost_seeded_transitions", float(self.offline_transition_count), step=0)
         if self.offline_init_checkpoint_path is not None:
-            self.load_offline_initialization(self.offline_init_checkpoint_path)
+            self.load_offline_initialization(self.offline_init_checkpoint_path, init_mode=self.offline_init_mode)
 
         self.command_queue = None
         self.output_queue = None
@@ -1766,11 +1792,15 @@ class REDQLearner(SACLearner):
         self._reschedule_from_counters()
         self._record_progress_diagnostics()
 
-    def load_offline_initialization(self, checkpoint_path: str | Path) -> None:
+    def load_offline_initialization(self, checkpoint_path: str | Path, *, init_mode: str = "weights_only") -> None:
         payload = torch.load(Path(checkpoint_path).resolve(), map_location=self.device)
-        self.agent.load_state_dict(payload)
+        normalized_mode = str(init_mode).strip().lower()
+        if normalized_mode not in {"weights_only", "weights_and_optimizers"}:
+            raise ValueError(f"Unsupported offline initialization mode: {init_mode!r}")
+        self.agent.load_state_dict(payload, load_optimizers=normalized_mode == "weights_and_optimizers")
         self.offline_pretrain_metadata = {
             "checkpoint_path": str(Path(checkpoint_path).resolve()),
+            "offline_init_mode": normalized_mode,
             "checkpoint_kind": payload.get("checkpoint_kind"),
             "offline_pretrain_strategy": payload.get("offline_pretrain_strategy"),
             "ghost_bundle_manifest_path": payload.get("ghost_bundle_manifest_path"),
@@ -1786,10 +1816,18 @@ class REDQLearner(SACLearner):
             "resolved_selected_ghost_rank": payload.get("resolved_selected_ghost_rank"),
             "resolved_selected_ghost_name": payload.get("resolved_selected_ghost_name"),
             "author_fallback_used": payload.get("author_fallback_used"),
+            "offline_dataset_metadata": payload.get("offline_dataset_metadata"),
         }
 
     def _ready_for_control(self) -> bool:
-        return self.actor_step > 0
+        return self.actor_step > 0 or self.offline_pretrain_metadata is not None
+
+    def _control_ready_reason(self, ready_for_control: bool) -> str:
+        if self.actor_step > 0:
+            return "trained_updates_available"
+        if ready_for_control and self.offline_pretrain_metadata is not None:
+            return "offline_pretrained_weights_available"
+        return "startup_untrained"
 
     def _current_actor_step(self) -> int | None:
         return self.actor_step
@@ -1864,6 +1902,7 @@ class REDQLearner(SACLearner):
                 "replay_seeded": self.replay_seeded,
                 **self._ghost_bundle_provenance_payload(),
                 "offline_init_checkpoint_path": self.offline_init_checkpoint_path,
+                "offline_init_mode": getattr(self, "offline_init_mode", None),
                 "offline_pretrain_metadata": self.offline_pretrain_metadata,
                 "offline_dataset_metadata": self.offline_dataset_metadata,
                 "offline_transition_count": self.offline_transition_count,

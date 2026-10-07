@@ -129,3 +129,35 @@ def test_balanced_replay_buffer_samples_offline_and_online_sources() -> None:
     assert int((sample.source == 0).sum().item()) == 1
     assert balanced.last_sample_profile["offline_batch_size"] == 3
     assert balanced.last_sample_profile["online_batch_size"] == 1
+
+
+def test_balanced_replay_fraction_decays_on_phase5_schedule() -> None:
+    balanced = BalancedReplayBuffer(
+        online=ReplayBuffer(
+            mode="full",
+            capacity=8,
+            observation_shape=(4, 64, 64),
+            telemetry_dim=TELEMETRY_DIM,
+        ),
+        offline=ReplayBuffer(
+            mode="full",
+            capacity=8,
+            observation_shape=(4, 64, 64),
+            telemetry_dim=TELEMETRY_DIM,
+        ),
+        offline_initial_fraction=0.75,
+        offline_final_fraction=0.10,
+        decay_env_steps=50_000,
+    )
+
+    balanced.set_progress(env_step=0)
+    assert balanced.offline_fraction() == 0.75
+
+    balanced.set_progress(env_step=25_000)
+    assert np.isclose(balanced.offline_fraction(), 0.425)
+
+    balanced.set_progress(env_step=50_000)
+    assert np.isclose(balanced.offline_fraction(), 0.10)
+
+    balanced.set_progress(env_step=75_000)
+    assert np.isclose(balanced.offline_fraction(), 0.10)

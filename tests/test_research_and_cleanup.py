@@ -3,9 +3,18 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from collections import namedtuple
 from pathlib import Path
 
-from tm20ai.train.artifact_retention import cleanup_artifact_root, select_keeper_run_dirs
+import pytest
+
+from tm20ai.train.artifact_retention import (
+    cleanup_artifact_root,
+    directory_size_bytes,
+    enforce_storage_preflight,
+    select_keeper_run_dirs,
+    storage_preflight_report,
+)
 from tm20ai.train.research import append_results_entry, write_algorithm_comparison_report
 
 
@@ -181,6 +190,62 @@ def test_artifact_cleanup_keeps_best_and_latest_runs(tmp_path: Path) -> None:
     assert (artifact_root / "eval" / "best_redq_final_exact_step_00001000_deterministic").exists()
     assert (artifact_root / "eval" / "best_redq_final_exact_step_00001000_stochastic").exists()
     assert not (artifact_root / "eval" / "stale_redq_final_exact_step_00001000_deterministic").exists()
+
+
+def test_artifact_cleanup_dry_run_reports_removed_bytes_without_deleting(tmp_path: Path) -> None:
+    artifact_root = tmp_path / "artifacts"
+    best_redq = _write_train_run(
+        artifact_root,
+        algorithm="redq",
+        run_name="best_redq",
+        best_progress=2000.0,
+        run_end_timestamp="2026-04-19T02:00:00+00:00",
+    )
+    stale_redq = _write_train_run(
+        artifact_root,
+        algorithm="redq",
+        run_name="stale_redq",
+        best_progress=500.0,
+        run_end_timestamp="2026-04-19T01:00:00+00:00",
+    )
+
+    cleanup_result = cleanup_artifact_root(artifact_root, keep_run_dirs=[best_redq], dry_run=True)
+
+    assert stale_redq.exists()
+    assert str(stale_redq.resolve()) in cleanup_result.removed_paths
+    assert cleanup_result.removed_bytes > 0
+    assert cleanup_result.artifact_root_bytes_before == cleanup_result.artifact_root_bytes_after
+    assert directory_size_bytes(artifact_root) == cleanup_result.artifact_root_bytes_before
+
+
+def test_artifact_cleanup_refuses_protected_project_paths() -> None:
+    with pytest.raises(ValueError, match="protected path"):
+        cleanup_artifact_root(ROOT / "results", keep_run_dirs=[], dry_run=True)
+
+
+def test_storage_preflight_reports_low_free_space_and_quota(tmp_path: Path) -> None:
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir()
+    (artifact_root / "large.bin").write_bytes(b"x" * 2048)
+    DiskUsage = namedtuple("DiskUsage", "total used free")
+
+    report = storage_preflight_report(
+        artifact_root,
+        min_free_gb=1.0,
+        max_artifact_gb=0.0000001,
+        disk_usage_fn=lambda _path: DiskUsage(total=10_000, used=9_000, free=512),
+    )
+
+    assert report.ok is False
+    assert any(reason.startswith("free_space_below_minimum") for reason in report.reasons)
+    assert any(reason.startswith("artifact_root_above_quota") for reason in report.reasons)
+    with pytest.raises(RuntimeError, match="Storage preflight failed"):
+        enforce_storage_preflight(
+            artifact_root,
+            min_free_gb=1.0,
+            max_artifact_gb=0.0000001,
+            disk_usage_fn=lambda _path: DiskUsage(total=10_000, used=9_000, free=512),
+        )
 
 
 def test_run_algorithm_ladder_dry_run(tmp_path: Path) -> None:

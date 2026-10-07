@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import torch
 
 from tm20ai.train.features import TELEMETRY_DIM
 from tm20ai.train.learner import REDQLearner
@@ -181,6 +182,43 @@ def test_redq_ghost_reward_manifest_does_not_allocate_balanced_replay_when_disab
     )
 
     assert isinstance(learner.replay, ReplayBuffer)
+
+
+def test_redq_offline_initialization_broadcasts_actor_ready_for_control(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    artifacts_root = tmp_path / "artifacts"
+    write_redq_train_config(config_path, artifacts_root)
+    source = REDQLearner(
+        config_path=config_path,
+        run_name="unit_redq_offline_source",
+        eval_episodes_override=0,
+    )
+    checkpoint_path = tmp_path / "ghost_redq_pretrain.pt"
+    torch.save(
+        {
+            **source.agent.state_dict(),
+            "checkpoint_kind": "ghost_redq_offline_pretrain",
+            "offline_pretrain_strategy": "bc_redq_awac",
+            "ghost_bundle_manifest_path": "C:/ghosts/rank11.json",
+            "offline_transition_count": 123,
+        },
+        checkpoint_path,
+    )
+
+    learner = REDQLearner(
+        config_path=config_path,
+        run_name="unit_redq_offline_ready",
+        eval_episodes_override=0,
+        offline_init_checkpoint=checkpoint_path,
+        offline_init_mode="weights_only",
+    )
+    learner.broadcast_actor(force=True)
+
+    desired_actor = json.loads(learner.paths.desired_actor_path.read_text(encoding="utf-8"))
+    assert desired_actor["ready_for_control"] is True
+    assert desired_actor["control_ready_reason"] == "offline_pretrained_weights_available"
+    assert desired_actor["actor_step"] == 0
+    assert learner.offline_pretrain_metadata["offline_init_mode"] == "weights_only"
 
 
 def test_redq_learner_marks_actor_ready_only_after_actor_update(tmp_path) -> None:
@@ -578,6 +616,12 @@ def test_redq_finalize_run_preserves_inflight_eval_result(tmp_path) -> None:
     learner.pending_eval = {"run_name": "eval_pending", "env_step": 4}
 
     def fake_final_eval_runner(**_kwargs):
+        deterministic_summary_path = tmp_path / "eval" / "deterministic" / "summary.json"
+        stochastic_summary_path = tmp_path / "eval" / "stochastic" / "summary.json"
+        deterministic_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        stochastic_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        deterministic_summary_path.write_text("{}", encoding="utf-8")
+        stochastic_summary_path.write_text("{}", encoding="utf-8")
         return {
             "deterministic": {
                 "summary": {
@@ -587,7 +631,7 @@ def test_redq_finalize_run_preserves_inflight_eval_result(tmp_path) -> None:
                     "final_checkpoint_eval": True,
                     "eval_mode": "deterministic",
                 },
-                "summary_path": str(tmp_path / "eval" / "deterministic" / "summary.json"),
+                "summary_path": str(deterministic_summary_path),
                 "run_dir": str(tmp_path / "eval" / "deterministic"),
             },
             "stochastic": {
@@ -598,7 +642,7 @@ def test_redq_finalize_run_preserves_inflight_eval_result(tmp_path) -> None:
                     "final_checkpoint_eval": True,
                     "eval_mode": "stochastic",
                 },
-                "summary_path": str(tmp_path / "eval" / "stochastic" / "summary.json"),
+                "summary_path": str(stochastic_summary_path),
                 "run_dir": str(tmp_path / "eval" / "stochastic"),
             },
         }
@@ -706,12 +750,18 @@ def test_redq_finalize_run_uses_live_worker_for_final_exact_eval(tmp_path) -> No
             if command.get("type") != "run_eval":
                 continue
             assert command.get("final_checkpoint_eval") is True
+            deterministic_summary_path = tmp_path / "eval" / "deterministic" / "summary.json"
+            stochastic_summary_path = tmp_path / "eval" / "stochastic" / "summary.json"
+            deterministic_summary_path.parent.mkdir(parents=True, exist_ok=True)
+            stochastic_summary_path.parent.mkdir(parents=True, exist_ok=True)
+            deterministic_summary_path.write_text("{}", encoding="utf-8")
+            stochastic_summary_path.write_text("{}", encoding="utf-8")
             eval_result_queue.put(
                 {
                     "checkpoint_step": 4,
                     "env_step": 4,
                     "learner_step": 8,
-                    "summary_path": str(tmp_path / "eval" / "deterministic" / "summary.json"),
+                    "summary_path": str(deterministic_summary_path),
                     "summary": {
                         "env_step": 4,
                         "mean_final_progress_index": 33.0,
@@ -734,8 +784,8 @@ def test_redq_finalize_run_uses_live_worker_for_final_exact_eval(tmp_path) -> No
                             },
                         },
                         "eval_mode_summary_paths": {
-                            "deterministic": str(tmp_path / "eval" / "deterministic" / "summary.json"),
-                            "stochastic": str(tmp_path / "eval" / "stochastic" / "summary.json"),
+                            "deterministic": str(deterministic_summary_path),
+                            "stochastic": str(stochastic_summary_path),
                         },
                         "eval_mode_run_dirs": {
                             "deterministic": str(tmp_path / "eval" / "deterministic"),
@@ -759,4 +809,42 @@ def test_redq_finalize_run_uses_live_worker_for_final_exact_eval(tmp_path) -> No
     assert learner.latest_eval_summary["mean_final_progress_index"] == 33.0
     assert learner._exact_final_eval_entry() is not None
     assert fake_worker.terminated is False
+    learner.close()
+
+
+def test_redq_exact_final_eval_payload_requires_mode_summary_files(tmp_path) -> None:
+    config_path = tmp_path / "config.yaml"
+    artifacts_root = tmp_path / "artifacts"
+    write_redq_train_config(config_path, artifacts_root, q_updates_per_policy_update=1)
+
+    learner = REDQLearner(config_path=config_path, run_name="unit_redq_missing_final_eval_files")
+    learner.eval_history.append(
+        {
+            "final_checkpoint_eval": True,
+            "summary": {
+                "env_step": 4,
+                "mean_final_progress_index": 10.0,
+                "final_checkpoint_eval": True,
+            },
+            "summary_path": str(tmp_path / "eval" / "deterministic" / "summary.json"),
+            "mode_summaries": {
+                "deterministic": {"mean_final_progress_index": 10.0},
+                "stochastic": {"mean_final_progress_index": 12.0},
+            },
+            "mode_summary_paths": {
+                "deterministic": str(tmp_path / "eval" / "deterministic" / "summary.json"),
+                "stochastic": str(tmp_path / "eval" / "stochastic" / "summary.json"),
+            },
+            "mode_run_dirs": {
+                "deterministic": str(tmp_path / "eval" / "deterministic"),
+                "stochastic": str(tmp_path / "eval" / "stochastic"),
+            },
+        }
+    )
+
+    payload = learner._exact_final_eval_payload()
+
+    assert payload["complete"] is False
+    assert "deterministic_summary_missing_on_disk" in payload["missing_reasons"]
+    assert "stochastic_summary_missing_on_disk" in payload["missing_reasons"]
     learner.close()

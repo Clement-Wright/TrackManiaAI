@@ -17,7 +17,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from tm20ai.data.parquet_writer import ensure_directory, read_json, write_json  # noqa: E402
-from tm20ai.train.artifact_retention import cleanup_artifact_root  # noqa: E402
+from tm20ai.train.artifact_retention import cleanup_artifact_root, enforce_storage_preflight, format_bytes  # noqa: E402
 from tm20ai.train.campaign import (  # noqa: E402
     analyze_policy_mode_sweep_results,
     best_scheduled_deterministic_checkpoint,
@@ -113,8 +113,10 @@ REPAIRABLE_FINAL_EVAL_REASONS = {
     "exact_final_eval_complete_false",
     "incomplete_final_eval_true",
     "final_eval_state=exact_final_eval_missing",
+    "deterministic_summary_missing",
     "deterministic_summary_path_missing",
     "deterministic_summary_missing_on_disk",
+    "stochastic_summary_missing",
     "stochastic_summary_path_missing",
     "stochastic_summary_missing_on_disk",
 }
@@ -187,7 +189,19 @@ def _preflight(*, base_config_path: Path, bundle_manifest_path: Path, dry_run: b
         raise RuntimeError(
             f"rank11_100_bundle manifest must contain 90 selected trajectories, found {bundle_manifest.get('selected_count')}."
         )
+    if str(bundle_manifest.get("selected_training_family") or "") != "rank11_100_bundle":
+        raise RuntimeError(
+            "rank11_100_bundle manifest must declare selected_training_family='rank11_100_bundle', "
+            f"found {bundle_manifest.get('selected_training_family')!r}."
+        )
+    if bool(bundle_manifest.get("mixed_fallback", False)):
+        raise RuntimeError("rank11_100_bundle manifest must not be a mixed fallback bundle.")
     config = yaml.safe_load(base_config_path.read_text(encoding="utf-8")) or {}
+    ghosts_config = config.get("ghosts") or {}
+    if str(ghosts_config.get("ambiguous_family_policy", "")).strip().lower() != "hard_stop":
+        raise RuntimeError(
+            f"Base config {base_config_path} must set ghosts.ambiguous_family_policy='hard_stop'."
+        )
     configured_bundle_raw = Path(str(((config.get("ghosts") or {}).get("bundle_manifest") or "")))
     configured_bundle = (
         configured_bundle_raw.resolve()
@@ -200,10 +214,76 @@ def _preflight(*, base_config_path: Path, bundle_manifest_path: Path, dry_run: b
         )
 
 
+def _preflight_block_c_offline_bundle(*, bundle_manifest_path: Path, dry_run: bool) -> None:
+    manifest = read_json(bundle_manifest_path)
+    reasons: list[str] = []
+    if str(manifest.get("selected_training_family") or "") != "rank11_100_bundle":
+        reasons.append(f"selected_training_family={manifest.get('selected_training_family')!r}")
+    if int(manifest.get("selected_count", 0) or 0) != 90:
+        reasons.append(f"selected_count={manifest.get('selected_count')!r}")
+    if bool(manifest.get("mixed_fallback", False)):
+        reasons.append("mixed_fallback=true")
+    if not bool(manifest.get("action_channel_valid", False)):
+        reasons.append("action_channel_valid=false")
+    if int(manifest.get("offline_transition_count", 0) or 0) <= 0:
+        reasons.append(f"offline_transition_count={manifest.get('offline_transition_count')!r}")
+    npz_raw = manifest.get("offline_transition_npz_path")
+    if npz_raw in (None, ""):
+        reasons.append("offline_transition_npz_path_missing")
+    else:
+        npz_path = Path(str(npz_raw))
+        if not npz_path.is_absolute():
+            npz_path = bundle_manifest_path.parent / npz_path
+        if not npz_path.exists():
+            reasons.append(f"offline_transition_npz_path_missing_on_disk={npz_path}")
+    if reasons:
+        message = (
+            "Block C offline warm-start requires validated rank11_100 offline transition sidecars; "
+            + ", ".join(reasons)
+        )
+        if dry_run:
+            log("block_c_offline_preflight_warning=" + message)
+            return
+        raise RuntimeError(message)
+
+
+def _resolve_existing_winner_run(
+    *,
+    winner_run_dir: str | Path | None,
+    winner_config: str | Path | None,
+    base_config_path: Path,
+) -> tuple[Path, Path]:
+    if winner_run_dir in (None, ""):
+        raise RuntimeError("Blocks B/C require --winner-run-dir when Block A is not selected.")
+    resolved_run_dir = Path(str(winner_run_dir)).resolve()
+    validation = validate_campaign_run(resolved_run_dir)
+    if not validation.valid:
+        raise RuntimeError(
+            f"Existing winner run is not valid for Phase 4/5: {', '.join(validation.reasons)}"
+        )
+    if winner_config in (None, ""):
+        resolved_config = base_config_path
+    else:
+        resolved_config = Path(str(winner_config)).resolve()
+    if not resolved_config.exists():
+        raise RuntimeError(f"Existing winner config does not exist: {resolved_config}")
+    return resolved_run_dir, resolved_config
+
+
 def _gate_environment(*, config_path: Path, dry_run: bool) -> None:
     _remove_stale_live_lock()
     _run_command(
         [sys.executable, str(ROOT / "scripts" / "force_window_size.py"), "--config", str(config_path)],
+        dry_run=dry_run,
+    )
+    _run_command(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "check_environment.py"),
+            "--config",
+            str(config_path),
+            "--require-reward",
+        ],
         dry_run=dry_run,
     )
 
@@ -234,16 +314,6 @@ def _repair_missing_exact_final_eval(
             str(run_dir),
             "--config",
             str(config_path),
-        ],
-        dry_run=dry_run,
-    )
-    _run_command(
-        [
-            sys.executable,
-            str(ROOT / "scripts" / "check_environment.py"),
-            "--config",
-            str(config_path),
-            "--require-reward",
         ],
         dry_run=dry_run,
     )
@@ -401,6 +471,19 @@ def main() -> int:
     parser.add_argument("--results-file", default="rank11_100_validation_campaign.md")
     parser.add_argument("--artifact-root", default=None)
     parser.add_argument("--blocks", default="A,B,C")
+    parser.add_argument("--min-free-gb", type=float, default=150.0)
+    parser.add_argument("--max-artifact-gb", type=float, default=150.0)
+    parser.add_argument(
+        "--winner-run-dir",
+        default=None,
+        help="Validated Block A winner run directory to use when running only Block B/C.",
+    )
+    parser.add_argument(
+        "--winner-config",
+        default=None,
+        help="Config for --winner-run-dir; defaults to --config.",
+    )
+    parser.add_argument("--disable-storage-preflight", action="store_true")
     parser.add_argument("--keep-artifacts", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -415,6 +498,19 @@ def main() -> int:
     artifact_root = ensure_directory(
         Path(args.artifact_root).resolve() if args.artifact_root is not None else session_root / "artifacts"
     )
+    if not args.disable_storage_preflight:
+        max_artifact_gb = None if args.max_artifact_gb <= 0.0 else args.max_artifact_gb
+        storage_report = enforce_storage_preflight(
+            artifact_root,
+            min_free_gb=args.min_free_gb,
+            max_artifact_gb=max_artifact_gb,
+        )
+        log(
+            "storage_preflight_ok "
+            f"free={format_bytes(storage_report.free_bytes)} "
+            f"artifact_root_size={format_bytes(storage_report.artifact_root_bytes)} "
+            f"artifact_quota={format_bytes(storage_report.max_artifact_bytes)}"
+        )
     status_path = session_root / "status.json"
 
     blocks = {part.strip().upper() for part in args.blocks.split(",") if part.strip()}
@@ -445,6 +541,21 @@ def main() -> int:
     winner_report: dict[str, Any] | None = None
     winner_config_path: Path | None = None
     block_a_runner_up_dirs: list[Path] = []
+    if "A" not in blocks:
+        winner_run_dir, winner_config_path = _resolve_existing_winner_run(
+            winner_run_dir=args.winner_run_dir,
+            winner_config=args.winner_config,
+            base_config_path=base_config_path,
+        )
+        _write_status(
+            status_path,
+            {
+                "state": "using_existing_block_a_winner",
+                "winner_run_dir": str(winner_run_dir),
+                "winner_config_path": str(winner_config_path),
+            },
+        )
+
     if "A" in blocks:
         for variant in REWARD_VARIANTS:
             run_name = f"{args.session_name}_{variant['label']}"
@@ -560,6 +671,12 @@ def main() -> int:
                     str(checkpoint_path),
                     "--run-name",
                     run_name,
+                    "--required-ghost-bundle",
+                    str(bundle_manifest_path),
+                    "--required-training-family",
+                    "rank11_100_bundle",
+                    "--required-selected-count",
+                    "90",
                 ],
                 dry_run=args.dry_run,
             )
@@ -596,6 +713,32 @@ def main() -> int:
             None,
         )
         write_json(reports_dir / "block_b_extraction_summary.json", {"rows": extraction_rows, "deployment_choice": deployment_choice})
+        final_row = next((row for row in extraction_rows if row.get("checkpoint_label") == "final"), None)
+        final_mode = None if final_row is None or deployment_choice is None else dict(final_row.get("per_mode") or {}).get(
+            deployment_choice
+        )
+        if final_row is not None and final_mode is not None:
+            write_json(
+                reports_dir / "selected_deployment_policy.json",
+                {
+                    "checkpoint_label": "final",
+                    "checkpoint_path": final_row.get("checkpoint_path"),
+                    "policy_mode_sweep_path": final_row.get("policy_mode_sweep_path"),
+                    "deployment_choice": deployment_choice,
+                    "deployment_choice_meets_target": final_row.get("deployment_choice_meets_target"),
+                    "dcs_target": final_row.get("dcs_target"),
+                    "determinism_conversion_score": final_mode.get("determinism_conversion_score"),
+                    "mean_final_progress_index": final_mode.get("mean_final_progress_index"),
+                    "mean_progress_fraction_of_reference": final_mode.get("mean_progress_fraction_of_reference"),
+                    "extraction_mode": final_mode.get("extraction_mode", deployment_choice),
+                    "temperature": final_mode.get("temperature", 1.0),
+                    "best_of_k": final_mode.get("best_of_k", 1),
+                    "deployment_eligible": final_mode.get("deployment_eligible", True),
+                    "diagnostic_only": final_mode.get("diagnostic_only", False),
+                    "eval_checkpoint_path": final_mode.get("eval_checkpoint_path"),
+                    "eval_checkpoint_sha256": final_mode.get("eval_checkpoint_sha256"),
+                },
+            )
         (reports_dir / "block_b_extraction_summary.md").write_text(
             _render_block_b_summary(analysis_rows=extraction_rows, deployment_choice=deployment_choice),
             encoding="utf-8",
@@ -611,6 +754,7 @@ def main() -> int:
 
     offline_rows: list[dict[str, Any]] = []
     if "C" in blocks:
+        _preflight_block_c_offline_bundle(bundle_manifest_path=bundle_manifest_path, dry_run=args.dry_run)
         offline_pretrain_dir = ensure_directory(session_root / "pretrain")
         offline_checkpoint_path = offline_pretrain_dir / "ghost_redq_pretrain.pt"
         if not args.dry_run and not offline_checkpoint_path.exists():
@@ -626,6 +770,12 @@ def main() -> int:
                     str(offline_pretrain_dir),
                     "--run-name",
                     f"{args.session_name}_offline_pretrain",
+                    "--strategy",
+                    "bc_redq_awac",
+                    "--required-training-family",
+                    "rank11_100_bundle",
+                    "--required-selected-count",
+                    "90",
                 ],
                 dry_run=False,
             )
@@ -642,6 +792,12 @@ def main() -> int:
                     str(offline_pretrain_dir),
                     "--run-name",
                     f"{args.session_name}_offline_pretrain",
+                    "--strategy",
+                    "bc_redq_awac",
+                    "--required-training-family",
+                    "rank11_100_bundle",
+                    "--required-selected-count",
+                    "90",
                 ],
                 dry_run=True,
             )
@@ -678,7 +834,7 @@ def main() -> int:
             dry_run=args.dry_run,
             status_path=status_path,
             leg_label="C1_weight_init_only",
-            extra_args=["--offline-init-checkpoint", str(offline_checkpoint_path)],
+            extra_args=["--offline-init-checkpoint", str(offline_checkpoint_path), "--offline-init-mode", "weights_only"],
         )
         c2_run_dir = _run_training_leg(
             run_name=f"{args.session_name}_C2_full_offline_to_online",
@@ -688,7 +844,14 @@ def main() -> int:
             dry_run=args.dry_run,
             status_path=status_path,
             leg_label="C2_full_offline_to_online",
-            extra_args=["--offline-init-checkpoint", str(offline_checkpoint_path), "--ghost-bundle", str(bundle_manifest_path)],
+            extra_args=[
+                "--offline-init-checkpoint",
+                str(offline_checkpoint_path),
+                "--offline-init-mode",
+                "weights_only",
+                "--ghost-bundle",
+                str(bundle_manifest_path),
+            ],
         )
 
         if not args.dry_run:

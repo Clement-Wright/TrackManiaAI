@@ -111,6 +111,9 @@ class SummaryProgressMonitor:
 
 
 def main() -> int:
+    from tm20ai.config import load_tm20ai_config
+    from tm20ai.data.parquet_writer import resolve_artifact_root
+    from tm20ai.train.artifact_retention import enforce_storage_preflight, format_bytes
     from tm20ai.train.learner import SACLearner
     from tm20ai.train.reporting import write_training_report
     from tm20ai.train.worker import worker_entry
@@ -131,6 +134,9 @@ def main() -> int:
     parser.add_argument("--progress-log-interval", type=int, default=1000)
     parser.add_argument("--max-env-steps", type=int, default=None)
     parser.add_argument("--max-wall-clock-minutes", type=float, default=None)
+    parser.add_argument("--min-free-gb", type=float, default=150.0)
+    parser.add_argument("--max-artifact-gb", type=float, default=150.0)
+    parser.add_argument("--disable-storage-preflight", action="store_true")
     args = parser.parse_args()
     if args.resume is not None and (
         args.init_actor is not None
@@ -139,6 +145,26 @@ def main() -> int:
         or args.demo_root is not None
     ):
         parser.error("--resume cannot be combined with BC warm-start or demo-root/replay-seeding options.")
+
+    long_run = (
+        args.max_wall_clock_minutes is None
+        or args.max_wall_clock_minutes >= 30.0
+        or (args.max_env_steps is not None and args.max_env_steps >= 10000)
+    )
+    if long_run and not args.disable_storage_preflight:
+        loaded_config = load_tm20ai_config(args.config)
+        max_artifact_gb = None if args.max_artifact_gb <= 0.0 else args.max_artifact_gb
+        storage_report = enforce_storage_preflight(
+            resolve_artifact_root(loaded_config),
+            min_free_gb=args.min_free_gb,
+            max_artifact_gb=max_artifact_gb,
+        )
+        log(
+            "storage_preflight_ok "
+            f"free={format_bytes(storage_report.free_bytes)} "
+            f"artifact_root_size={format_bytes(storage_report.artifact_root_bytes)} "
+            f"artifact_quota={format_bytes(storage_report.max_artifact_bytes)}"
+        )
 
     multiprocessing.freeze_support()
     run_name = args.run_name

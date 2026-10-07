@@ -32,6 +32,14 @@ def main() -> int:
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--gradient-steps", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument(
+        "--strategy",
+        choices=("bc", "redq_critic", "awac", "iql", "cql", "bc_redq_awac"),
+        default=None,
+        help="Override offline_pretrain.strategy for this checkpoint.",
+    )
+    parser.add_argument("--required-training-family", default=None)
+    parser.add_argument("--required-selected-count", type=int, default=None)
     args = parser.parse_args()
 
     config = load_tm20ai_config(args.config)
@@ -55,8 +63,12 @@ def main() -> int:
         replay,
         args.ghost_bundle,
         require_actions=config.offline_pretrain.require_actions,
+        required_training_family=args.required_training_family,
+        required_selected_count=args.required_selected_count,
     )
     pretrain_config = config.offline_pretrain
+    if args.strategy is not None:
+        pretrain_config.strategy = str(args.strategy)
     if args.gradient_steps is not None:
         pretrain_config.gradient_steps = int(args.gradient_steps)
     if args.batch_size is not None:
@@ -83,6 +95,18 @@ def main() -> int:
         "offline_pretrain_strategy": pretrain_config.strategy,
         "offline_dataset_hash": seed_metadata.get("offline_dataset_hash"),
         "offline_transition_count": seed_metadata.get("seeded", 0),
+        "canonical_reference_source": seed_metadata.get("canonical_reference_source"),
+        "canonical_reference_path": seed_metadata.get("canonical_reference_path"),
+        "strategy_classification_status": seed_metadata.get("strategy_classification_status"),
+        "selected_training_family": seed_metadata.get("selected_training_family"),
+        "selected_count": seed_metadata.get("selected_count"),
+        "mixed_fallback": seed_metadata.get("mixed_fallback"),
+        "bundle_resolution_mode": seed_metadata.get("bundle_resolution_mode"),
+        "selected_ghost_selector": seed_metadata.get("selected_ghost_selector"),
+        "resolved_selected_ghost_rank": seed_metadata.get("resolved_selected_ghost_rank"),
+        "resolved_selected_ghost_name": seed_metadata.get("resolved_selected_ghost_name"),
+        "author_fallback_used": seed_metadata.get("author_fallback_used"),
+        "offline_dataset_metadata": seed_metadata,
         "pretrain_result": asdict(result),
         "env_step": 0,
         "learner_step": int(result.critic_updates),

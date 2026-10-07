@@ -134,6 +134,25 @@ def test_write_training_report_handles_interrupted_run(tmp_path) -> None:
                 "shortcut_or_exploit": 10,
                 "unclassified": 3,
             },
+            "offline_init_checkpoint_path": "C:/pretrain/ghost_redq_pretrain.pt",
+            "offline_pretrain_metadata": {
+                "checkpoint_kind": "ghost_redq_offline_pretrain",
+                "offline_pretrain_strategy": "bc_redq_awac",
+                "ghost_bundle_manifest_path": "C:/ghosts/test-map/ghost_bundle_manifest.json",
+            },
+            "offline_dataset_metadata": {
+                "seeded": 123,
+                "offline_dataset_hash": "abc123",
+                "selected_training_family": "intended_route",
+            },
+            "offline_transition_count": 123,
+            "online_replay_size": 5200,
+            "offline_replay_size": 123,
+            "balanced_replay_profile": {
+                "offline_fraction": 0.75,
+                "offline_batch_size": 192,
+                "online_batch_size": 64,
+            },
         },
     )
     video_path = run_dir / "rollout.mp4"
@@ -152,12 +171,22 @@ def test_write_training_report_handles_interrupted_run(tmp_path) -> None:
     assert report["selected_training_family"] == "intended_route"
     assert report["mixed_fallback"] is False
     assert report["bundle_resolution_mode"] == "intended_route"
+    assert report["offline_init_checkpoint_path"] == "C:/pretrain/ghost_redq_pretrain.pt"
+    assert report["offline_pretrain_metadata"]["offline_pretrain_strategy"] == "bc_redq_awac"
+    assert report["offline_dataset_metadata"]["seeded"] == 123
+    assert report["offline_transition_count"] == 123
+    assert report["online_replay_size"] == 5200
+    assert report["offline_replay_size"] == 123
+    assert report["balanced_replay_profile"]["offline_fraction"] == 0.75
     assert report["exact_final_eval_complete"] is False
     assert report["incomplete_final_eval"] is True
     markdown = report_paths.markdown_path.read_text(encoding="utf-8")
     assert "Strategy selection: status=classified family=intended_route mixed_fallback=False" in markdown
     assert "Bundle resolution: mode=intended_route selector=None resolved_rank=None resolved_name=None author_fallback_used=False" in markdown
     assert "Canonical reference: source=author_reference_manifest path=C:/ghosts/test-map/author_reference.json" in markdown
+    assert "Offline init checkpoint: C:/pretrain/ghost_redq_pretrain.pt" in markdown
+    assert "offline_pretrain_strategy=bc_redq_awac" in markdown
+    assert "offline_replay_size=123" in markdown
     assert "Exact final eval complete: False" in markdown
 
 

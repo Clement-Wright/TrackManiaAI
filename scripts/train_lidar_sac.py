@@ -17,6 +17,9 @@ def log(message: str) -> None:
 
 
 def main() -> int:
+    from tm20ai.config import load_tm20ai_config
+    from tm20ai.data.parquet_writer import resolve_artifact_root
+    from tm20ai.train.artifact_retention import enforce_storage_preflight, format_bytes
     from tm20ai.train.learner import SACLearner
     from tm20ai.train.worker import worker_entry
 
@@ -25,7 +28,26 @@ def main() -> int:
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--resume", default=None)
     parser.add_argument("--max-env-steps", type=int, default=None)
+    parser.add_argument("--min-free-gb", type=float, default=150.0)
+    parser.add_argument("--max-artifact-gb", type=float, default=150.0)
+    parser.add_argument("--disable-storage-preflight", action="store_true")
     args = parser.parse_args()
+
+    long_run = args.max_env_steps is None or args.max_env_steps >= 10000
+    if long_run and not args.disable_storage_preflight:
+        loaded_config = load_tm20ai_config(args.config)
+        max_artifact_gb = None if args.max_artifact_gb <= 0.0 else args.max_artifact_gb
+        storage_report = enforce_storage_preflight(
+            resolve_artifact_root(loaded_config),
+            min_free_gb=args.min_free_gb,
+            max_artifact_gb=max_artifact_gb,
+        )
+        log(
+            "storage_preflight_ok "
+            f"free={format_bytes(storage_report.free_bytes)} "
+            f"artifact_root_size={format_bytes(storage_report.artifact_root_bytes)} "
+            f"artifact_quota={format_bytes(storage_report.max_artifact_bytes)}"
+        )
 
     multiprocessing.freeze_support()
     run_name = args.run_name

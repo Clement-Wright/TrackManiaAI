@@ -116,8 +116,6 @@ def main() -> int:
         print(f"[build-ghost-dataset] selected_override_manifest={result.selected_override_manifest_path}", flush=True)
     if result.author_fallback_manifest_path is not None:
         print(f"[build-ghost-dataset] author_fallback_manifest={result.author_fallback_manifest_path}", flush=True)
-    if result.mixed_fallback_manifest_path is not None:
-        print(f"[build-ghost-dataset] mixed_fallback_manifest={result.mixed_fallback_manifest_path}", flush=True)
     print(
         "[build-ghost-dataset] "
         f"selected={result.selected_count}/{result.trajectory_count} "

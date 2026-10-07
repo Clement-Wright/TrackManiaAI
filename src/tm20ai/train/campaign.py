@@ -76,6 +76,7 @@ def validate_campaign_run(run_dir: str | Path) -> RunValidation:
     incomplete_final_eval = bool(summary.get("incomplete_final_eval", True))
     final_eval_state = None if summary.get("final_eval_state") is None else str(summary.get("final_eval_state"))
     mode_paths = dict(summary.get("exact_final_eval_mode_summary_paths") or {})
+    mode_summaries = dict(summary.get("exact_final_eval_mode_summaries") or {})
     deterministic_summary_path = None if mode_paths.get("deterministic") is None else str(mode_paths.get("deterministic"))
     stochastic_summary_path = None if mode_paths.get("stochastic") is None else str(mode_paths.get("stochastic"))
 
@@ -86,6 +87,10 @@ def validate_campaign_run(run_dir: str | Path) -> RunValidation:
         reasons.append("incomplete_final_eval_true")
     if final_eval_state != "complete":
         reasons.append(f"final_eval_state={final_eval_state}")
+    if "deterministic" not in mode_summaries:
+        reasons.append("deterministic_summary_missing")
+    if "stochastic" not in mode_summaries:
+        reasons.append("stochastic_summary_missing")
     if deterministic_summary_path is None:
         reasons.append("deterministic_summary_path_missing")
     elif not Path(deterministic_summary_path).exists():
@@ -202,6 +207,8 @@ def analyze_policy_mode_sweep_results(
         dcs = determinism_conversion_score(progress, stochastic_reference_progress)
         enriched = dict(payload)
         enriched["determinism_conversion_score"] = dcs
+        enriched.setdefault("diagnostic_only", mode_name.startswith("best_of_"))
+        enriched.setdefault("deployment_eligible", mode_name in {"deterministic_mean", "clipped_mean"})
         per_mode[mode_name] = enriched
 
     deployment_choice = "deterministic_mean"

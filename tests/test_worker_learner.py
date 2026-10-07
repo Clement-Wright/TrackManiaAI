@@ -592,30 +592,39 @@ def test_learner_checkpoint_roundtrip_and_command_scheduling(tmp_path) -> None:
     restored.load_checkpoint(checkpoint_path)
     assert restored.env_step == learner.env_step
     assert restored.learner_step == learner.learner_step
-    learner._standalone_eval_runner = lambda **_kwargs: {
-        "deterministic": {
-            "summary": {
-                "env_step": learner.env_step,
-                "mean_final_progress_index": 14.0,
-                "completion_rate": 0.0,
-                "final_checkpoint_eval": True,
-                "eval_mode": "deterministic",
+    def fake_standalone_eval_runner(**_kwargs):
+        deterministic_summary_path = tmp_path / "eval" / "deterministic" / "summary.json"
+        stochastic_summary_path = tmp_path / "eval" / "stochastic" / "summary.json"
+        deterministic_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        stochastic_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        deterministic_summary_path.write_text("{}", encoding="utf-8")
+        stochastic_summary_path.write_text("{}", encoding="utf-8")
+        return {
+            "deterministic": {
+                "summary": {
+                    "env_step": learner.env_step,
+                    "mean_final_progress_index": 14.0,
+                    "completion_rate": 0.0,
+                    "final_checkpoint_eval": True,
+                    "eval_mode": "deterministic",
+                },
+                "summary_path": str(deterministic_summary_path),
+                "run_dir": str(tmp_path / "eval" / "deterministic"),
             },
-            "summary_path": str(tmp_path / "eval" / "deterministic" / "summary.json"),
-            "run_dir": str(tmp_path / "eval" / "deterministic"),
-        },
-        "stochastic": {
-            "summary": {
-                "env_step": learner.env_step,
-                "mean_final_progress_index": 18.0,
-                "completion_rate": 0.0,
-                "final_checkpoint_eval": True,
-                "eval_mode": "stochastic",
+            "stochastic": {
+                "summary": {
+                    "env_step": learner.env_step,
+                    "mean_final_progress_index": 18.0,
+                    "completion_rate": 0.0,
+                    "final_checkpoint_eval": True,
+                    "eval_mode": "stochastic",
+                },
+                "summary_path": str(stochastic_summary_path),
+                "run_dir": str(tmp_path / "eval" / "stochastic"),
             },
-            "summary_path": str(tmp_path / "eval" / "stochastic" / "summary.json"),
-            "run_dir": str(tmp_path / "eval" / "stochastic"),
-        },
-    }
+        }
+
+    learner._standalone_eval_runner = fake_standalone_eval_runner
     worker_done_event.set()
     final_checkpoint = learner.finalize_run(timeout_seconds=0.1)
     assert final_checkpoint.exists()

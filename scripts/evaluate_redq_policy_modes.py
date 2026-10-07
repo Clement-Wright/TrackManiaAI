@@ -14,7 +14,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from tm20ai.data.parquet_writer import build_run_artifact_paths, sha256_file, write_json
+from tm20ai.data.parquet_writer import build_run_artifact_paths, read_json, sha256_file, write_json
 from tm20ai.config import load_tm20ai_config
 from tm20ai.train.campaign import analyze_policy_mode_sweep_results
 from tm20ai.train.evaluator import resolve_policy_adapter, run_policy_episodes
@@ -24,7 +24,16 @@ def _mode_specs(extraction_modes: list[str], temperatures: list[float], best_of_
     specs: list[dict[str, object]] = []
     for mode in extraction_modes:
         if mode in {"deterministic_mean", "clipped_mean"}:
-            specs.append({"name": mode, "extraction_mode": mode, "temperature": 1.0, "best_of_k": 1})
+            specs.append(
+                {
+                    "name": mode,
+                    "extraction_mode": mode,
+                    "temperature": 1.0,
+                    "best_of_k": 1,
+                    "deployment_eligible": True,
+                    "diagnostic_only": False,
+                }
+            )
         elif mode == "stochastic":
             for temperature in temperatures:
                 specs.append(
@@ -33,6 +42,8 @@ def _mode_specs(extraction_modes: list[str], temperatures: list[float], best_of_
                         "extraction_mode": "stochastic",
                         "temperature": float(temperature),
                         "best_of_k": 1,
+                        "deployment_eligible": False,
+                        "diagnostic_only": False,
                     }
                 )
         elif mode == "sample_best_of_k":
@@ -43,11 +54,77 @@ def _mode_specs(extraction_modes: list[str], temperatures: list[float], best_of_
                         "extraction_mode": "sample_best_of_k",
                         "temperature": float(temperature),
                         "best_of_k": int(best_of_k),
+                        "deployment_eligible": False,
+                        "diagnostic_only": True,
                     }
                 )
         else:
             raise ValueError(f"Unsupported extraction mode: {mode}")
     return specs
+
+
+def _resolve_config_ghost_bundle(config, config_path: str | Path) -> Path:  # noqa: ANN001
+    configured_bundle = config.ghosts.bundle_manifest
+    if configured_bundle in (None, ""):
+        raise RuntimeError(f"Config {config_path} does not define ghosts.bundle_manifest.")
+    configured_path = Path(str(configured_bundle))
+    if not configured_path.is_absolute():
+        configured_path = ROOT / configured_path
+    return configured_path.resolve()
+
+
+def _preflight_policy_sweep(
+    *,
+    config,  # noqa: ANN001
+    config_path: str | Path,
+    required_ghost_bundle: str | Path | None,
+    required_training_family: str | None,
+    required_selected_count: int | None,
+    forbid_mixed_fallback: bool,
+) -> dict[str, object] | None:
+    if (
+        required_ghost_bundle is None
+        and required_training_family is None
+        and required_selected_count is None
+        and not forbid_mixed_fallback
+    ):
+        return None
+
+    configured_bundle = _resolve_config_ghost_bundle(config, config_path)
+    if required_ghost_bundle is not None:
+        required_bundle = Path(required_ghost_bundle)
+        if not required_bundle.is_absolute():
+            required_bundle = ROOT / required_bundle
+        required_bundle = required_bundle.resolve()
+        if configured_bundle != required_bundle:
+            raise RuntimeError(
+                f"Policy-mode sweep config points at {configured_bundle}; required ghost bundle is {required_bundle}."
+            )
+    if not configured_bundle.exists():
+        raise RuntimeError(f"Policy-mode sweep ghost bundle does not exist: {configured_bundle}")
+
+    manifest = read_json(configured_bundle)
+    if forbid_mixed_fallback and bool(manifest.get("mixed_fallback", False)):
+        raise RuntimeError(f"Policy-mode sweep refuses mixed fallback bundle: {configured_bundle}")
+    if required_training_family is not None and str(manifest.get("selected_training_family") or "") != str(
+        required_training_family
+    ):
+        raise RuntimeError(
+            f"Policy-mode sweep bundle selected_training_family={manifest.get('selected_training_family')!r}; "
+            f"expected {required_training_family!r}."
+        )
+    if required_selected_count is not None and int(manifest.get("selected_count", 0) or 0) != int(required_selected_count):
+        raise RuntimeError(
+            f"Policy-mode sweep bundle selected_count={manifest.get('selected_count')!r}; "
+            f"expected {int(required_selected_count)}."
+        )
+    return {
+        "ghost_bundle_manifest_path": str(configured_bundle),
+        "selected_training_family": manifest.get("selected_training_family"),
+        "selected_count": manifest.get("selected_count"),
+        "mixed_fallback": bool(manifest.get("mixed_fallback", False)),
+        "bundle_resolution_mode": manifest.get("bundle_resolution_mode"),
+    }
 
 
 def main() -> int:
@@ -61,9 +138,26 @@ def main() -> int:
     parser.add_argument("--temperatures", default=None, help="Comma-separated stochastic temperatures.")
     parser.add_argument("--best-of-k", type=int, default=None)
     parser.add_argument("--record-video", action="store_true")
+    parser.add_argument("--required-ghost-bundle", default=None)
+    parser.add_argument("--required-training-family", default=None)
+    parser.add_argument("--required-selected-count", type=int, default=None)
+    parser.add_argument("--allow-mixed-fallback", action="store_true")
     args = parser.parse_args()
 
     config = load_tm20ai_config(args.config)
+    target_preflight = _preflight_policy_sweep(
+        config=config,
+        config_path=args.config,
+        required_ghost_bundle=args.required_ghost_bundle,
+        required_training_family=args.required_training_family,
+        required_selected_count=args.required_selected_count,
+        forbid_mixed_fallback=not args.allow_mixed_fallback
+        and (
+            args.required_ghost_bundle is not None
+            or args.required_training_family is not None
+            or args.required_selected_count is not None
+        ),
+    )
     checkpoint_path = Path(args.checkpoint).resolve()
     payload = torch.load(checkpoint_path, map_location="cpu")
     extraction_modes = (
@@ -86,6 +180,8 @@ def main() -> int:
         "eval_checkpoint_learner_step": int(payload.get("learner_step", 0)),
         "eval_checkpoint_actor_step": int(payload["actor_step"]) if payload.get("actor_step") is not None else None,
     }
+    if target_preflight is not None:
+        checkpoint_summary_extra.update(target_preflight)
     results: dict[str, dict] = {}
     for spec in _mode_specs(extraction_modes, temperatures, best_of_k):
         name = str(spec["name"])
@@ -117,6 +213,16 @@ def main() -> int:
         )
         results[name] = {
             "summary_path": str(result["summary_path"]),
+            "eval_checkpoint_path": str(checkpoint_path),
+            "eval_checkpoint_sha256": checkpoint_summary_extra["eval_checkpoint_sha256"],
+            "eval_checkpoint_env_step": checkpoint_summary_extra["eval_checkpoint_env_step"],
+            "eval_checkpoint_learner_step": checkpoint_summary_extra["eval_checkpoint_learner_step"],
+            "eval_checkpoint_actor_step": checkpoint_summary_extra["eval_checkpoint_actor_step"],
+            "extraction_mode": str(spec["extraction_mode"]),
+            "temperature": float(spec["temperature"]),
+            "best_of_k": int(spec["best_of_k"]),
+            "deployment_eligible": bool(spec["deployment_eligible"]),
+            "diagnostic_only": bool(spec["diagnostic_only"]),
             "mean_final_progress_index": result["summary"].get("mean_final_progress_index"),
             "median_final_progress_index": result["summary"].get("median_final_progress_index"),
             "mean_final_progress_meters": result["summary"].get("mean_final_progress_meters"),
@@ -139,6 +245,7 @@ def main() -> int:
             "base_run_name": base_run_name,
             "results": results,
             "analysis": analysis,
+            "target_preflight": target_preflight,
         },
     )
     print(f"[evaluate-redq-policy-modes] combined={combined_path}", flush=True)

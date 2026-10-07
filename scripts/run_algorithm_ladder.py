@@ -62,7 +62,7 @@ def _latest_final_checkpoint(run_dir: Path) -> Path:
 
 def main() -> int:
     from tm20ai.data.parquet_writer import ensure_directory, timestamp_tag
-    from tm20ai.train.artifact_retention import cleanup_artifact_root
+    from tm20ai.train.artifact_retention import cleanup_artifact_root, enforce_storage_preflight, format_bytes
     from tm20ai.train.research import append_results_entry, write_algorithm_comparison_report
 
     parser = argparse.ArgumentParser(description="Run a fixed-wall-clock REDQ/DroQ/CrossQ comparison ladder.")
@@ -73,6 +73,9 @@ def main() -> int:
     parser.add_argument("--artifact-root", default=str(ROOT / ".tmp" / "artifacts" / "ladder"))
     parser.add_argument("--comparison-output-dir", default=None)
     parser.add_argument("--session-name", default="algorithm_ladder")
+    parser.add_argument("--min-free-gb", type=float, default=150.0)
+    parser.add_argument("--max-artifact-gb", type=float, default=150.0)
+    parser.add_argument("--disable-storage-preflight", action="store_true")
     parser.add_argument("--keep-artifacts", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--backfill-checkpoint", default=None)
@@ -85,6 +88,19 @@ def main() -> int:
         parser.error(f"Unsupported algorithms: {invalid!r}")
 
     artifact_root = ensure_directory(Path(args.artifact_root).resolve())
+    if not args.disable_storage_preflight:
+        max_artifact_gb = None if args.max_artifact_gb <= 0.0 else args.max_artifact_gb
+        storage_report = enforce_storage_preflight(
+            artifact_root,
+            min_free_gb=args.min_free_gb,
+            max_artifact_gb=max_artifact_gb,
+        )
+        log(
+            "storage_preflight_ok "
+            f"free={format_bytes(storage_report.free_bytes)} "
+            f"artifact_root_size={format_bytes(storage_report.artifact_root_bytes)} "
+            f"artifact_quota={format_bytes(storage_report.max_artifact_bytes)}"
+        )
     session_tag = f"{args.session_name}_{timestamp_tag()}"
     config_override_dir = ensure_directory(ROOT / ".tmp" / "ladder_configs" / session_tag)
     results_root = ensure_directory(ROOT / "results")

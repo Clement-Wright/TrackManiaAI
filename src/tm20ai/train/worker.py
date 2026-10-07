@@ -24,6 +24,13 @@ from .features import TELEMETRY_DIM, TelemetryFeatureBuilder
 from .protocol import EvalResult
 
 
+def _eval_extraction_mode_for_mode(mode_name: str, eval_config) -> str:  # noqa: ANN001
+    normalized = str(mode_name).strip().lower()
+    if normalized == "deterministic":
+        return str(getattr(eval_config, "deployment_extraction_mode", "deterministic_mean"))
+    return "stochastic"
+
+
 @dataclass(slots=True)
 class TrainingEpisodeState:
     episode_index: int = 0
@@ -1289,7 +1296,7 @@ class SACWorker:
         mode_results: dict[str, dict[str, Any]] = {}
         for mode_name in modes:
             deterministic = mode_name == "deterministic"
-            extraction_mode = "deterministic_mean" if deterministic else "stochastic"
+            extraction_mode = _eval_extraction_mode_for_mode(mode_name, self.config.eval)
             policy = resolve_policy_adapter(
                 policy="checkpoint",
                 checkpoint=checkpoint_path,

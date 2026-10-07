@@ -299,6 +299,13 @@ def build_training_report(
         "current_actor_staleness": summary.get("current_actor_staleness"),
         "episode_count": int(summary.get("episode_count", 0)),
         "replay_size": int(summary.get("replay_size", 0)),
+        "online_replay_size": int(summary.get("online_replay_size", summary.get("replay_size", 0)) or 0),
+        "offline_replay_size": int(summary.get("offline_replay_size", 0) or 0),
+        "balanced_replay_profile": dict(summary.get("balanced_replay_profile") or {}),
+        "offline_init_checkpoint_path": summary.get("offline_init_checkpoint_path"),
+        "offline_pretrain_metadata": dict(summary.get("offline_pretrain_metadata") or {}),
+        "offline_dataset_metadata": dict(summary.get("offline_dataset_metadata") or {}),
+        "offline_transition_count": int(summary.get("offline_transition_count", 0) or 0),
         "latest_checkpoint_path": summary.get("latest_checkpoint_path"),
         "latest_eval_summary_path": summary.get("latest_eval_summary_path"),
         "latest_eval_mode_summaries": dict(summary.get("latest_eval_mode_summaries") or {}),
@@ -471,6 +478,8 @@ def _render_run_report_markdown(report: dict[str, Any]) -> str:
         f"- Cumulative UTD: {report.get('cumulative_utd')}",
         f"- Current actor staleness: {report.get('current_actor_staleness')}",
         f"- Replay size: {report['replay_size']}",
+        f"- Online replay size: {report.get('online_replay_size')}",
+        f"- Offline replay size: {report.get('offline_replay_size')}",
         f"- Training duration (s): {report.get('training_duration_seconds')}",
         f"- Exact final eval complete: {report.get('exact_final_eval_complete')}",
         f"- Final eval state: {report.get('final_eval_state')}",
@@ -491,6 +500,17 @@ def _render_run_report_markdown(report: dict[str, Any]) -> str:
         lines.append(f"- Selected override bundle: {report.get('selected_override_manifest_path')}")
     if report.get("author_fallback_manifest_path") is not None:
         lines.append(f"- Author fallback bundle: {report.get('author_fallback_manifest_path')}")
+    if report.get("offline_init_checkpoint_path") is not None:
+        offline_pretrain_metadata = dict(report.get("offline_pretrain_metadata") or {})
+        balanced_replay_profile = dict(report.get("balanced_replay_profile") or {})
+        lines.append(f"- Offline init checkpoint: {report.get('offline_init_checkpoint_path')}")
+        lines.append(
+            f"- Offline provenance: offline_pretrain_strategy={offline_pretrain_metadata.get('offline_pretrain_strategy')} "
+            f"offline_transition_count={report.get('offline_transition_count')} "
+            f"offline_replay_size={report.get('offline_replay_size')} "
+            f"online_replay_size={report.get('online_replay_size')} "
+            f"balanced_replay_profile={balanced_replay_profile}"
+        )
     exact_final_eval = dict(report.get("exact_final_eval") or {})
     if exact_final_eval:
         lines.extend(

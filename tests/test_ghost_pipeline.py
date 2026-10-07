@@ -579,6 +579,53 @@ def test_ghost_action_missing_fails_closed_for_offline_seed(tmp_path: Path) -> N
         seed_replay_from_ghost_bundle(replay, result.manifest_path, require_actions=True)
 
 
+def test_ghost_offline_seed_can_require_selected_family_and_count(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "ghost_bundle_manifest.json"
+    write_json(
+        manifest_path,
+        {
+            "schema_version": "ghost_bundle_v1",
+            "selected_training_family": "rank11_100_bundle",
+            "selected_count": 90,
+            "mixed_fallback": False,
+            "action_channel_valid": False,
+            "offline_transition_npz_path": None,
+        },
+    )
+    replay = ReplayBuffer(mode="full", capacity=8, observation_shape=(4, 64, 64), telemetry_dim=TELEMETRY_DIM)
+
+    seeded = seed_replay_from_ghost_bundle(
+        replay,
+        manifest_path,
+        require_actions=False,
+        required_training_family="rank11_100_bundle",
+        required_selected_count=90,
+    )
+    assert seeded["seeded"] == 0
+    assert seeded["selected_training_family"] == "rank11_100_bundle"
+
+    with pytest.raises(RuntimeError, match="selected_training_family"):
+        seed_replay_from_ghost_bundle(
+            replay,
+            manifest_path,
+            require_actions=False,
+            required_training_family="intended_route",
+        )
+    with pytest.raises(RuntimeError, match="selected_count"):
+        seed_replay_from_ghost_bundle(
+            replay,
+            manifest_path,
+            require_actions=False,
+            required_selected_count=15,
+        )
+
+    payload = read_json(manifest_path)
+    payload["mixed_fallback"] = True
+    write_json(manifest_path, payload)
+    with pytest.raises(RuntimeError, match="mixed fallback"):
+        seed_replay_from_ghost_bundle(replay, manifest_path, require_actions=False)
+
+
 class _FakeNadeoClient(NadeoServicesClient):
     def __init__(self, output: Path) -> None:
         super().__init__(

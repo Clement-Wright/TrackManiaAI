@@ -108,6 +108,7 @@ def test_tm20ai_config_parses_redq_block_and_normalizes_algorithm() -> None:
                 "extraction_modes": ["deterministic_mean", "stochastic", "clipped_mean"],
                 "temperature_sweep": [0.5, 1.0],
                 "best_of_k": 4,
+                "deployment_extraction_mode": "clipped_mean",
             },
             "redq": {
                 "n_critics": 12,
@@ -128,7 +129,7 @@ def test_tm20ai_config_parses_redq_block_and_normalizes_algorithm() -> None:
                     }
                 },
                 "training_family": "intended_route",
-                "ambiguous_family_policy": "mixed_with_warning",
+                "ambiguous_family_policy": "hard_stop",
                 "anchor_count": 24,
                 "anchor_radius_m": 12.0,
                 "canonical_divergence_radius_m": 25.0,
@@ -191,6 +192,7 @@ def test_tm20ai_config_parses_redq_block_and_normalizes_algorithm() -> None:
     assert config.eval.extraction_modes == ("deterministic_mean", "stochastic", "clipped_mean")
     assert config.eval.temperature_sweep == (0.5, 1.0)
     assert config.eval.best_of_k == 4
+    assert config.eval.deployment_extraction_mode == "clipped_mean"
     assert config.redq.n_critics == 12
     assert config.redq.m_subset == 3
     assert config.redq.q_updates_per_policy_update == 5
@@ -202,7 +204,7 @@ def test_tm20ai_config_parses_redq_block_and_normalizes_algorithm() -> None:
     assert config.ghosts.selected_ghost_overrides["map-uid"].ghost_name_contains == "chosen_ghost.Ghost"
     assert config.ghosts.selected_ghost_overrides["map-uid"].rank == 11
     assert config.ghosts.training_family == "intended_route"
-    assert config.ghosts.ambiguous_family_policy == "mixed_with_warning"
+    assert config.ghosts.ambiguous_family_policy == "hard_stop"
     assert config.ghosts.anchor_count == 24
     assert config.ghosts.anchor_radius_m == 12.0
     assert config.ghosts.canonical_divergence_radius_m == 25.0
@@ -235,6 +237,7 @@ def test_tm20ai_config_parses_redq_block_and_normalizes_algorithm() -> None:
         ({"eval": {"extraction_modes": ["mystery"]}}, "eval.extraction_modes"),
         ({"eval": {"temperature_sweep": [0.0]}}, "eval.temperature_sweep"),
         ({"eval": {"best_of_k": 0}}, "eval.best_of_k"),
+        ({"eval": {"deployment_extraction_mode": "sample_best_of_k"}}, "eval.deployment_extraction_mode"),
         ({"reward": {"mode": "ghost_magic"}}, "reward.mode"),
         ({"reward": {"corridor_mode": "legacy"}}, "reward.corridor_mode"),
         ({"reward": {"corridor_soft_margin_m": -1.0}}, "reward.corridor_soft_margin_m"),
@@ -256,6 +259,7 @@ def test_tm20ai_config_parses_redq_block_and_normalizes_algorithm() -> None:
         ({"ghosts": {"unavailable_intended_policy": "mixed"}}, "ghosts.unavailable_intended_policy"),
         ({"ghosts": {"training_family": "exploit"}}, "ghosts.training_family"),
         ({"ghosts": {"ambiguous_family_policy": "block"}}, "ghosts.ambiguous_family_policy"),
+        ({"ghosts": {"ambiguous_family_policy": "mixed_with_warning"}}, "ghosts.ambiguous_family_policy"),
         ({"ghosts": {"selected_ghost_overrides": {"map": {}}}}, "ghosts.selected_ghost_overrides"),
         (
             {"ghosts": {"selected_ghost_overrides": {"map": {"ghost_name_contains": ""}}}},
@@ -332,13 +336,24 @@ def test_top100_redq_config_uses_map_calibrated_corridor() -> None:
     assert config.reward.corridor_recovery_distance_delta_m == 1.0
     assert config.metrics.metric_version == "ghost_bundle_progress_v2_fixed_spacing"
     assert config.ghosts.unavailable_intended_policy == "selected_ghost_then_author_then_error"
+    assert config.ghosts.ambiguous_family_policy == "hard_stop"
 
 
 def test_tmrl_test_top100_redq_config_uses_rank11_100_bundle_manifest() -> None:
     config = load_tm20ai_config(ROOT / "configs" / "full_redq_top100_tmrl_test.yaml")
 
     assert config.train.algorithm == "redq"
+    assert config.reward.corridor_soft_margin_m == 25.0
+    assert config.reward.corridor_hard_margin_m == 90.0
+    assert config.reward.corridor_patience_steps == 60
+    assert config.reward.corridor_penalty_scale == 0.03
+    assert config.reward.corridor_penalty_max == 8.0
+    assert config.reward.corridor_recovery_bonus == 1.0
+    assert config.reward.corridor_min_recovery_progress_m == 0.10
+    assert config.reward.corridor_min_recovery_speed_kmh == 3.0
+    assert config.reward.corridor_recovery_distance_delta_m == 0.25
     assert config.ghosts.unavailable_intended_policy == "selected_ghost_then_author_then_error"
+    assert config.ghosts.ambiguous_family_policy == "hard_stop"
     assert config.ghosts.bundle_manifest == "data/ghosts/oqIJ5rQDRrNwLPTh9H2p_W4tLof/ghost_bundle_rank_011_100.json"
     assert config.ghosts.selected_ghost_overrides == {}
 
@@ -444,6 +459,40 @@ def test_redq_checkpoint_roundtrip_and_evaluator_compatibility(tmp_path) -> None
         },
     )
     assert action.shape == (ACTION_DIM,)
+
+
+def test_redq_load_state_dict_can_skip_offline_optimizer_state() -> None:
+    source = REDQSACAgent(
+        sac_config=SACConfig(),
+        redq_config=REDQConfig(n_critics=4, m_subset=2, q_updates_per_policy_update=2),
+        observation_mode="full",
+        device=torch.device("cpu"),
+        observation_shape=(4, 64, 64),
+        telemetry_dim=TELEMETRY_DIM,
+    )
+    replay = _build_full_replay(rng_seed=29)
+    batch = replay.sample(4, device=torch.device("cpu"))
+    source.update_critics(batch)
+    source.update_critics(batch)
+    assert source.maybe_update_actor_and_alpha(batch) is not None
+    payload = source.state_dict()
+    assert payload["actor_optimizer_state_dict"]["state"]
+
+    target = REDQSACAgent(
+        sac_config=SACConfig(),
+        redq_config=REDQConfig(n_critics=4, m_subset=2, q_updates_per_policy_update=2),
+        observation_mode="full",
+        device=torch.device("cpu"),
+        observation_shape=(4, 64, 64),
+        telemetry_dim=TELEMETRY_DIM,
+    )
+    assert target.actor_optimizer.state_dict()["state"] == {}
+
+    target.load_state_dict(payload, load_optimizers=False)
+
+    for key, value in payload["actor_state_dict"].items():
+        assert torch.equal(target.actor.state_dict()[key], value)
+    assert target.actor_optimizer.state_dict()["state"] == {}
 
 
 def test_redq_agent_load_bc_warm_start_actor_only(tmp_path) -> None:

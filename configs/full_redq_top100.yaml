@@ -146,7 +146,7 @@ ghosts:
   unavailable_intended_policy: "selected_ghost_then_author_then_error"
   selected_ghost_overrides: {}
   training_family: "intended_route"
-  ambiguous_family_policy: "mixed_with_warning"
+  ambiguous_family_policy: "hard_stop"
   anchor_count: 24
   anchor_radius_m: 12.0
   canonical_divergence_radius_m: 25.0

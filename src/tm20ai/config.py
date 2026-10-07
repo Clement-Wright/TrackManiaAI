@@ -326,6 +326,7 @@ class EvalConfig:
     extraction_modes: tuple[str, ...] = ("deterministic_mean", "stochastic")
     temperature_sweep: tuple[float, ...] = (1.0,)
     best_of_k: int = 1
+    deployment_extraction_mode: str = "deterministic_mean"
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "EvalConfig":
@@ -366,6 +367,12 @@ class EvalConfig:
         best_of_k = int(payload.get("best_of_k", 1))
         if best_of_k < 1:
             raise ConfigError(f"eval.best_of_k must be >= 1, got {best_of_k}.")
+        deployment_extraction_mode = str(payload.get("deployment_extraction_mode", "deterministic_mean")).strip().lower()
+        if deployment_extraction_mode not in {"deterministic_mean", "clipped_mean"}:
+            raise ConfigError(
+                "eval.deployment_extraction_mode must be deterministic_mean or clipped_mean, "
+                f"got {deployment_extraction_mode!r}."
+            )
         return cls(
             episodes=int(payload.get("episodes", 20)),
             seed_base=int(payload.get("seed_base", 12345)),
@@ -381,6 +388,7 @@ class EvalConfig:
             extraction_modes=extraction_modes,
             temperature_sweep=temperature_sweep,
             best_of_k=best_of_k,
+            deployment_extraction_mode=deployment_extraction_mode,
         )
 
 
@@ -628,7 +636,7 @@ class GhostConfig:
     unavailable_intended_policy: str = "selected_ghost_then_author_then_error"
     selected_ghost_overrides: dict[str, "GhostSelectionOverrideConfig"] = field(default_factory=dict)
     training_family: str = "intended_route"
-    ambiguous_family_policy: str = "mixed_with_warning"
+    ambiguous_family_policy: str = "hard_stop"
     anchor_count: int = 24
     anchor_radius_m: float = 12.0
     canonical_divergence_radius_m: float = 25.0
@@ -674,10 +682,10 @@ class GhostConfig:
                 "ghosts.training_family must be 'intended_route', "
                 f"got {training_family!r}."
             )
-        ambiguous_family_policy = str(payload.get("ambiguous_family_policy", "mixed_with_warning")).strip().lower()
-        if ambiguous_family_policy not in {"mixed_with_warning"}:
+        ambiguous_family_policy = str(payload.get("ambiguous_family_policy", "hard_stop")).strip().lower()
+        if ambiguous_family_policy not in {"hard_stop"}:
             raise ConfigError(
-                "ghosts.ambiguous_family_policy must be 'mixed_with_warning', "
+                "ghosts.ambiguous_family_policy must be 'hard_stop', "
                 f"got {ambiguous_family_policy!r}."
             )
         anchor_count = int(payload.get("anchor_count", 24))

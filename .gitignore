@@ -5,6 +5,8 @@ __pycache__/
 .tmp/
 .pytest_tmp*/
 .ruff_cache/
+.gitnexus/
+.serena/
 build/
 dist/
 artifacts/

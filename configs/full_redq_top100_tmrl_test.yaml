@@ -70,15 +70,15 @@ reward:
   corridor_mode: map_calibrated
   corridor_soft_margin_m: 25.0
   corridor_hard_margin_m: 90.0
-  corridor_patience_steps: 20
+  corridor_patience_steps: 60
   corridor_penalty_scale: 0.03
   corridor_penalty_max: 8.0
   corridor_recovery_bonus: 1.0
   corridor_catastrophic_distance_m: 350.0
   line_switch_max_distance_m: 140.0
-  corridor_min_recovery_progress_m: 0.5
-  corridor_min_recovery_speed_kmh: 8.0
-  corridor_recovery_distance_delta_m: 1.0
+  corridor_min_recovery_progress_m: 0.10
+  corridor_min_recovery_speed_kmh: 3.0
+  corridor_recovery_distance_delta_m: 0.25
 
 eval:
   episodes: 20
@@ -146,7 +146,7 @@ ghosts:
   unavailable_intended_policy: "selected_ghost_then_author_then_error"
   selected_ghost_overrides: {}
   training_family: "intended_route"
-  ambiguous_family_policy: "mixed_with_warning"
+  ambiguous_family_policy: "hard_stop"
   anchor_count: 24
   anchor_radius_m: 12.0
   canonical_divergence_radius_m: 25.0

@@ -145,6 +145,7 @@ def main() -> int:
     summary["exact_final_eval_mode_summary_paths"] = mode_summary_paths
     summary["exact_final_eval_mode_run_dirs"] = mode_run_dirs
     summary["exact_final_eval_complete"] = True
+    summary["exact_final_eval_missing_reasons"] = []
     summary["incomplete_final_eval"] = False
     summary["final_eval_state"] = "complete"
     final_eval_status = dict(summary.get("final_eval_status") or {})

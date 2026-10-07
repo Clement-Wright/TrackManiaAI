@@ -6,6 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 from tm20ai.train.campaign import (
@@ -194,12 +195,103 @@ def test_analyze_policy_mode_sweep_results_prefers_clipped_when_it_clearly_wins(
                 "mean_final_progress_index": 100.0,
                 "mean_progress_fraction_of_reference": 0.75,
             },
+            "best_of_8_temp_1": {
+                "mean_final_progress_index": 200.0,
+                "mean_progress_fraction_of_reference": 0.95,
+            },
         }
     )
     assert analysis["deployment_choice"] == "clipped_mean"
     assert analysis["per_mode"]["deterministic_mean"]["determinism_conversion_score"] == 0.8
     assert analysis["per_mode"]["clipped_mean"]["determinism_conversion_score"] == 0.9
     assert analysis["deployment_choice_meets_target"] is True
+    assert analysis["per_mode"]["clipped_mean"]["deployment_eligible"] is True
+    assert analysis["per_mode"]["stochastic_temp_1"]["deployment_eligible"] is False
+    assert analysis["per_mode"]["best_of_8_temp_1"]["diagnostic_only"] is True
+    assert analysis["per_mode"]["best_of_8_temp_1"]["deployment_eligible"] is False
+
+
+def test_policy_mode_specs_mark_best_of_k_diagnostic_only() -> None:
+    module = importlib.util.spec_from_file_location("evaluate_redq_policy_modes", ROOT / "scripts" / "evaluate_redq_policy_modes.py")
+    assert module is not None and module.loader is not None
+    evaluate_module = importlib.util.module_from_spec(module)
+    module.loader.exec_module(evaluate_module)
+
+    specs = evaluate_module._mode_specs(
+        ["deterministic_mean", "clipped_mean", "stochastic", "sample_best_of_k"],
+        [0.5, 1.0],
+        8,
+    )
+
+    by_name = {spec["name"]: spec for spec in specs}
+    assert by_name["deterministic_mean"]["deployment_eligible"] is True
+    assert by_name["clipped_mean"]["deployment_eligible"] is True
+    assert by_name["stochastic_temp_1"]["deployment_eligible"] is False
+    assert by_name["best_of_8_temp_1"]["diagnostic_only"] is True
+    assert by_name["best_of_8_temp_1"]["deployment_eligible"] is False
+
+
+def test_policy_mode_preflight_requires_rank11_bundle(tmp_path: Path) -> None:
+    module = importlib.util.spec_from_file_location("evaluate_redq_policy_modes", ROOT / "scripts" / "evaluate_redq_policy_modes.py")
+    assert module is not None and module.loader is not None
+    evaluate_module = importlib.util.module_from_spec(module)
+    module.loader.exec_module(evaluate_module)
+
+    bundle_path = tmp_path / "ghost_bundle_rank_011_100.json"
+    bundle_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "ghost_bundle_v1",
+                "selected_training_family": "rank11_100_bundle",
+                "selected_count": 90,
+                "mixed_fallback": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "train": {"algorithm": "redq"},
+                "ghosts": {
+                    "bundle_manifest": str(bundle_path),
+                    "ambiguous_family_policy": "hard_stop",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = evaluate_module.load_tm20ai_config(config_path)
+
+    evaluate_module._preflight_policy_sweep(
+        config=config,
+        config_path=config_path,
+        required_ghost_bundle=str(bundle_path),
+        required_training_family="rank11_100_bundle",
+        required_selected_count=90,
+        forbid_mixed_fallback=True,
+    )
+
+    with pytest.raises(RuntimeError, match="required ghost bundle"):
+        evaluate_module._preflight_policy_sweep(
+            config=config,
+            config_path=config_path,
+            required_ghost_bundle=str(tmp_path / "other_bundle.json"),
+            required_training_family="rank11_100_bundle",
+            required_selected_count=90,
+            forbid_mixed_fallback=True,
+        )
+
+
+def test_worker_eval_uses_configured_deployment_extraction_mode() -> None:
+    from tm20ai.config import EvalConfig
+    from tm20ai.train.worker import _eval_extraction_mode_for_mode
+
+    eval_config = EvalConfig(deployment_extraction_mode="clipped_mean")
+
+    assert _eval_extraction_mode_for_mode("deterministic", eval_config) == "clipped_mean"
+    assert _eval_extraction_mode_for_mode("stochastic", eval_config) == "stochastic"
 
 
 def test_run_rank11_validation_campaign_dry_run(tmp_path: Path) -> None:
@@ -220,6 +312,8 @@ def test_run_rank11_validation_campaign_dry_run(tmp_path: Path) -> None:
     )
     assert result.returncode == 0, result.stderr or result.stdout
     assert "dry_run_complete" in result.stdout
+    assert "check_environment.py" in result.stdout
+    assert "--require-reward" in result.stdout
     generated_config = (
         ROOT
         / ".tmp"
@@ -230,6 +324,325 @@ def test_run_rank11_validation_campaign_dry_run(tmp_path: Path) -> None:
     )
     payload = yaml.safe_load(generated_config.read_text(encoding="utf-8"))
     assert Path(payload["ghosts"]["bundle_manifest"]).is_absolute()
+    assert payload["ghosts"]["ambiguous_family_policy"] == "hard_stop"
+    assert payload["ghosts"]["bundle_manifest"].endswith("ghost_bundle_rank_011_100.json")
+
+
+def test_run_rank11_validation_campaign_can_resume_phase4_from_existing_winner(tmp_path: Path) -> None:
+    source_artifact_root = tmp_path / "source_artifacts"
+    winner_run_dir = _write_campaign_run(
+        source_artifact_root,
+        run_name="rank11_existing_A3_buffered_hard_boundary",
+        exact_progress=1612.8,
+        ghost_delta_ms=-14717.18,
+        progress_fraction=0.40,
+        corridor_truncation_rate=0.0,
+        corridor_nonrecovering_p95=0.0,
+    )
+    winner_config = tmp_path / "winner_config.yaml"
+    winner_config.write_text(
+        yaml.safe_dump(
+            {
+                "reward": {"corridor_patience_steps": 60},
+                "ghosts": {
+                    "bundle_manifest": str(
+                        ROOT
+                        / "data"
+                        / "ghosts"
+                        / "oqIJ5rQDRrNwLPTh9H2p_W4tLof"
+                        / "ghost_bundle_rank_011_100.json"
+                    ),
+                    "ambiguous_family_policy": "hard_stop",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "run_rank11_100_validation_campaign.py"),
+            "--dry-run",
+            "--blocks",
+            "B",
+            "--session-name",
+            "pytest_rank11_phase4",
+            "--artifact-root",
+            str(tmp_path / "campaign_artifacts"),
+            "--winner-run-dir",
+            str(winner_run_dir),
+            "--winner-config",
+            str(winner_config),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "evaluate_redq_policy_modes.py" in result.stdout
+    assert "--required-ghost-bundle" in result.stdout
+    assert "--required-training-family rank11_100_bundle" in result.stdout
+    assert "train_full_redq.py" not in result.stdout
+    status_path = ROOT / ".tmp" / "live_rank11_100_validation_campaign" / "pytest_rank11_phase4" / "status.json"
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    assert status["state"] == "complete_dry_run"
+    assert status["winner_run_dir"] == str(winner_run_dir.resolve())
+
+
+def test_run_rank11_validation_campaign_phase5_uses_weight_only_offline_init(tmp_path: Path) -> None:
+    campaign_script = _load_campaign_script_module()
+    source_artifact_root = tmp_path / "source_artifacts"
+    winner_run_dir = _write_campaign_run(
+        source_artifact_root,
+        run_name="rank11_existing_A3_buffered_hard_boundary",
+        exact_progress=1612.8,
+        ghost_delta_ms=-14717.18,
+        progress_fraction=0.40,
+        corridor_truncation_rate=0.0,
+        corridor_nonrecovering_p95=0.0,
+    )
+    winner_config = tmp_path / "winner_config.yaml"
+    winner_config.write_text(
+        yaml.safe_dump(
+            {
+                "ghosts": {
+                    "bundle_manifest": str(
+                        ROOT
+                        / "data"
+                        / "ghosts"
+                        / "oqIJ5rQDRrNwLPTh9H2p_W4tLof"
+                        / "ghost_bundle_rank_011_100.json"
+                    ),
+                    "ambiguous_family_policy": "hard_stop",
+                },
+                "offline_pretrain": {"require_actions": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+    bundle_path = tmp_path / "ghost_bundle_rank_011_100.json"
+    offline_npz = tmp_path / "offline_transitions.npz"
+    offline_npz.write_bytes(b"npz")
+    bundle_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "ghost_bundle_v1",
+                "selected_count": 90,
+                "selected_training_family": "rank11_100_bundle",
+                "mixed_fallback": False,
+                "action_channel_valid": True,
+                "offline_transition_count": 10,
+                "offline_transition_npz_path": str(offline_npz),
+            }
+        ),
+        encoding="utf-8",
+    )
+    campaign_script._preflight_block_c_offline_bundle(bundle_manifest_path=bundle_path, dry_run=False)
+
+    # Exercise the C1/C2 command construction through the public dry-run path.
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "run_rank11_100_validation_campaign.py"),
+            "--dry-run",
+            "--blocks",
+            "C",
+            "--session-name",
+            "pytest_rank11_phase5",
+            "--artifact-root",
+            str(tmp_path / "campaign_artifacts"),
+            "--winner-run-dir",
+            str(winner_run_dir),
+            "--winner-config",
+            str(winner_config),
+            "--disable-storage-preflight",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "--offline-init-mode weights_only" in result.stdout
+
+
+def test_rank11_campaign_preflight_requires_hard_stop_rank_bundle(tmp_path: Path) -> None:
+    campaign_script = _load_campaign_script_module()
+    bundle_path = tmp_path / "ghost_bundle_rank_011_100.json"
+    bundle_path.write_text(
+        json.dumps(
+            {
+                "selected_count": 90,
+                "selected_training_family": "rank11_100_bundle",
+                "mixed_fallback": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "ghosts": {
+                    "bundle_manifest": str(bundle_path),
+                    "ambiguous_family_policy": "hard_stop",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    campaign_script._preflight(base_config_path=config_path, bundle_manifest_path=bundle_path, dry_run=True)
+
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "ghosts": {
+                    "bundle_manifest": str(bundle_path),
+                    "ambiguous_family_policy": "mixed_with_warning",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="ambiguous_family_policy='hard_stop'"):
+        campaign_script._preflight(base_config_path=config_path, bundle_manifest_path=bundle_path, dry_run=True)
+
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "ghosts": {
+                    "bundle_manifest": str(bundle_path),
+                    "ambiguous_family_policy": "hard_stop",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    bundle_path.write_text(
+        json.dumps(
+            {
+                "selected_count": 90,
+                "selected_training_family": "rank11_100_bundle",
+                "mixed_fallback": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="must not be a mixed fallback"):
+        campaign_script._preflight(base_config_path=config_path, bundle_manifest_path=bundle_path, dry_run=True)
+
+
+def test_block_c_preflight_requires_offline_transition_sidecar(tmp_path: Path) -> None:
+    campaign_script = _load_campaign_script_module()
+    bundle_path = tmp_path / "ghost_bundle_rank_011_100.json"
+    bundle_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "ghost_bundle_v1",
+                "selected_count": 90,
+                "selected_training_family": "rank11_100_bundle",
+                "mixed_fallback": False,
+                "action_channel_valid": True,
+                "offline_transition_count": 0,
+                "offline_transition_npz_path": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    campaign_script._preflight_block_c_offline_bundle(bundle_manifest_path=bundle_path, dry_run=True)
+    with pytest.raises(RuntimeError, match="offline_transition_count"):
+        campaign_script._preflight_block_c_offline_bundle(bundle_manifest_path=bundle_path, dry_run=False)
+
+    offline_npz = tmp_path / "offline_transitions.npz"
+    offline_npz.write_bytes(b"npz")
+    bundle_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "ghost_bundle_v1",
+                "selected_count": 90,
+                "selected_training_family": "rank11_100_bundle",
+                "mixed_fallback": False,
+                "action_channel_valid": True,
+                "offline_transition_count": 10,
+                "offline_transition_npz_path": str(offline_npz),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    campaign_script._preflight_block_c_offline_bundle(bundle_manifest_path=bundle_path, dry_run=False)
+
+
+def test_rank11_campaign_reward_variants_are_locked_to_corridor_only() -> None:
+    campaign_script = _load_campaign_script_module()
+    expected = {
+        "A0_baseline_current": {
+            "corridor_soft_margin_m": 25.0,
+            "corridor_hard_margin_m": 90.0,
+            "corridor_patience_steps": 20,
+            "corridor_penalty_scale": 0.03,
+            "corridor_penalty_max": 8.0,
+            "corridor_recovery_bonus": 1.0,
+            "corridor_min_recovery_progress_m": 0.5,
+            "corridor_min_recovery_speed_kmh": 8.0,
+            "corridor_recovery_distance_delta_m": 1.0,
+        },
+        "A1_wider_recovery": {
+            "corridor_soft_margin_m": 25.0,
+            "corridor_hard_margin_m": 90.0,
+            "corridor_patience_steps": 40,
+            "corridor_penalty_scale": 0.03,
+            "corridor_penalty_max": 8.0,
+            "corridor_recovery_bonus": 1.0,
+            "corridor_min_recovery_progress_m": 0.25,
+            "corridor_min_recovery_speed_kmh": 5.0,
+            "corridor_recovery_distance_delta_m": 0.5,
+        },
+        "A2_softer_wider_corridor": {
+            "corridor_soft_margin_m": 35.0,
+            "corridor_hard_margin_m": 120.0,
+            "corridor_patience_steps": 40,
+            "corridor_penalty_scale": 0.02,
+            "corridor_penalty_max": 6.0,
+            "corridor_recovery_bonus": 1.0,
+            "corridor_min_recovery_progress_m": 0.25,
+            "corridor_min_recovery_speed_kmh": 5.0,
+            "corridor_recovery_distance_delta_m": 0.5,
+        },
+        "A3_buffered_hard_boundary": {
+            "corridor_soft_margin_m": 25.0,
+            "corridor_hard_margin_m": 90.0,
+            "corridor_patience_steps": 60,
+            "corridor_penalty_scale": 0.03,
+            "corridor_penalty_max": 8.0,
+            "corridor_recovery_bonus": 1.0,
+            "corridor_min_recovery_progress_m": 0.10,
+            "corridor_min_recovery_speed_kmh": 3.0,
+            "corridor_recovery_distance_delta_m": 0.25,
+        },
+        "A4_hard_stray_control": {
+            "corridor_soft_margin_m": 10.0,
+            "corridor_hard_margin_m": 45.0,
+            "corridor_patience_steps": 1,
+            "corridor_penalty_scale": 0.05,
+            "corridor_penalty_max": 12.0,
+            "corridor_recovery_bonus": 0.0,
+            "corridor_catastrophic_distance_m": 120.0,
+            "corridor_min_recovery_progress_m": 1.0,
+            "corridor_min_recovery_speed_kmh": 12.0,
+            "corridor_recovery_distance_delta_m": 2.0,
+        },
+    }
+
+    variants = {variant["label"]: variant["reward"] for variant in campaign_script.REWARD_VARIANTS}
+    assert variants == expected
+    assert all(set(variant) == {"label", "reward"} for variant in campaign_script.REWARD_VARIANTS)
 
 
 def test_run_training_leg_repairs_missing_exact_final_eval_before_retry(tmp_path: Path, monkeypatch) -> None:
